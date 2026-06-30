@@ -443,37 +443,49 @@ live instance, state from creation only" here and completed in Tasks 4–5.
 
 - [ ] **Step 1: Write failing tests** — append to `tracker.rs`:
 
+Introduce the shared `test_support` helper here (Tasks 4 and 5 reuse it unchanged — define
+the final 7-arg `seg` now so no later task rewrites it). All helpers are module-level; no
+item-level `#[allow]` is used (the workspace denies `clippy::allow_attributes`).
+
 ```rust
 #[cfg(test)]
-mod orient_tests {
-    use super::*;
+mod test_support {
     use core::net::{IpAddr, Ipv4Addr};
     use tcpvisr_core::{FlowKey, Item, Nanos, Segment, TcpFlags, TcpOptions, TcpSeq};
 
-    fn ep(o: u8, p: u16) -> (IpAddr, u16) { (IpAddr::V4(Ipv4Addr::new(10, 0, 0, o)), p) }
+    pub fn ep(o: u8, p: u16) -> (IpAddr, u16) { (IpAddr::V4(Ipv4Addr::new(10, 0, 0, o)), p) }
 
-    fn seg(src: (IpAddr, u16), dst: (IpAddr, u16), flags: u16, seq: u32, len: u32, ts: u64)
-        -> Item {
+    /// Build a one-segment `Item`. `ack` is carried for state tests; pass `0` when unused.
+    pub fn seg(
+        src: (IpAddr, u16), dst: (IpAddr, u16), flags: u16, seq: u32, ack: u32, len: u32, ts: u64,
+    ) -> Item {
         Item::Segment(Segment {
             ts: Nanos(ts),
             flow: FlowKey { src_ip: src.0, src_port: src.1, dst_ip: dst.0, dst_port: dst.1 },
             seq: TcpSeq(seq),
-            ack: TcpSeq(0),
+            ack: TcpSeq(ack),
             flags: TcpFlags(flags),
             window: 0,
             options: TcpOptions::default(),
             payload_len: len,
         })
     }
+}
+
+#[cfg(test)]
+mod orient_tests {
+    use super::test_support::{ep, seg};
+    use super::*;
+    use tcpvisr_core::{Nanos, TcpFlags};
 
     #[test]
     fn bare_syn_sets_origin_and_groups_both_directions() {
         let (c, s) = (ep(1, 1234), ep(2, 80));
         let mut t = Tracker::new(EngineConfig::default());
-        t.observe(&seg(c, s, TcpFlags::SYN, 100, 0, 1_000));        // client SYN
-        t.observe(&seg(s, c, TcpFlags::SYN | TcpFlags::ACK, 500, 0, 2_000)); // server SYN-ACK
-        t.observe(&seg(c, s, TcpFlags::ACK, 101, 10, 3_000));       // 10 bytes c->s
-        t.observe(&seg(s, c, TcpFlags::ACK, 501, 20, 4_000));       // 20 bytes s->c
+        t.observe(&seg(c, s, TcpFlags::SYN, 100, 0, 0, 1_000));        // client SYN
+        t.observe(&seg(s, c, TcpFlags::SYN | TcpFlags::ACK, 500, 101, 0, 2_000)); // server SYN-ACK
+        t.observe(&seg(c, s, TcpFlags::ACK, 101, 501, 10, 3_000));     // 10 bytes c->s
+        t.observe(&seg(s, c, TcpFlags::ACK, 501, 111, 20, 4_000));     // 20 bytes s->c
         let conns = t.into_connections();
         assert_eq!(conns.len(), 1, "both directions group into one connection");
         let conn = conns[0];
@@ -490,7 +502,7 @@ mod orient_tests {
     fn syn_ack_first_orients_server_as_responder() {
         let (c, s) = (ep(1, 1234), ep(2, 443));
         let mut t = Tracker::new(EngineConfig::default());
-        t.observe(&seg(s, c, TcpFlags::SYN | TcpFlags::ACK, 9, 0, 1_000)); // joined mid-handshake
+        t.observe(&seg(s, c, TcpFlags::SYN | TcpFlags::ACK, 9, 0, 0, 1_000)); // joined mid-handshake
         let conns = t.into_connections();
         assert_eq!((conns[0].origin.ip, conns[0].origin.port), c, "client is origin");
         assert_eq!((conns[0].responder.ip, conns[0].responder.port), s);
@@ -501,7 +513,7 @@ mod orient_tests {
     fn mid_stream_infers_origin_from_first_segment() {
         let (a, b) = (ep(1, 5000), ep(2, 8080));
         let mut t = Tracker::new(EngineConfig::default());
-        t.observe(&seg(a, b, TcpFlags::ACK, 42, 5, 1_000)); // no SYN ever
+        t.observe(&seg(a, b, TcpFlags::ACK, 42, 0, 5, 1_000)); // no SYN ever
         let conns = t.into_connections();
         assert_eq!((conns[0].origin.ip, conns[0].origin.port), a);
         assert!(conns[0].origin_inferred);
@@ -512,8 +524,8 @@ mod orient_tests {
     fn last_at_is_max_under_reordered_timestamps() {
         let (a, b) = (ep(1, 5000), ep(2, 8080));
         let mut t = Tracker::new(EngineConfig::default());
-        t.observe(&seg(a, b, TcpFlags::ACK, 42, 5, 5_000));  // later ts first
-        t.observe(&seg(a, b, TcpFlags::ACK, 47, 5, 1_000));  // reordered earlier ts
+        t.observe(&seg(a, b, TcpFlags::ACK, 42, 0, 5, 5_000));  // later ts first
+        t.observe(&seg(a, b, TcpFlags::ACK, 47, 0, 5, 1_000));  // reordered earlier ts
         let conns = t.into_connections();
         assert_eq!(conns[0].opened_at, Nanos(5_000));
         assert_eq!(conns[0].last_at, Nanos(5_000), "earlier ts must not move last_at back");
@@ -727,38 +739,9 @@ git commit -m "feat(engine): track connection grouping, orientation, and byte ac
 `observe_segment`'s live-instance branch and from `create_instance` is **not** changed
 (creation already sets the initial state). Implements the spec's state-transition table.
 
-- [ ] **Step 1: Write failing tests** — append a `state_tests` module to `tracker.rs` (reuses
-  the `ep`/`seg` helpers; declare `use super::orient_tests::{...}` is not possible across
-  modules, so duplicate the two tiny helpers or lift them to a shared `#[cfg(test)]` module
-  `test_support` at the top of `tracker.rs`). Lift them:
-
-```rust
-#[cfg(test)]
-mod test_support {
-    use core::net::{IpAddr, Ipv4Addr};
-    use tcpvisr_core::{FlowKey, Item, Nanos, Segment, TcpFlags, TcpOptions, TcpSeq};
-
-    pub fn ep(o: u8, p: u16) -> (IpAddr, u16) { (IpAddr::V4(Ipv4Addr::new(10, 0, 0, o)), p) }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn seg(
-        src: (IpAddr, u16), dst: (IpAddr, u16), flags: u16, seq: u32, ack: u32, len: u32, ts: u64,
-    ) -> Item {
-        Item::Segment(Segment {
-            ts: Nanos(ts),
-            flow: FlowKey { src_ip: src.0, src_port: src.1, dst_ip: dst.0, dst_port: dst.1 },
-            seq: TcpSeq(seq),
-            ack: TcpSeq(ack),
-            flags: TcpFlags(flags),
-            window: 0,
-            options: TcpOptions::default(),
-            payload_len: len,
-        })
-    }
-}
-```
-(Update `orient_tests` to `use super::test_support::{ep, seg}` and drop its inline copies; its
-`seg` calls gain an `ack` arg of `0`.)
+- [ ] **Step 1: Write failing tests** — append a `state_tests` module to `tracker.rs`, reusing
+  the `test_support::{ep, seg}` helpers already defined in Task 3 (the 7-arg `seg` carries the
+  `ack` these tests need — no helper changes required):
 
 ```rust
 #[cfg(test)]
@@ -1137,7 +1120,10 @@ fn committed_fixtures_match_builder() {
 //! timestamps, so fixtures are reviewable as source. No clock or randomness.
 
 #![allow(dead_code)]
-#![allow(clippy::expect_used, clippy::cast_possible_truncation)]
+// `tcp()` takes 8 params (a full frame spec); module-level relaxation matches M1's
+// tests/support pattern (item-level `#[allow]` is avoided — the workspace denies
+// `clippy::allow_attributes`).
+#![allow(clippy::expect_used, clippy::cast_possible_truncation, clippy::too_many_arguments)]
 
 use etherparse::PacketBuilder;
 
