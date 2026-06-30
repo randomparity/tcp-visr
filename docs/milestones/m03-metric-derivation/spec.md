@@ -130,12 +130,14 @@ direction `d` (ADR-0007):
 
 State per direction `d` (lazily initialized on the first segment seen in `d`):
 
-- `snd_nxt[d]`: serial-max of `seq_end(S)` over segments in `d` — the highest sequence the `d`
-  sender has put on the wire.
-- `acked[d]`: serial-max of the ACK field carried by segments in the **opposite** direction
-  (an ACK in `¬d` acknowledges data sent in `d`). Initialized to the **first observed `seq`**
-  in `d`, so before any acknowledgement, in-flight measures bytes put on the wire since the
-  capture began (mid-stream has no ISN to anchor to).
+- `snd_nxt[d]`: `Option<TcpSeq>`, serial-max of `seq_end(S)` over segments in `d` — the highest
+  sequence the `d` sender has put on the wire. `None` until the first segment in `d` is observed.
+- `acked[d]`: `Option<TcpSeq>`, serial-max of the ACK field carried by segments in the
+  **opposite** direction (an ACK in `¬d` acknowledges data sent in `d`). Initialized to the
+  **first observed `seq`** in `d` (so before any acknowledgement, in-flight measures bytes put
+  on the wire since the capture began — mid-stream has no ISN to anchor to). It can also be
+  initialized by the first acknowledgement that arrives once `d` has a tracked send (below);
+  before `d` has any tracked send it stays `None`.
 - `frontier[d]`: serial-max of `seq_end(S)` over **data** segments (`payload_len > 0`) seen so
   far in `d`, evaluated **before** incorporating the current segment — the retransmit/OOO
   reference.
@@ -147,15 +149,22 @@ On observing segment `S` in direction `d` (with the metric state above advanced 
 reading the references it needs), produce exactly one `MetricSample`:
 
 0. **ACK advance, computed once.** Before any state mutation, compute the single predicate
-   `ack_advances = S.flags.ack() && S.ack.serial_gt(acked[¬d])` against the **pre-update**
-   `acked[¬d]`. Both the in-flight update (step 1) and the RTT gate (step 4) read this one
-   value; a duplicate/old ACK has `ack_advances = false` and therefore neither moves `acked`
-   nor yields RTT. (Stated as a distinct pre-step so the read-before-write ordering is
-   unambiguous.)
-1. **in-flight.** Advance `snd_nxt[d]` with `seq_end(S)`. If `ack_advances`, set
-   `acked[¬d] = S.ack`. `in_flight_bytes = serial_diff(snd_nxt[d], acked[d])` when `snd_nxt[d]`
-   is serial-≥ `acked[d]`, else **0** (clamp — at a mid-path vantage an ACK can be observed
-   before the data it covers; design §4). **Pure-ACK / drain semantics:** the sample reports
+   `ack_advances = S.flags.ack() && snd_nxt[¬d].is_some()
+   && (acked[¬d].is_none() || S.ack.serial_gt(acked[¬d]))` against the **pre-update** state. An
+   ACK can advance (and yield RTT) only once the opposite direction has a **tracked send** to
+   acknowledge (`snd_nxt[¬d].is_some()`); an ACK observed before any data in `¬d` acknowledges
+   nothing we track, so `ack_advances = false` and `acked[¬d]` stays `None`. This is the case
+   the flagship `seq_wrap` derivation hits at sample 1 (an o2r `ACK=1` while `r2o` has no send
+   yet). Otherwise `ack_advances` is true on the first real ACK (initializing `acked[¬d]`) and on
+   any later ACK that serial-advances it; a duplicate/old ACK is `false`. Both the in-flight
+   update (step 1) and the RTT gate (step 4) read this one value, so the read-before-write
+   ordering is unambiguous.
+1. **in-flight.** If this is the first segment in `d`, initialize `acked[d] = Some(S.seq)`. Then
+   advance `snd_nxt[d]` with `seq_end(S)` (now `Some`). If `ack_advances`, set
+   `acked[¬d] = Some(S.ack)`. `in_flight_bytes = serial_diff(snd_nxt[d], acked[d])` when
+   `snd_nxt[d]` is serial-≥ `acked[d]`, else **0** (clamp — at a mid-path vantage an ACK can be
+   observed before the data it covers; design §4). Both operands are `Some` here: `snd_nxt[d]`
+   was just advanced and `acked[d]` was just initialized. **Pure-ACK / drain semantics:** the sample reports
    `dir`'s own outstanding, so a pure ACK (which advances `acked[¬d]`, draining the *opposite*
    direction) records `dir`'s in-flight (~0 for a one-way receiver), **not** the drained
    direction. The drained direction's reduction surfaces on its **next data sample** (whose
@@ -189,7 +198,11 @@ reading the references it needs), produce exactly one `MetricSample`:
    whose ts ∈ `(S.ts − throughput_window, S.ts]`) `· 1e9 / throughput_window_ns`, computed in
    `u128` and saturating-cast to `u64`. Wire bytes (retransmissions **included**); goodput is
    M9. The window is relative to `S`'s own ts, so a reordered earlier-ts segment computes its
-   own trailing window over bytes accumulated so far (non-monotonic-safe, saturating).
+   own trailing window over bytes accumulated so far (non-monotonic-safe, saturating). The
+   per-direction `(ts, len)` history this sum reads from is a bounded deque, evicted to entries
+   with `ts > (max_observed_ts[d] − throughput_window)` (lazy prune; non-monotonic-safe via the
+   running max), so its memory is bounded by **one window** of traffic regardless of capture
+   size — it is **not** governed by `max_samples` (which bounds the output series).
 
 `Tick` items produce **no** sample (replay emits none; live decay-to-zero is M11). The
 sample's `t` is `S.ts`. When the instance is being collected (`series_collection` is `All`, or
@@ -299,7 +312,8 @@ fixture is reviewable as source. M3 adds metric-specific fixtures and **golden o
     plus the boundary: gap exactly `reorder_window` ⇒ retransmit);
   - **SACK** flag set iff the segment carried SACK blocks;
   - **RTT** pairs a data send with the ACK that first covers it (handshake RTT and data RTT);
-    **Karn**: no RTT from a retransmitted range; a **dup ACK** produces no RTT;
+    **Karn**: no RTT from a retransmitted range; a **dup ACK** produces no RTT; an **ACK before
+    any data in the acked direction** advances nothing and yields no RTT (`snd_nxt[¬d] = None`);
   - **throughput** sums wire bytes (retransmits included) in the trailing window; bytes outside
     the window are excluded; the boundary (`ts − window`, exclusive) is asserted;
   - phantom-byte accounting: a SYN/FIN advances the sequence frontier (in-flight reflects it) but
@@ -453,8 +467,11 @@ per-segment numbers are finalized with the fixtures in the plan; this appendix f
 **method** the goldens are checked against, so a golden is never "whatever the code emitted".)
 
 - **`seq_wrap.pcap`** (C→S `seq=2^32−101 len=50`, C→S `seq=200 len=50`, S→C `seq=1 ack=300 len=10`):
-  - Sample 1 (o2r): `acked[o2r]` init = `2^32−101`; `snd_nxt[o2r] = 2^32−51`;
-    `in_flight = serial_diff(2^32−51, 2^32−101) = 50`.
+  - Sample 1 (o2r): `acked[o2r]` init = `2^32−101` (first o2r seq); `snd_nxt[o2r] = 2^32−51`;
+    `in_flight = serial_diff(2^32−51, 2^32−101) = 50`. The segment also carries `ACK=1`, but
+    `r2o` has no tracked send yet (`snd_nxt[r2o] = None`), so `ack_advances = false`: `acked[r2o]`
+    stays `None` and no RTT is produced. (This is the unobserved-opposite-direction case from the
+    derivation contract; `r2o` is anchored later at sample 3.)
   - Sample 2 (o2r): `seq=200` is a **forward** advance of `2^32−51` (serial, the wrap);
     `snd_nxt[o2r] = 250`; `in_flight = serial_diff(250, 2^32−101) = 351` (the 50 + the 301-byte
     serial span across the wrap). A naive `250 − (2^32−101)` is **negative/≈4.29e9** — the test
