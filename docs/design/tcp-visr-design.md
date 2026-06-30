@@ -84,7 +84,7 @@ interface, and is testable in isolation.
 | `tcpvisr-tui` | ratatui master/detail UI, timeline cursor, the four graph views | core, engine | terminal |
 | `tcp-visr` (bin) | clap CLI; subcommands `replay`, `live`, `parse`, `conns`, `metrics`; wires faucet → engine → tui | all | — |
 
-### 3.2 The two load-bearing interfaces
+### 3.2 The load-bearing interfaces
 
 1. **Ingest boundary — `Item` (`Segment | Tick`) stream.** Both faucets (file, wire) emit
    the same item type. The engine never knows the source. This is what makes live and
