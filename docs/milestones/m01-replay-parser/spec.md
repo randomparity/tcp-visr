@@ -32,8 +32,12 @@ gated behind `--features live` and exercised by a dedicated CI job that installs
 
 ### `tcpvisr-core` — wire packet model
 
-- **Time**: `Nanos(u64)` newtype — nanoseconds since the capture's first packet timestamp,
-  computed with `saturating_sub` (wall-clock is not assumed monotonic, design §14).
+- **Time**: `Nanos(u64)` newtype — nanoseconds since the **baseline**: the timestamp of the
+  **first packet record in file order** (whether or not that packet decodes to a `Segment`),
+  computed with `saturating_sub`. Both faucets MUST use this same baseline rule or per-packet
+  times diverge. Wall-clock is not assumed monotonic (design §14): a packet earlier than the
+  baseline clamps to `0` (`saturating_sub`); M1's `parse` therefore prints in file order, not
+  sorted time order, and this clamp is documented in the parse output's behavior.
 - **Serial-number arithmetic** (design §4, "the single most error-prone area"):
   `TcpSeq(u32)` with RFC 1982 serial comparison (`serial_lt`/`serial_gt`) and forward
   distance (`serial_diff`). `proptest`-covered.
@@ -58,8 +62,12 @@ gated behind `--features live` and exercised by a dedicated CI job that installs
   (`DLT_LINUX_SLL`), Linux SLL2 (`DLT_LINUX_SLL2`), raw IP (`DLT_RAW`), and BSD/NULL loopback
   (`DLT_NULL`). `etherparse` handles Ethernet II and SLL v1 natively; **SLL2 is hand-decoded**
   (the 20-byte cooked header) per design §3.2, then the IP payload is handed to `etherparse`.
-  Raw IP and NULL loopback strip their (zero- or 4-byte) link layer and dispatch on the IP
-  version nibble / address-family word.
+  Raw IP (`DLT_RAW`) and NULL loopback (`DLT_NULL`) strip their link layer (0 and 4 bytes
+  respectively) and **dispatch on the IP-version nibble of the payload (4 or 6), not on the
+  `DLT_NULL` address-family word** — the AF word is the capture host's byte order and its
+  `AF_INET6` value is OS-dependent (Linux 10, macOS 30, FreeBSD 28), so it is unreliable for a
+  foreign capture; the IP-version nibble is unambiguous. A nibble that is neither 4 nor 6 is
+  skipped-and-counted as `Malformed`.
 - **IPv6 extension-header chains**: hop-by-hop, routing, destination-options, and fragment
   headers are walked (via `etherparse`) to reach the TCP header. An **IPv6-fragmented TCP
   segment** (a fragment header indicating this is not a complete datagram) and any
@@ -68,13 +76,32 @@ gated behind `--features live` and exercised by a dedicated CI job that installs
   function (`Segment` or `Skipped{reason}`). Both faucets call it; there is no second
   header-parsing path (design §3.2, ADR-0003).
 - **Pure-Rust faucet** (always available): `pcap-parser` reads the `.pcap`/`.pcapng`
-  container and yields `(link_type, ts, frame)` records into `decode_frame`.
+  container and **streams** `(link_type, ts, frame)` records into `decode_frame` (a visitor /
+  iterator, so `parse` holds only the current frame, not the whole capture — see resource
+  note below). A collect helper returns `(Vec<Item>, SkipCounts)` for tests and the parity
+  test, which operate on bounded fixtures.
 - **libpcap faucet** (`#[cfg(feature = "live")]`): `pcap::Capture::from_file` yields the same
   records into the **same** `decode_frame`. File reading only; live capture is M11.
-- **Skip-and-count**: parsing returns the decoded `Vec<Item>` plus a `SkipCounts` keyed by
+- **Single-interface assumption.** M1 supports captures with one link type. A legacy `.pcap`
+  has exactly one. A `.pcapng` with multiple Interface Description Blocks of **differing** link
+  types is rejected with `IngestError` (libpcap's `from_file` exposes only one `datalink()`,
+  so the two faucets could not agree on a per-packet link type — keeping them in lockstep is
+  why this is an error, not a silent partial parse). Multiple IDBs that all share one link type
+  are accepted.
+- **Timestamp-precision contract (parity-critical).** The two container readers can expose
+  different precision (`pcap-parser` surfaces the file's native precision — microsecond vs
+  nanosecond legacy-`pcap` magic, or pcapng `if_tsresol`; `pcap::Capture::from_file` defaults
+  to microsecond). To keep the parity test falsifiable: **M1 fixtures use microsecond
+  precision**, the drift-guard test asserts that precision, and `Nanos` is computed as
+  `micros · 1000` from both faucets so they agree exactly. (Nanosecond-precision capture
+  support is deferred to M11 with the live faucet, where the libpcap handle is opened
+  `Precision::Nano`.)
+- **Skip-and-count**: parsing returns the decoded items plus a `SkipCounts` keyed by
   reason (`NonTcp`, `Malformed`, `UnsupportedLinkType`, `Ipv6Fragment`,
   `UnsupportedExtChain`, `Truncated`). Malformed/unsupported packets never abort the parse
-  (design §7); a truncated capture renders what parsed.
+  (design §7); a truncated capture renders what parsed. **`Truncated` is detected uniformly
+  from the container** (a record whose captured length `incl_len` is less than its original
+  length `orig_len`), before `decode_frame` runs, so both faucets classify it identically.
 - **Errors**: `thiserror`-based `IngestError` for whole-file failures (file open, unreadable
   container, unknown link type for the *whole* file), with actionable messages (operation,
   input, suggested fix). Per-packet problems are counts, not errors.
@@ -98,8 +125,14 @@ gated behind `--features live` and exercised by a dedicated CI job that installs
   exact pcap/pcapng bytes, so every fixture is reviewable as source, not an opaque blob. The
   generated bytes are written to committed `tests/fixtures/*.pcap[ng]` files; a **drift-guard
   test** asserts the committed files byte-match the builder output (regenerate on change).
-- **Parity test** (`#[cfg(feature = "live")]`): each fixture is fed through both faucets and
-  the resulting `Vec<Item>` (and `SkipCounts`) must be identical. Guards design §3.2.
+- **Parity test** (`#[cfg(feature = "live")]`): each **well-formed** fixture (every link-type
+  fixture, including the IPv6 ext-header and `.pcapng` ones) is fed through both faucets and
+  the resulting `Vec<Item>` and `SkipCounts` must be identical (`Item` derives `PartialEq` over
+  all fields). Guards design §3.2. The **truncated/snaplen** fixture is exercised for skip
+  classification **per faucet** (each must report it `Truncated`) but is excluded from the
+  byte-for-byte cross-faucet equality set, because the two readers' presentation of a
+  short-captured record can legitimately differ below `decode_frame`; uniform pre-decode
+  `Truncated` detection (above) is what keeps the *classification* in agreement.
 
 ### CI
 
@@ -158,6 +191,15 @@ gated behind `--features live` and exercised by a dedicated CI job that installs
   builder) and literal to the DoD ("committed fixtures"), and libpcap needs real files.
 - **NULL loopback (`DLT_NULL`) is the loopback variant** decoded (host-endian AF word); BSD
   `DLT_LOOP` (big-endian) is out of scope unless a fixture needs it.
+- **`parse` streams; retained-series ceiling deferred.** M1's `parse` decodes and prints
+  per-frame, holding only the current frame (constant memory beyond it), so a large capture
+  does not OOM the CLI. The full in-memory `Vec<Item>` is built only by tests/the parity test
+  over bounded fixtures. The design §7/§14 capture-size ceiling governs **retained
+  per-connection series**, which first live in RAM when ADR-0004's precomputed series are
+  built (M3 derivation / M5 timeline); it is **deferred to M3** and recorded here and in the
+  PR as a known M1 limitation, not silently dropped.
+- **Single-interface captures only at M1** — multi-link-type `.pcapng` is an `IngestError`
+  (see ingest section); multi-interface support tracks the live faucet work (M11).
 - **Pinned versions** (`=`, verified 2026-06-30): `pcap-parser` 0.17.0, `etherparse` 0.20.2,
   `pcap` 2.4.0, `thiserror` 2.0.18, `proptest` 1.11.0.
 
