@@ -8,6 +8,6 @@ pub mod tracker;
 
 pub use config::EngineConfig;
 pub use conn::{ConnId, Connection, EndpointPair};
-pub use metrics::{MetricError, SeriesCollection};
+pub use metrics::{ConnectionMetrics, MetricError, SeriesCollection};
 pub use state::ConnState;
 pub use tracker::{Tracker, track};

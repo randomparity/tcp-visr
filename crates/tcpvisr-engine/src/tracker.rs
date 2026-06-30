@@ -2,10 +2,11 @@
 
 use std::collections::HashMap;
 
-use tcpvisr_core::{Endpoint, Item, Nanos, Segment, TcpFlags, TcpSeq};
+use tcpvisr_core::{Endpoint, Item, MetricSample, Nanos, Segment, TcpFlags, TcpSeq};
 
 use crate::config::EngineConfig;
 use crate::conn::{ConnId, Connection, Direction, EndpointPair};
+use crate::metrics::{ConnectionMetrics, MetricError, MetricState, SeriesCollection};
 use crate::state::ConnState;
 
 /// `true` when `seq` sits backward of `baseline` in RFC 1982 serial space by more than
@@ -46,6 +47,8 @@ struct ConnTrack {
     fin_r2o: bool,
     base_o2r: Option<TcpSeq>,
     base_r2o: Option<TcpSeq>,
+    metrics: MetricState,
+    series: Vec<MetricSample>,
 }
 
 impl ConnTrack {
@@ -138,6 +141,8 @@ pub struct Tracker {
     conns: Vec<ConnTrack>,
     live: HashMap<EndpointPair, usize>,
     next_instance: HashMap<EndpointPair, u32>,
+    collected_samples: usize,
+    overflowed: bool,
 }
 
 impl Tracker {
@@ -148,7 +153,32 @@ impl Tracker {
             conns: Vec::new(),
             live: HashMap::new(),
             next_instance: HashMap::new(),
+            collected_samples: 0,
+            overflowed: false,
         }
+    }
+
+    /// Whether the instance with `id` buffers a metric series under the current config.
+    fn should_collect(&self, id: ConnId) -> bool {
+        match self.config.series_collection {
+            SeriesCollection::None => false,
+            SeriesCollection::All => true,
+            SeriesCollection::Only(target) => target == id,
+        }
+    }
+
+    /// Stores `sample` on the instance at `idx` when collected, enforcing `max_samples`.
+    fn record_sample(&mut self, idx: usize, sample: MetricSample) {
+        let id = self.conns[idx].id;
+        if !self.should_collect(id) {
+            return;
+        }
+        if self.collected_samples >= self.config.max_samples {
+            self.overflowed = true;
+            return;
+        }
+        self.collected_samples += 1;
+        self.conns[idx].series.push(sample);
     }
 
     /// Folds one `Item` into tracker state. `Tick`s are inert in replay (idle is evaluated
@@ -168,6 +198,8 @@ impl Tracker {
                 let dir = self.conns[idx].direction_of(src);
                 self.conns[idx].account(seg, dir);
                 self.conns[idx].apply_state(seg, dir);
+                let sample = self.conns[idx].metrics.observe(seg, dir, &self.config);
+                self.record_sample(idx, sample);
                 return;
             }
         }
@@ -225,6 +257,8 @@ impl Tracker {
             fin_r2o: false,
             base_o2r: None,
             base_r2o: None,
+            metrics: MetricState::new(),
+            series: Vec::new(),
         };
         let dir = track.direction_of(src);
         track.account(seg, dir);
@@ -234,9 +268,11 @@ impl Tracker {
                 Direction::ResponderToOrigin => track.fin_r2o = true,
             }
         }
+        let sample = track.metrics.observe(seg, dir, &self.config);
         let idx = self.conns.len();
         self.conns.push(track);
         self.live.insert(pair, idx);
+        self.record_sample(idx, sample);
     }
 
     /// All tracked instances, ordered by `(opened_at, pair, instance)` for determinism.
@@ -245,6 +281,29 @@ impl Tracker {
         let mut out: Vec<Connection> = self.conns.iter().map(ConnTrack::view).collect();
         out.sort_by_key(|c| (c.opened_at, c.id.pair, c.id.instance));
         out
+    }
+
+    /// All tracked instances with their derived series, same ordering as `into_connections`.
+    ///
+    /// # Errors
+    /// Returns [`MetricError::SampleCeiling`] if collection hit `max_samples`.
+    pub fn into_metrics(self) -> Result<Vec<ConnectionMetrics>, MetricError> {
+        if self.overflowed {
+            return Err(MetricError::SampleCeiling {
+                samples: self.collected_samples + 1,
+                limit: self.config.max_samples,
+            });
+        }
+        let mut out: Vec<ConnectionMetrics> = self
+            .conns
+            .iter()
+            .map(|c| ConnectionMetrics {
+                conn: c.view(),
+                series: c.series.clone(),
+            })
+            .collect();
+        out.sort_by_key(|m| (m.conn.opened_at, m.conn.id.pair, m.conn.id.instance));
+        Ok(out)
     }
 }
 
@@ -606,5 +665,110 @@ mod split_tests {
             let seq = TcpSeq(base.wrapping_sub(b));
             prop_assert_eq!(is_backward_reset(TcpSeq(base), seq, thr), b > thr);
         }
+    }
+}
+
+#[cfg(test)]
+mod metric_wire_tests {
+    use super::test_support::{ep, seg};
+    use super::*;
+    use crate::metrics::SeriesCollection;
+    use tcpvisr_core::TcpFlags;
+
+    fn run(items: &[tcpvisr_core::Item], coll: SeriesCollection) -> Vec<ConnectionMetrics> {
+        let cfg = EngineConfig {
+            series_collection: coll,
+            ..EngineConfig::default()
+        };
+        let mut t = Tracker::new(cfg);
+        for it in items {
+            t.observe(it);
+        }
+        t.into_metrics().expect("no ceiling")
+    }
+
+    #[test]
+    fn none_collection_yields_empty_series() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let m = run(
+            &[seg(c, s, TcpFlags::ACK, 100, 1, 10, 1_000)],
+            SeriesCollection::None,
+        );
+        assert_eq!(m.len(), 1);
+        assert!(m[0].series.is_empty());
+    }
+
+    #[test]
+    fn all_collection_yields_one_sample_per_segment() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let m = run(
+            &[
+                seg(c, s, TcpFlags::ACK, 100, 1, 10, 1_000),
+                seg(s, c, TcpFlags::ACK, 1, 110, 0, 2_000),
+            ],
+            SeriesCollection::All,
+        );
+        assert_eq!(m[0].series.len(), 2);
+        assert_eq!(m[0].series[0].in_flight_bytes, 10);
+    }
+
+    #[test]
+    fn only_collection_buffers_just_the_target() {
+        // Two distinct connections; collect only the first one's ConnId.
+        let (c1, s1) = (ep(1, 1111), ep(2, 80));
+        let (c2, s2) = (ep(3, 2222), ep(4, 80));
+        let items = [
+            seg(c1, s1, TcpFlags::ACK, 100, 1, 10, 1_000),
+            seg(c2, s2, TcpFlags::ACK, 100, 1, 10, 2_000),
+        ];
+        // Resolve target id via a None pass.
+        let conns = {
+            let mut t = Tracker::new(EngineConfig::default());
+            for it in &items {
+                t.observe(it);
+            }
+            t.into_connections()
+        };
+        let target = conns[0].id;
+        let m = run(&items, SeriesCollection::Only(target));
+        let by_target: Vec<_> = m.iter().filter(|cm| cm.conn.id == target).collect();
+        let others: Vec<_> = m.iter().filter(|cm| cm.conn.id != target).collect();
+        assert_eq!(by_target[0].series.len(), 1);
+        assert!(others.iter().all(|cm| cm.series.is_empty()));
+    }
+
+    #[test]
+    fn ceiling_exceeded_returns_error() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let cfg = EngineConfig {
+            series_collection: SeriesCollection::All,
+            max_samples: 1,
+            ..EngineConfig::default()
+        };
+        let mut t = Tracker::new(cfg);
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 1_000));
+        t.observe(&seg(c, s, TcpFlags::ACK, 110, 1, 10, 2_000)); // 2nd sample > limit 1
+        let err = t.into_metrics().expect_err("should exceed");
+        assert_eq!(
+            err,
+            MetricError::SampleCeiling {
+                samples: 2,
+                limit: 1
+            }
+        );
+    }
+
+    #[test]
+    fn metrics_ordering_matches_into_connections() {
+        let (c1, s1) = (ep(1, 1111), ep(2, 80));
+        let (c2, s2) = (ep(3, 2222), ep(4, 80));
+        let items = [
+            seg(c2, s2, TcpFlags::ACK, 100, 1, 10, 2_000),
+            seg(c1, s1, TcpFlags::ACK, 100, 1, 10, 1_000),
+        ];
+        let m = run(&items, SeriesCollection::All);
+        // opened_at 1_000 (c1) sorts before 2_000 (c2).
+        assert_eq!(m[0].conn.opened_at, tcpvisr_core::Nanos(1_000));
+        assert_eq!(m[1].conn.opened_at, tcpvisr_core::Nanos(2_000));
     }
 }
