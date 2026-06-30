@@ -7,3 +7,14 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+default = []
+live = ["dep:pcap"]
+
+[dependencies]
+tcpvisr-core = { path = "../tcpvisr-core" }
+etherparse = "=0.20.2"
+pcap-parser = "=0.17.0"
+thiserror = "=2.0.18"
+pcap = { version = "=2.4.0", optional = true }
