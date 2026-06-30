@@ -278,7 +278,7 @@ tasks within a milestone map to **sub-issues**. See [§12](#12-development-workf
 | ID | Title | Definition of Done | Release |
 |----|-------|--------------------|---------|
 | **M0** | Repo & toolchain | green CI (fmt, clippy `-D warnings`, test); `cargo run -- --help`; lint set, `cargo-deny`, prek hooks, templates, LICENSE | v0.1 |
-| **M1** | Packet model & replay parser | `tcp-visr parse f.pcap` prints decoded TCP segments; fixtures per link type incl. SLL2 and an IPv6 extension-header chain; both faucets pass the parity test (§8) | v0.1 |
+| **M1** | Packet model & replay parser | `tcp-visr parse f.pcap` prints decoded TCP segments; fixtures per link type incl. SLL2 and an IPv6 extension-header chain; both faucets pass the parity test (§8). The libpcap faucet enters here as a default-off, file-reading faucet for the parity test ([ADR-0005](../adr/0005-libpcap-file-faucet-at-m1.md)); live interface capture stays M11 | v0.1 |
 | **M2** | Connection state machine | `tcp-visr conns f.pcap` lists connections with state, bytes, duration; passes fixtures for mid-stream (no SYN), simultaneous-open, mid-stream RST, 4-tuple reuse (distinct instances), and seq-wrap-vs-new-instance disambiguation (§4) | v0.1 |
 | **M3** | Metric derivation | `tcp-visr metrics f.pcap --conn N` dumps the series (JSON); in-flight, throughput (defined window), retransmit/OOO/SACK; RTT paired under Karn's algorithm; passes `u32` seq-wrap fixtures and the validation oracle (§8) | v0.1 |
 | **M4** | TUI shell: master list | browse a capture's connections; sort, `/` filter, selection; port→service labels | v0.1 |
@@ -368,6 +368,7 @@ and roadmap ordering already encode those, and duplicate state rots.
 | [0002](../adr/0002-pure-engine-io-boundary.md) | The analysis engine is pure (no I/O) | Accepted |
 | [0003](../adr/0003-libpcap-for-live-capture.md) | Live capture uses libpcap (`pcap` crate); replay parsing is pure-Rust | Accepted |
 | [0004](../adr/0004-seekable-timeseries-timeline.md) | Precomputed time-indexed series + cursor for seek/speed | Accepted |
+| [0005](../adr/0005-libpcap-file-faucet-at-m1.md) | libpcap enters at M1 as a default-off file faucet for the parity test (amends ADR-0003 timing) | Accepted |
 
 ## 14. Risks
 
