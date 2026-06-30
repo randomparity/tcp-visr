@@ -220,52 +220,51 @@ Create `crates/tcp-visr/tests/cli.rs`:
 ```rust
 use std::process::Command;
 
-type TestResult = Result<(), Box<dyn std::error::Error>>;
-
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_tcp-visr"))
 }
 
 #[test]
-fn version_flag_prints_version_and_exits_zero() -> TestResult {
-    let output = bin().arg("--version").output()?;
+fn version_flag_prints_version_and_exits_zero() {
+    let output = bin().arg("--version").output().unwrap();
     assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout)?;
+    let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains(env!("CARGO_PKG_VERSION")));
-    Ok(())
 }
 
 #[test]
-fn help_flag_exits_zero_and_shows_usage() -> TestResult {
-    let output = bin().arg("--help").output()?;
+fn help_flag_exits_zero_and_shows_usage() {
+    let output = bin().arg("--help").output().unwrap();
     assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout)?;
+    let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("tcp-visr"));
     assert!(stdout.contains("Usage"));
-    Ok(())
 }
 
 #[test]
-fn unimplemented_subcommand_exits_nonzero_with_message() -> TestResult {
-    let output = bin().arg("replay").output()?;
+fn unimplemented_subcommand_exits_nonzero_with_message() {
+    let output = bin().arg("replay").output().unwrap();
     assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
+    let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("not implemented"));
-    Ok(())
 }
 
 #[test]
-fn no_subcommand_exits_nonzero() -> TestResult {
-    let output = bin().output()?;
+fn no_subcommand_exits_nonzero() {
+    let output = bin().output().unwrap();
     assert!(!output.status.success());
-    Ok(())
 }
 ```
+
+> Test functions return `()` and use `.unwrap()` (allowed by `clippy.toml`'s
+> `allow-unwrap-in-tests`). Do **not** make them return `Result` — `assert!` inside a
+> `-> Result` fn trips the denied `panic_in_result_fn` lint, which `clippy.toml` does **not**
+> relax (there is no `allow-panic-in-result-fn` key).
 
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p tcp-visr --test cli`
-Expected: FAIL — `replay` is not a known argument (clap not wired yet), so `unimplemented_subcommand...` and `no_subcommand...` fail (the trivial `main` exits 0 and ignores args).
+Expected: FAIL — the trivial `main` ignores args, prints nothing, and exits 0, so **all four** tests fail (the two `--version`/`--help` tests get no output and a 0 exit they don't expect to be empty; the two subcommand tests expect a non-zero exit).
 
 - [ ] **Step 3: Add the `clap` dependency**
 
@@ -322,14 +321,17 @@ impl Command {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    match cli.command {
-        None => Err("no subcommand given; run `tcp-visr --help`".into()),
-        Some(command) => {
-            Err(format!("`{}` is not implemented yet (see the milestone roadmap)", command.name()).into())
-        }
-    }
+    let Some(command) = cli.command else {
+        return Err("no subcommand given; run `tcp-visr --help`".into());
+    };
+    let name = command.name();
+    Err(format!("`{name}` is not implemented yet (see the milestone roadmap)").into())
 }
 ```
+
+> The `let...else` form keeps every line under 100 columns so `cargo fmt --check` is
+> stable on the verbatim snippet; `name()` is private, so pedantic's `must_use_candidate`
+> does not fire. Step 6 still runs `cargo fmt --all` first as a safety net.
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
@@ -341,11 +343,14 @@ Expected: PASS (4 tests).
 Run:
 
 ```bash
+cargo fmt --all
 cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Expected: clean. (Returning `Err` from `main` is not a panic; the `assert!`s live in test code allowed by `clippy.toml`.)
+Expected: clean. Returning `Err` from `main` is not a panic; the `()`-returning tests use
+`.unwrap()` (allowed via `clippy.toml`'s `allow-unwrap-in-tests`), so neither `unwrap_used`
+nor `panic_in_result_fn` fires.
 
 - [ ] **Step 7: Commit**
 
@@ -381,16 +386,15 @@ version = 2
 [bans]
 multiple-versions = "warn"
 
+# Only the SPDX ids actually present in M0's tree (clap + std deps). Add more as later
+# milestones introduce dependencies — an unused `allow` entry emits a license-not-encountered
+# warning, which the zero-warnings policy forbids.
 [licenses]
 version = 2
 allow = [
     "MIT",
     "Apache-2.0",
-    "Apache-2.0 WITH LLVM-exception",
     "Unicode-3.0",
-    "BSD-3-Clause",
-    "ISC",
-    "Zlib",
 ]
 
 [sources]

@@ -1,6 +1,6 @@
 # M0 — Repo & Toolchain Setup (Spec)
 
-> Implements: design §10.M0 · Depends-on: ADR-0001..0004 (structural only) ·
+> Implements: design §10.M0 · Depends-on: — (scaffolding only; ADRs constrain M1+) ·
 > Touches: `area:ci` `area:cli` `area:core` `area:docs` · Release: v0.1 · Type: `type:epic`
 
 ## Objective
@@ -20,7 +20,7 @@ prints `--help`/`--version`.
 - `tcp-visr` binary: a `clap` skeleton exposing `--help` and `--version`, plus the v1
   subcommand names as stubs (`replay`, `live`, `parse`, `conns`, `metrics`) that exit with a
   "not implemented yet" message — so the command surface is fixed early.
-- `cargo-deny` config (`deny.toml`): advisories, licenses, bans.
+- `cargo-deny` config (`deny.toml`): advisories, licenses, bans, sources.
 - GitHub Actions CI: `fmt --check`, `clippy -D warnings`, `test`, `cargo-deny check` — actions
   SHA-pinned with version comments, `persist-credentials: false`.
 - `prek` (pre-commit) hooks running fmt + clippy locally.
