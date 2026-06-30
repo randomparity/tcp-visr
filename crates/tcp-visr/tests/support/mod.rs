@@ -12,7 +12,7 @@
     clippy::too_many_arguments
 )]
 
-use etherparse::PacketBuilder;
+use etherparse::{PacketBuilder, TcpOptionElement};
 
 const DLT_EN10MB: u16 = 1;
 const C: [u8; 4] = [10, 0, 0, 1]; // client
@@ -55,6 +55,35 @@ pub fn tcp(
     }
     let mut buf = Vec::new();
     b.write(&mut buf, &vec![0xab; n]).expect("build tcp frame");
+    buf
+}
+
+/// One Ethernet+IPv4+TCP frame carrying a single SACK block `[left,right)`, `n` payload bytes.
+#[must_use]
+pub fn tcp_with_sack(
+    src: [u8; 4],
+    dst: [u8; 4],
+    sp: u16,
+    dp: u16,
+    seq: u32,
+    ack: u32,
+    left: u32,
+    right: u32,
+    n: usize,
+) -> Vec<u8> {
+    let builder = PacketBuilder::ethernet2([2, 0, 0, 0, 0, 1], [2, 0, 0, 0, 0, 2])
+        .ipv4(src, dst, 64)
+        .tcp(sp, dp, seq, 64240)
+        .ack(ack)
+        .options(&[TcpOptionElement::SelectiveAcknowledgement(
+            (left, right),
+            [None, None, None],
+        )])
+        .expect("valid SACK option");
+    let mut buf = Vec::new();
+    builder
+        .write(&mut buf, &vec![0xab; n])
+        .expect("build sack frame");
     buf
 }
 
@@ -132,6 +161,50 @@ pub fn fixture_set() -> Vec<(&'static str, Vec<u8>)> {
                 (1_000, tcp(C, S, cp, sp, ACK, u32::MAX - 100, 1, 50)),
                 (2_000, tcp(C, S, cp, sp, ACK, 200, 1, 50)),
                 (3_000, tcp(S, C, sp, cp, ACK, 1, 300, 10)),
+            ]),
+        ),
+    ]
+}
+
+/// The four M3 metric fixtures (`seq_wrap` is reused from the M2 set). Strictly increasing
+/// microsecond timestamps; reorder cases reverse SEQ, not time.
+#[must_use]
+pub fn metrics_fixture_set() -> Vec<(&'static str, Vec<u8>)> {
+    use flag::{ACK, SYN};
+    let (cp, sp) = (1234u16, 80u16);
+    vec![
+        // SYN handshake + data + ACKs: in-flight, handshake RTT, data RTT, throughput.
+        (
+            "metrics_basic.pcap",
+            legacy_pcap(&[
+                (1_000, tcp(C, S, cp, sp, SYN, 1000, 0, 0)), // SYN seq=1000
+                (2_000, tcp(S, C, sp, cp, SYN | ACK, 5000, 1001, 0)), // SYN-ACK
+                (3_000, tcp(C, S, cp, sp, ACK, 1001, 5001, 100)), // data 100B o2r
+                (4_000, tcp(S, C, sp, cp, ACK, 5001, 1101, 0)), // ACK of o2r data
+            ]),
+        ),
+        // data, then a retransmit of the same range after a long gap (>= reorder_window).
+        (
+            "metrics_retransmit.pcap",
+            legacy_pcap(&[
+                (1_000, tcp(C, S, cp, sp, ACK, 100, 1, 100)), // data 100..200
+                (3_001_000, tcp(C, S, cp, sp, ACK, 100, 1, 100)), // retransmit (gap 3.0001s)
+            ]),
+        ),
+        // out-of-order: a behind-frontier segment within reorder_window (1us gap).
+        (
+            "metrics_ooo.pcap",
+            legacy_pcap(&[
+                (1_000, tcp(C, S, cp, sp, ACK, 200, 1, 100)), // frontier 300
+                (1_001, tcp(C, S, cp, sp, ACK, 100, 1, 100)), // behind, gap 1us -> OOO
+            ]),
+        ),
+        // a segment carrying a SACK block.
+        (
+            "metrics_sack.pcap",
+            legacy_pcap(&[
+                (1_000, tcp(C, S, cp, sp, ACK, 100, 1, 50)),
+                (2_000, tcp_with_sack(S, C, sp, cp, 1, 151, 200, 260, 0)), // SACK [200,260)
             ]),
         ),
     ]

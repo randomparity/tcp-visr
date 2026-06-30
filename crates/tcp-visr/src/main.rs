@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use tcpvisr_core::Item;
+use serde::Serialize;
+use tcpvisr_core::{Item, MetricSample, Nanos, SampleDir};
+use tcpvisr_engine::{ConnectionMetrics, EngineConfig, SeriesCollection, Tracker};
 
 /// Visualize TCP flow over time from a live system or a pcap/pcapng replay.
 #[derive(Parser)]
@@ -31,8 +33,23 @@ enum Command {
         /// The `.pcap`/`.pcapng` capture file to analyze.
         file: PathBuf,
     },
-    /// Dump a connection's metric series.
-    Metrics,
+    /// Dump a connection's metric series as JSON.
+    Metrics {
+        /// The `.pcap`/`.pcapng` capture file to analyze.
+        file: PathBuf,
+        /// 0-based index of the connection (the order `tcp-visr conns` prints).
+        #[arg(long)]
+        conn: usize,
+        /// Trailing throughput window in milliseconds (must be >= 1).
+        #[arg(long, default_value_t = 1000)]
+        throughput_window_ms: u64,
+        /// Reorder window in milliseconds (a behind-frontier gap below this is out-of-order).
+        #[arg(long, default_value_t = 3)]
+        reorder_window_ms: u64,
+        /// Ceiling on retained samples for the selected connection (must be >= 1).
+        #[arg(long, default_value_t = 10_000_000)]
+        max_samples: usize,
+    },
 }
 
 impl Command {
@@ -42,7 +59,7 @@ impl Command {
             Command::Live => "live",
             Command::Parse { .. } => "parse",
             Command::Conns { .. } => "conns",
-            Command::Metrics => "metrics",
+            Command::Metrics { .. } => "metrics",
         }
     }
 }
@@ -67,6 +84,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Command::Parse { file } => run_parse(&file),
         Command::Conns { file } => run_conns(&file),
+        Command::Metrics {
+            file,
+            conn,
+            throughput_window_ms,
+            reorder_window_ms,
+            max_samples,
+        } => run_metrics(
+            &file,
+            conn,
+            throughput_window_ms,
+            reorder_window_ms,
+            max_samples,
+        ),
         other => Err(format!(
             "`{}` is not implemented yet (see the milestone roadmap)",
             other.name()
@@ -164,5 +194,131 @@ fn run_conns(file: &Path) -> Result<(), Box<dyn std::error::Error>> {
         conns.len(),
         skipped.total()
     )?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct ConnectionJson {
+    index: usize,
+    origin: String,
+    responder: String,
+    instance: u32,
+    state: String,
+    origin_inferred: bool,
+    opened_at_ns: u64,
+    last_at_ns: u64,
+}
+
+#[derive(Serialize)]
+struct SampleJson {
+    t_ns: u64,
+    dir: &'static str,
+    in_flight: u64,
+    throughput_bps: u64,
+    rtt_ns: Option<u64>,
+    retransmit: bool,
+    out_of_order: bool,
+    sack: bool,
+}
+
+#[derive(Serialize)]
+struct MetricsJson {
+    connection: ConnectionJson,
+    throughput_window_ns: u64,
+    reorder_window_ns: u64,
+    samples: Vec<SampleJson>,
+}
+
+fn dir_str(d: SampleDir) -> &'static str {
+    match d {
+        SampleDir::OriginToResponder => "o2r",
+        SampleDir::ResponderToOrigin => "r2o",
+    }
+}
+
+fn sample_json(s: &MetricSample) -> SampleJson {
+    SampleJson {
+        t_ns: s.t.0,
+        dir: dir_str(s.dir),
+        in_flight: s.in_flight_bytes,
+        throughput_bps: s.throughput_bps,
+        rtt_ns: s.rtt.map(|n| n.0),
+        retransmit: s.retransmit,
+        out_of_order: s.out_of_order,
+        sack: s.sack,
+    }
+}
+
+/// Resolves connection `conn` in a lifecycle-only pass, then collects only its series in a
+/// second pass, and serializes it as JSON. Two passes are safe because replay is deterministic.
+fn run_metrics(
+    file: &Path,
+    conn: usize,
+    throughput_window_ms: u64,
+    reorder_window_ms: u64,
+    max_samples: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if throughput_window_ms == 0 {
+        return Err("--throughput-window-ms must be at least 1 (got 0)".into());
+    }
+    if max_samples == 0 {
+        return Err("--max-samples must be at least 1 (got 0)".into());
+    }
+
+    let base = EngineConfig {
+        throughput_window: Nanos(throughput_window_ms.saturating_mul(1_000_000)),
+        reorder_window: Nanos(reorder_window_ms.saturating_mul(1_000_000)),
+        max_samples,
+        ..EngineConfig::default()
+    };
+
+    // Pass 1: resolve the target connection (lifecycle only, no series).
+    let mut pass1 = Tracker::new(base);
+    let _ = tcpvisr_ingest::parse_file_visit(file, &mut |item| pass1.observe(item))?;
+    let conns = pass1.into_connections();
+    let target = conns.get(conn).ok_or_else(|| {
+        format!(
+            "connection index {conn} out of range (capture has {} connections, 0..{}); \
+             run `tcp-visr conns {}` to list them",
+            conns.len(),
+            conns.len().saturating_sub(1),
+            file.display()
+        )
+    })?;
+    let target_id = target.id;
+
+    // Pass 2: collect only the target's series.
+    let cfg = EngineConfig {
+        series_collection: SeriesCollection::Only(target_id),
+        ..base
+    };
+    let mut pass2 = Tracker::new(cfg);
+    let _ = tcpvisr_ingest::parse_file_visit(file, &mut |item| pass2.observe(item))?;
+    let metrics = pass2.into_metrics()?;
+    let selected: &ConnectionMetrics = metrics
+        .iter()
+        .find(|m| m.conn.id == target_id)
+        .ok_or("internal: target connection vanished between passes")?;
+
+    let c = &selected.conn;
+    let json = MetricsJson {
+        connection: ConnectionJson {
+            index: conn,
+            origin: c.origin.to_string(),
+            responder: c.responder.to_string(),
+            instance: c.id.instance,
+            state: format!("{:?}", c.state),
+            origin_inferred: c.origin_inferred,
+            opened_at_ns: c.opened_at.0,
+            last_at_ns: c.last_at.0,
+        },
+        throughput_window_ns: cfg.throughput_window.0,
+        reorder_window_ns: cfg.reorder_window.0,
+        samples: selected.series.iter().map(sample_json).collect(),
+    };
+
+    let mut out = std::io::stdout().lock();
+    serde_json::to_writer_pretty(&mut out, &json)?;
+    writeln!(out)?; // trailing newline
     Ok(())
 }
