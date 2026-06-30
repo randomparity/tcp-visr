@@ -1,0 +1,36 @@
+{
+  "connection": {
+    "index": 0,
+    "origin": "10.0.0.1:1234",
+    "responder": "10.0.0.2:80",
+    "instance": 0,
+    "state": "Established",
+    "origin_inferred": true,
+    "opened_at_ns": 0,
+    "last_at_ns": 1000
+  },
+  "throughput_window_ns": 1000000000,
+  "reorder_window_ns": 3000000,
+  "samples": [
+    {
+      "t_ns": 0,
+      "dir": "o2r",
+      "in_flight": 100,
+      "throughput_bps": 800,
+      "rtt_ns": null,
+      "retransmit": false,
+      "out_of_order": false,
+      "sack": false
+    },
+    {
+      "t_ns": 1000,
+      "dir": "o2r",
+      "in_flight": 100,
+      "throughput_bps": 1600,
+      "rtt_ns": null,
+      "retransmit": false,
+      "out_of_order": true,
+      "sack": false
+    }
+  ]
+}

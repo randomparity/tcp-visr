@@ -48,3 +48,30 @@ fn regenerate_metrics_fixtures() {
         std::fs::write(std::path::Path::new(dir).join(name), bytes).unwrap();
     }
 }
+
+#[test]
+fn committed_oracle_goldens_are_present_json() {
+    // The goldens are byte-matched against live output by tests/metrics.rs; here we only assert
+    // each exists and is non-empty JSON with a trailing newline, so an accidental deletion or
+    // truncation is caught even if a fixture happened to produce empty output.
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/oracle");
+    for stem in [
+        "seq_wrap",
+        "metrics_basic",
+        "metrics_retransmit",
+        "metrics_ooo",
+        "metrics_sack",
+    ] {
+        let path = std::path::Path::new(dir).join(format!("{stem}.metrics.json"));
+        let body = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        assert!(
+            body.trim_start().starts_with('{'),
+            "{stem} golden is not JSON"
+        );
+        assert!(
+            body.ends_with('\n'),
+            "{stem} golden must end with a newline"
+        );
+    }
+}
