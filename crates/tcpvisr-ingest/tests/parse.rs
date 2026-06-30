@@ -198,3 +198,37 @@ fn missing_file_errors_with_open_context() {
     assert!(matches!(err, IngestError::Open { .. }));
     assert!(err.to_string().contains("opening capture"));
 }
+
+#[test]
+fn header_only_capture_decodes_like_full_snaplen() {
+    use etherparse::PacketBuilder;
+
+    // One IPv4/TCP data segment with 80 payload bytes, raw-IP link.
+    let mut full = Vec::new();
+    PacketBuilder::ipv4([10, 0, 0, 1], [10, 0, 0, 2], 64)
+        .tcp(1234, 80, 1000, 64240)
+        .ack(1)
+        .write(&mut full, &[0x42; 80])
+        .unwrap();
+    let orig_len = full.len() as u32;
+    let header_end = full.len() - 80; // headers only
+
+    let full_cap = legacy_pcap(DLT_RAW, &[Pkt::new(TS, full.clone())]);
+    let hdr_cap = legacy_pcap(
+        DLT_RAW,
+        &[Pkt::truncated(TS, full[..header_end].to_vec(), orig_len)],
+    );
+
+    let full_parsed = parse_file(&write_temp("hdr_full.pcap", &full_cap)).unwrap();
+    let hdr_parsed = parse_file(&write_temp("hdr_only.pcap", &hdr_cap)).unwrap();
+
+    assert_eq!(full_parsed.items, hdr_parsed.items, "items differ");
+    assert_eq!(
+        full_parsed.skipped, hdr_parsed.skipped,
+        "skip counts differ"
+    );
+    assert_eq!(full_parsed.skipped.total(), 0, "nothing should be skipped");
+    // The header-only segment must carry the *non-zero on-wire* payload length
+    // (acceptance criterion 3), not the truncated captured length.
+    assert_eq!(only_segment(&hdr_parsed.items).payload_len, 80);
+}
