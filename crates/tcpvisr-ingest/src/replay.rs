@@ -113,8 +113,11 @@ fn handle_block(
             Ok(())
         }
         PcapBlockOwned::Legacy(b) => {
-            let abs_ns =
-                u64::from(b.ts_sec) * 1_000_000_000 + u64::from(b.ts_usec) * state.nanos_per_tick;
+            // Saturating so a crafted timestamp clamps instead of overflow-panicking (debug)
+            // or wrapping (release) in a parser that must stay hostile-input-safe (design §7).
+            let abs_ns = u64::from(b.ts_sec)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(u64::from(b.ts_usec).saturating_mul(state.nanos_per_tick));
             process_packet(state, abs_ns, b.caplen, b.origlen, b.data, path, sink)
         }
         PcapBlockOwned::NG(Block::InterfaceDescription(idb)) => {
@@ -125,17 +128,42 @@ fn handle_block(
                 }
             }
             state.link_type = Some(link);
-            state.nanos_per_tick = MICRO_TICK_NS; // M1: microsecond fixtures (ns deferred to M11)
+            // Honor the interface's declared timestamp resolution rather than assuming
+            // microsecond; surface a resolution we cannot represent in `Nanos` (design §7,
+            // "no silent fallbacks") instead of mis-scaling silently.
+            let ticks_per_sec = idb.ts_resolution().ok_or_else(|| IngestError::Container {
+                path: path.to_path_buf(),
+                detail: "unreadable interface timestamp resolution".to_owned(),
+            })?;
+            state.nanos_per_tick =
+                nanos_per_tick(ticks_per_sec).ok_or_else(|| IngestError::Container {
+                    path: path.to_path_buf(),
+                    detail: format!(
+                        "unsupported timestamp resolution ({ticks_per_sec} ticks/s); \
+                         M1 supports nanosecond or coarser"
+                    ),
+                })?;
             Ok(())
         }
         PcapBlockOwned::NG(Block::EnhancedPacket(epb)) => {
             let ticks = (u64::from(epb.ts_high) << 32) | u64::from(epb.ts_low);
-            let abs_ns = ticks * state.nanos_per_tick;
+            let abs_ns = ticks.saturating_mul(state.nanos_per_tick);
             process_packet(state, abs_ns, epb.caplen, epb.origlen, epb.data, path, sink)
         }
         // Section headers and other pcapng blocks (statistics, name resolution, ...) carry no
         // packet for M1 and are ignored.
         PcapBlockOwned::NG(_) => Ok(()),
+    }
+}
+
+/// Nanoseconds per timestamp tick for a resolution of `ticks_per_sec`, or `None` if it is
+/// finer than nanosecond or does not divide evenly into 1e9 (unrepresentable in `Nanos`).
+fn nanos_per_tick(ticks_per_sec: u64) -> Option<u64> {
+    const NS_PER_SEC: u64 = 1_000_000_000;
+    if ticks_per_sec == 0 || NS_PER_SEC % ticks_per_sec != 0 {
+        None
+    } else {
+        Some(NS_PER_SEC / ticks_per_sec)
     }
 }
 

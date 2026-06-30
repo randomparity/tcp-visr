@@ -325,11 +325,36 @@ fn push_shb(out: &mut Vec<u8>) {
 }
 
 fn push_idb(out: &mut Vec<u8>, dlt: u16) {
+    push_idb_opts(out, dlt, None);
+}
+
+fn push_idb_opts(out: &mut Vec<u8>, dlt: u16, tsresol: Option<u8>) {
     let mut body = Vec::new();
     body.extend_from_slice(&dlt.to_le_bytes()); // linktype
     body.extend_from_slice(&0u16.to_le_bytes()); // reserved
     body.extend_from_slice(&65_535u32.to_le_bytes()); // snaplen
+    if let Some(resol) = tsresol {
+        body.extend_from_slice(&9u16.to_le_bytes()); // option code: if_tsresol
+        body.extend_from_slice(&1u16.to_le_bytes()); // option length
+        body.push(resol);
+        body.extend_from_slice(&[0, 0, 0]); // pad value to 32-bit boundary
+        body.extend_from_slice(&0u16.to_le_bytes()); // opt_endofopt code
+        body.extend_from_slice(&0u16.to_le_bytes()); // opt_endofopt length
+    }
     push_block(out, 0x0000_0001, &body);
+}
+
+/// A `.pcapng` whose interface declares an explicit `if_tsresol` (timestamp resolution).
+/// `pkts[i].ts_us` is interpreted as ticks in that resolution.
+#[must_use]
+pub fn pcapng_with_tsresol(dlt: u16, tsresol: u8, pkts: &[Pkt]) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_shb(&mut out);
+    push_idb_opts(&mut out, dlt, Some(tsresol));
+    for pkt in pkts {
+        push_epb(&mut out, pkt);
+    }
+    out
 }
 
 fn push_epb(out: &mut Vec<u8>, pkt: &Pkt) {

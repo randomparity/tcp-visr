@@ -142,6 +142,42 @@ fn skips_non_tcp_and_truncated_and_counts_them() {
 }
 
 #[test]
+fn pcapng_nanosecond_resolution_scales_timestamps() {
+    // if_tsresol = 9 (nanoseconds): a 250-tick gap is 250 ns, not 250 us. Guards the silent
+    // microsecond assumption.
+    let bytes = support::pcapng_with_tsresol(
+        DLT_EN10MB,
+        9,
+        &[
+            Pkt::new(0, ethernet(&ipv4_tcp_syn(1, 80), false)),
+            Pkt::new(250, ethernet(&ipv4_tcp_syn(2, 80), false)),
+        ],
+    );
+    let path = write_temp("ns.pcapng", &bytes);
+    let parsed = parse_file(&path).expect("parse");
+    let Item::Segment(second) = &parsed.items[1] else {
+        panic!()
+    };
+    assert_eq!(second.ts.0, 250);
+}
+
+#[test]
+fn pcapng_unsupported_subnanosecond_resolution_errors() {
+    // if_tsresol = 12 (picoseconds): finer than nanosecond is not representable in Nanos and
+    // must surface, not silently mis-scale.
+    let bytes = support::pcapng_with_tsresol(
+        DLT_EN10MB,
+        12,
+        &[Pkt::new(0, ethernet(&ipv4_tcp_syn(1, 80), false))],
+    );
+    let path = write_temp("pico.pcapng", &bytes);
+    assert!(matches!(
+        parse_file(&path),
+        Err(IngestError::Container { .. })
+    ));
+}
+
+#[test]
 fn rejects_mixed_link_types_in_pcapng() {
     // Two interfaces with different link types -> the two faucets could not agree; error out.
     let bytes = support::pcapng_two_interfaces(
