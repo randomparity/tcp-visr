@@ -203,6 +203,10 @@ reading the references it needs), produce exactly one `MetricSample`:
    with `ts > (max_observed_ts[d] − throughput_window)` (lazy prune; non-monotonic-safe via the
    running max), so its memory is bounded by **one window** of traffic regardless of capture
    size — it is **not** governed by `max_samples` (which bounds the output series).
+   **`throughput_window` must be `> 0`** (it is the divisor): the engine divides defensively
+   (a `0` window yields `throughput_bps = 0`, never a division-by-zero), so a test or caller that
+   pins `Nanos(0)` cannot panic the pure engine (the workspace denies `panic`); the CLI rejects
+   `--throughput-window-ms 0` up front with an actionable message (see the subcommand).
 
 `Tick` items produce **no** sample (replay emits none; live decay-to-zero is M11). The
 sample's `t` is `S.ts`. When the instance is being collected (`series_collection` is `All`, or
@@ -256,6 +260,12 @@ would exceed `max_samples`, stop pushing and record the overflow so `into_metric
   reuse the existing `Display`/`Debug` renderings (`Endpoint` `Display`, `ConnState` `Debug`).
   Serde `Serialize` is derived on **CLI-local DTO structs** that borrow from
   core/engine types (core/engine stay serde-free; ADR-0007).
+- **Flag validation.** `--throughput-window-ms` must be `≥ 1` (it is the throughput divisor);
+  `--max-samples` must be `≥ 1`. The CLI rejects `0` (or non-numeric) for either up front with an
+  actionable message naming the flag and the minimum (e.g. `--throughput-window-ms must be at
+  least 1 (got 0)`), before any parse, exiting non-zero. `--reorder-window-ms` of `0` is accepted
+  (it classifies every behind-frontier data segment as a retransmit). This keeps a zero window
+  from ever reaching the engine divisor, complementing the engine's defensive divide.
 - Errors propagate as `Result` (no `panic!`/`process::exit`); a missing/unreadable file yields
   the M1 actionable `IngestError`; an exceeded ceiling yields the `MetricError` message; both
   exit non-zero.
@@ -329,17 +339,19 @@ fixture is reviewable as source. M3 adds metric-specific fixtures and **golden o
     `Only` collection is bounded by the named connection alone (unrelated large flows do not
     trip it);
   - **non-monotonic time**: a reordered earlier-ts segment does not panic and computes its own
-    trailing window (saturating).
+    trailing window (saturating);
+  - **zero throughput window**: `throughput_window = Nanos(0)` yields `throughput_bps = 0` and
+    does **not** panic the engine (defensive divide).
 - **`proptest`** for the in-flight/serial property: for any baseline and any sequence of forward
   sends and advancing ACKs, `in_flight_bytes` equals the serial distance and never panics; for a
   send crossing the `u32` boundary, in-flight stays the true outstanding count (guards the
   wrap directly).
 - **CLI/oracle integration** (`tcp-visr` crate): `tcp-visr metrics <fixture> --conn N` exits 0
   and its stdout **byte-matches** the committed golden for every fixture; an out-of-range
-  `--conn` (rejected in pass 1, before any series is built), a missing file, and an exceeded
-  `--max-samples` each exit non-zero with the actionable message. A multi-connection capture with
-  a small `--max-samples` still succeeds for a small target connection (the `Only` ceiling is not
-  tripped by unrelated flows).
+  `--conn` (rejected in pass 1, before any series is built), a missing file, an exceeded
+  `--max-samples`, and a zero `--throughput-window-ms`/`--max-samples` each exit non-zero with the
+  actionable message. A multi-connection capture with a small `--max-samples` still succeeds for a
+  small target connection (the `Only` ceiling is not tripped by unrelated flows).
 - **Drift guard**: committed fixture bytes **and** committed oracle goldens match their
   generators (regenerate on change), matching M1/M2.
 
