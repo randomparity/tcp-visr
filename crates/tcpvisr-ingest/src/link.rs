@@ -13,13 +13,17 @@ pub enum LinkType {
 }
 
 impl LinkType {
-    /// Maps a libpcap data-link type (DLT) number to a supported `LinkType`.
+    /// Maps a data-link type (DLT) number to a supported `LinkType`.
+    ///
+    /// Raw IP accepts the pcap file's `LINKTYPE_RAW` (101) and the platform `DLT_RAW`
+    /// runtime values (12 on most systems, 14 on OpenBSD) that libpcap reports for the same
+    /// file, so both faucets normalize to the same `LinkType` (parity, ADR-0005).
     #[must_use]
     pub fn from_dlt(dlt: u16) -> Option<Self> {
         match dlt {
             1 => Some(Self::Ethernet),
             0 => Some(Self::Null),
-            101 => Some(Self::RawIp),
+            12 | 14 | 101 => Some(Self::RawIp),
             113 => Some(Self::LinuxSll),
             276 => Some(Self::LinuxSll2),
             _ => None,
