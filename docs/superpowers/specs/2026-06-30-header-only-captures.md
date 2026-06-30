@@ -95,7 +95,7 @@ onwire_ip_len = match net {
     Ipv4(v4) => v4.header().total_len() as usize,          // counts from IP header start
     Ipv6(v6) => 40 + v6.header().payload_length() as usize, // fixed header + payload
 };
-tcp_offset = offset of tcp.slice() within the IP slice;     // IP header + any ext headers
+tcp_offset = checked sub-slice offset of tcp.slice() within the IP slice; // IP hdr + ext hdrs
 need = tcp_offset + tcp.slice().len();                       // bytes up to end of TCP header
 payload_len = if onwire_ip_len >= need {
     (onwire_ip_len - need) as u32                            // on-wire payload length
@@ -104,9 +104,17 @@ payload_len = if onwire_ip_len >= need {
 };
 ```
 
-- `tcp_offset` is obtained from the sub-slice byte offset of the TCP header within
-  the stripped IP slice, so it accounts for IPv4 options and IPv6 extension
-  headers uniformly without re-summing per-layer lengths.
+- **Invariant (load-bearing):** `tcp.slice()` is a sub-slice of the exact stripped
+  IP slice passed to `from_ip` — same allocation — so the TCP header's byte offset
+  within that slice is well-defined. This holds for etherparse 0.20.2 (the lax
+  slicer returns borrows into the input, never copies). The implementation must not
+  assume it blindly: compute the offset with a **checked** operation
+  (`tcp.slice().as_ptr() as usize` minus `ip.as_ptr() as usize`, guarded by
+  `checked_sub` and an upper-bound check `tcp_offset + tcp.slice().len() <=
+  ip.len()`); if the invariant ever fails to hold, fall back to
+  `tcp.payload().len()` rather than underflowing. This offset accounts for IPv4
+  options and IPv6 extension headers uniformly without re-summing per-layer
+  lengths.
 - The **fallback** covers an implausible IP length field — notably hardware
   offload (TSO/GRO) where IPv4 `total_len` is 0, and IPv6 jumbograms
   (`payload_length` 0). There the on-wire length is unknowable from the header, so
@@ -134,9 +142,14 @@ decoder unit tests — are unchanged.
   `Len` error for header shortage and on `tcp.slice()` being a sub-slice of the
   passed IP slice. Both are verified against etherparse 0.20.2 source. A version
   bump must re-verify (covered by the unit tests above).
-- **Implausible length fields.** Offload/jumbo frames fall back to captured length
-  rather than fabricating a wrong on-wire value; this matches current behavior and
-  is documented, not silent magic.
+- **Implausible length fields.** For a *full* offload/jumbo frame the captured
+  length equals the on-wire length, so the fallback reports the same value as
+  today. The one genuinely lossy corner is a frame that is **both** offloaded
+  (`total_len`/`payload_length` 0) **and** snaplen-cut: there the IP length field
+  is unusable *and* the captured payload is truncated, so `payload_len` is
+  undercounted with no signal. No header source can recover the on-wire length in
+  that case; this is an accepted limitation, not a bug to fix. It requires hardware
+  offload and a short snaplen simultaneously, which is rare.
 - **IP-header truncation at tiny snaplens.** A snaplen that cuts inside the IP
   header still classifies `Truncated` because `from_ip` returns `Len` and the
   frame is truncated. A snaplen that cuts inside the *link* header is out of scope
