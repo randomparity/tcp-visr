@@ -21,9 +21,13 @@ jobs:
           persist-credentials: false
       - run: rustup show
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+      # libpcap headers are needed because `--all-features` / `--features live` compile the
+      # optional `pcap` dependency that drives the cross-faucet parity test (ADR-0005).
+      - run: sudo apt-get update && sudo apt-get install -y libpcap-dev
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --workspace
+      - run: cargo test -p tcpvisr-ingest --features live
 
   deny:
     runs-on: ubuntu-latest

@@ -34,3 +34,60 @@ fn no_subcommand_exits_nonzero() {
     let output = bin().output().unwrap();
     assert!(!output.status.success());
 }
+
+#[test]
+fn parse_prints_segments_and_skip_summary() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tcpvisr-ingest/tests/fixtures/ethernet.pcap"
+    );
+    let output = bin().args(["parse", fixture]).output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("->"),
+        "expected a decoded segment line: {stdout}"
+    );
+    assert!(
+        stdout.contains("skipped"),
+        "expected a skip summary: {stdout}"
+    );
+}
+
+#[test]
+fn parse_skip_fixture_exits_zero_and_counts_skips() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tcpvisr-ingest/tests/fixtures/skip.pcap"
+    );
+    let output = bin().args(["parse", fixture]).output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("1 segments"),
+        "one TCP segment decoded: {stdout}"
+    );
+    // skip.pcap holds one UDP (non_tcp) and one truncated record; the summary names reasons.
+    assert!(
+        stdout.contains("non_tcp=1"),
+        "per-reason breakdown: {stdout}"
+    );
+    assert!(
+        stdout.contains("truncated=1"),
+        "per-reason breakdown: {stdout}"
+    );
+}
+
+#[test]
+fn parse_missing_file_exits_nonzero_with_actionable_message() {
+    let output = bin()
+        .args(["parse", "/no/such/file.pcap"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("opening capture"),
+        "actionable error: {stderr}"
+    );
+}
