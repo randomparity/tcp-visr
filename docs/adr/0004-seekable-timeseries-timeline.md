@@ -17,23 +17,44 @@ seeking O(n) per scrub frame and couples render latency to parse cost — unwork
 ## Decision
 
 The engine will produce a **time-indexed `MetricSample` series per connection** up front.
-The timeline is a **cursor** over these series. Seeking is a binary search to `T`
-(O(log n)); playback speed only changes how fast the cursor advances. Rendering reads
-precomputed samples and never re-parses.
+The timeline is a **cursor** over these series. Rendering reads precomputed samples and never
+re-parses; playback speed only changes how fast the cursor advances.
 
-- **Replay**: the whole capture is parsed once into complete series.
-- **Live**: the same series are maintained incrementally in a bounded ring buffer
-  (configurable retention). Pause freezes the cursor while samples keep appending;
-  scroll-back is bounded by the retention window.
+- **Sample cadence**: one sample per processed segment (per-event). The series time index is
+  therefore irregular. "State as of `T`" is the **last sample at or before `T`**
+  (last-value-carried-forward) — not interpolation. `throughput_bps` is a trailing
+  sliding-window average of fixed length (default 1 s), **frozen into each sample at ingest
+  time** because seeking never re-parses; its window cannot be changed at scrub time.
+- **Cost is two-level.** Within one connection, seek is binary search, O(log m). The UI must
+  resolve **all connections active at `T`** (master list), so a random seek is **O(A·log m)**
+  per frame (A = active connections), found via a cross-connection interval index keyed by
+  `[opened_at, closed_at]`. During monotonic playback each connection advances O(1) from its
+  prior sample (O(A) per frame). A is bounded by a display cap; off-screen connections resolve
+  lazily. The "constant-feeling" property holds for bounded A, not for unbounded connection
+  counts.
+- **Replay**: the whole capture is parsed once into complete series, subject to a configurable
+  capture-size ceiling (fail-fast when exceeded; design §7).
+- **Live**: samples are maintained in a bounded ring buffer (configurable retention) for
+  **scroll-back display**. This is distinct from each connection's **running baseline** (ISN,
+  highest seq/ack), which is retained for the connection's life regardless of display
+  retention — so evicting old display samples never corrupts in-flight derivation. Pause
+  freezes the cursor; retention still applies during pause, and the frozen cursor is clamped
+  to the eviction horizon (with an indicator) so the buffer never grows unbounded during a
+  long pause.
 
 ## Consequences
 
-- Seek and speed are cheap and constant-feeling: 0.1× and 10× cost the same; scrubbing is
-  a binary search, not a replay.
-- Render performance is decoupled from parse/capture performance.
-- Cost: memory scales with retained samples. Replay holds the full series in memory (a
-  later enhancement can index/stream very large captures); live is bounded by the
-  retention window.
+- Speed is free: 0.1× and 10× cost the same. Random seek is O(A·log m) per frame (above),
+  not a replay; render performance is decoupled from parse/capture performance.
+- Cost: memory scales with retained samples. Replay holds the full series in memory, which is
+  the direct cause of the large-capture memory risk (design §14). v1 bounds it with a
+  configurable sample/size ceiling and fails fast when exceeded (design §7) rather than
+  risking OOM; streaming/indexing of very large captures is an explicit **post-v1** item, not
+  an open-ended "later." The "expected capture size" the per-event series targets is interactive
+  diagnostic captures (≤ low-millions of segments), not multi-hour full-link taps.
+- Live engine state has two lifetimes: bounded sample history (display) vs. per-connection
+  running baseline (connection lifetime). Many simultaneously-open long-lived connections make
+  the baseline set grow with connection count — bounded by the same active-connection cap.
 - Dense windows may need per-view downsampling to fit terminal resolution; the series
   granularity is the source, downsampling is a render-time concern.
 

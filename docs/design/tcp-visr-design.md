@@ -28,7 +28,9 @@ full transport controls (play/pause, 0.1–10× speed, seek/scrub, step).
 ## 2. Goals and non-goals
 
 ### Goals (v1)
-- TCP-only analysis, IPv4 and IPv6.
+- TCP-only analysis, IPv4 and IPv6. IPv6 in scope covers the common extension-header chains
+  (hop-by-hop, routing, destination-options, fragment); unsupported/abnormal chains and
+  IPv6-fragmented TCP segments are skipped-and-counted, not silently mis-parsed.
 - One analysis engine shared by live capture and pcap replay.
 - Master/detail UX: browse connections, drill into dynamics.
 - Four dynamics views: Time/Sequence (Stevens), In-flight/cwnd, RTT, Throughput/goodput.
@@ -76,7 +78,7 @@ interface, and is testable in isolation.
 | crate | responsibility | depends on | I/O |
 |-------|----------------|------------|-----|
 | `tcpvisr-core` | shared types: `FlowKey` (5-tuple, v4/v6), `Segment`, `MetricSample`, time units, serial-number arithmetic | — | none |
-| `tcpvisr-ingest` | pure-Rust `.pcap`/`.pcapng` parse (replay) + libpcap capture (live) → `(Timestamp, Segment)` stream; link types: Ethernet II, Linux SLL/SLL2, raw IP, loopback | core | files, libpcap |
+| `tcpvisr-ingest` | `.pcap`/`.pcapng` parse (replay) + libpcap capture (live) → `Item` stream (§4.1); link types: Ethernet II, Linux SLL & SLL2, raw IP, loopback | core | files, libpcap |
 | `tcpvisr-engine` | TCP connection state machine + metric derivation → per-connection time-indexed series | core | **none (pure)** |
 | `tcpvisr-enrich` | live-only: `sock_diag` (real cwnd/srtt/retrans) + `/proc` (process attribution), matched by `FlowKey` | core | netlink, procfs |
 | `tcpvisr-tui` | ratatui master/detail UI, timeline cursor, the four graph views | core, engine | terminal |
@@ -87,34 +89,93 @@ interface, and is testable in isolation.
 1. **Ingest boundary — `(Timestamp, Segment)` stream.** Both faucets (file, wire) emit
    the same item type. The engine never knows the source. This is what makes live and
    replay share ~90% of the code. See [ADR-0001](../adr/0001-packet-derived-unified-model.md).
-2. **Pure engine.** The engine takes timestamped segments and emits metric samples with
-   no file handles and no sockets. Every TCP edge case is a pure unit test fed a
-   hand-built `Vec<Segment>`. See [ADR-0002](../adr/0002-pure-engine-io-boundary.md).
+2. **Pure engine.** The engine takes timestamped `Item`s and emits metric samples with
+   no file handles, no sockets, and no clock reads. Event-driven TCP edge cases are pure
+   unit tests fed a hand-built `Vec<Item>`; time-driven cases (idle, RTO, throughput decay)
+   are exercised by injecting `Tick` items. See
+   [ADR-0002](../adr/0002-pure-engine-io-boundary.md).
+3. **One header decoder for both faucets.** libpcap (live) and `pcap-parser` (replay) differ
+   only in the *container/source* layer; both hand raw link-layer frames to the **same**
+   `etherparse`-based decoder that produces `Segment`s. This prevents the live and replay
+   paths from decoding identical on-wire bytes into different segments. A parity test (§8)
+   feeds one capture through both faucets and asserts identical `Item` streams.
+   `etherparse` 0.20.2 does **not** parse the SLL2 cooked header (the default link type for
+   `tcpdump -i any` on modern libpcap), so ingest decodes the SLL/SLL2 link headers itself
+   and hands the IP payload to `etherparse`. See
+   [ADR-0003](../adr/0003-libpcap-for-live-capture.md).
 
 ## 4. Data model
 
 ```
-FlowKey      = (src_ip, src_port, dst_ip, dst_port)   // canonicalized direction-independent
+FlowKey      = (src_ip, src_port, dst_ip, dst_port)   // TCP 4-tuple; protocol implicit (TCP-only)
+ConnId       = (FlowKey, instance)                    // see "connection identity" below
+Item         = Segment(ts, …) | Tick(ts)              // engine input; see §4.1
 Segment      = { seq, ack, flags, window, win_scale?, ts_opt?, sack_blocks, payload_len, direction }
 MetricSample = { t, in_flight_bytes, rtt?, throughput_bps, retransmit, out_of_order, sack }
-Connection   = { key, state, opened_at, closed_at?, series: Vec<MetricSample>, labels }
+Connection   = { id, state, opened_at, closed_at?, isn, series: Vec<MetricSample>, labels }
 KernelInfo   = { snd_cwnd, srtt, rttvar, retrans, delivery_rate, process? }  // live enrich
 ```
+
+**Connection identity.** A bare 4-tuple is *not* a stable connection identity: within one
+capture the same socket pair is reused (ephemeral port reuse, `TIME_WAIT` recycling, NAT
+rebinding). Keying solely on the 4-tuple would splice two independent sequence spaces into
+one series and corrupt in-flight/RTT/retransmit derivation. We therefore key connections by
+`ConnId = (FlowKey, instance)`: a new `instance` epoch begins on a SYN that follows a prior
+close, RST, or a long idle gap on the same 4-tuple. For mid-stream captures with no observed
+SYN, the instance is inferred from a large backward sequence discontinuity. `tcptrace`
+disambiguates instances the same way and for the same reason.
+
+**Wire metrics are "bytes in flight", not cwnd.** `in_flight_bytes` = `highest_seq_sent −
+highest_ack_seen` measures *outstanding* bytes on the wire, which is
+`min(cwnd, receiver_window, app-limited send rate)` — it equals the sender's congestion
+window only for an at-sender capture of a non-rwnd-limited, non-app-limited sender. The wire
+series is therefore labeled **bytes in flight (outstanding)** everywhere; the term **cwnd**
+is reserved for the kernel series (`KernelInfo.snd_cwnd`, live only). The two are overlaid
+for comparison but never conflated: `in_flight ≤ cwnd` always.
+
+**Capture vantage point** (at-sender vs. mid-path) determines what is observable: RTT halves,
+which retransmits are seen, and whether the wire/kernel comparison is well-posed. The vantage
+is recorded and shown; the wire-vs-kernel overlay is only meaningful for at-sender live
+capture (the one configuration where `KernelInfo` exists at all).
 
 Sequence and ack numbers are `u32` and **wrap**. All arithmetic on them (in-flight,
 RTT pairing, gap detection) uses serial-number comparison per RFC 1982, in
 `tcpvisr-core`, never naive subtraction. This is the single most error-prone area and is
 covered by `proptest`.
 
+### 4.1 Sampling, time, and as-of-T semantics
+
+- **Cadence**: one `MetricSample` per processed `Segment` (per-event sampling). The series
+  time index is therefore irregular; "state as of `T`" means the **last sample at or before
+  `T`** (last-value-carried-forward), not interpolation.
+- **Throughput** is a trailing sliding window of fixed length (default 1 s, configurable),
+  computed and frozen into each sample at ingest time — it cannot be recomputed at scrub time
+  because seeking never re-parses (§5).
+- **Time advances without packets via `Tick` items.** A connection that goes silent (no FIN,
+  no RST, no data) emits no segments, so in live mode `ingest` injects periodic `Tick(ts)`
+  items into the same stream. Ticks drive idle/dead transitions, inferred-RTO expiry, and
+  throughput decay-to-zero. The engine stays pure: time is still data
+  ([ADR-0002](../adr/0002-pure-engine-io-boundary.md)). In replay, "now" is simply the last
+  segment's timestamp and ticks are unnecessary.
+
 ## 5. The seekable timeline
 
-Arbitrary seek requires knowing every connection's state at any time `T` cheaply.
+Arbitrary seek requires resolving **every active connection's** state at any time `T`.
+Two structures, two costs:
 
-- **Replay**: ingest fully parses the capture up front; the engine produces complete
-  per-connection series. Seeking is a binary search into the series (O(log n)).
-- **Live**: the same engine is fed from libpcap; series are held in a bounded ring
-  buffer (configurable retention window). Pause freezes the cursor while the series keeps
-  appending; scroll-back is bounded by retention.
+- **Within one connection**: binary search to the last sample ≤ `T` — O(log m), m = samples.
+- **Across connections**: an interval index keyed by `[opened_at, closed_at]` yields the set
+  of connections active at `T`. A random seek (scrubber drag) is therefore
+  **O(A·log m)** per frame, A = connections active at `T` — not the O(log m) of a single
+  series. During normal playback the cursor advances monotonically, so each connection's
+  per-frame resolution is an O(1) step from the previous sample (O(A) per frame, amortized).
+  The headline cost is the random-seek case; A is bounded by a configurable display cap and
+  off-screen connections are resolved lazily.
+- **Replay**: ingest parses the capture up front; the engine produces complete per-connection
+  series. Subject to the capture-size policy in §7 (bounded, with fail-fast).
+- **Live**: the same engine is fed from libpcap + `Tick` items (§4.1). The live timeline
+  (bounded ring buffer, pause/freeze, eviction) is delivered and tested in **M11**, not the
+  replay-only M5 — see §10.
 - **Speed** (0.1–10×) only controls how fast the cursor advances over precomputed series.
   It never re-parses, so 10× and 0.1× cost the same. See
   [ADR-0004](../adr/0004-seekable-timeseries-timeline.md).
@@ -137,8 +198,11 @@ Arbitrary seek requires knowing every connection's state at any time `T` cheaply
   filter, selection; reflects state "as of cursor time `T`".
 - **Detail pane**: tab between the four graph views; drawn with ratatui `Canvas`/braille,
   axes auto-scaled to the visible time window.
-- In live mode, wire-derived series and kernel series are drawn as distinct overlays —
-  never conflated. Divergence between them is itself a diagnostic signal.
+- The in-flight chart plots **bytes in flight (outstanding)** from the wire; in at-sender
+  live mode it overlays the kernel's true **cwnd** (`KernelInfo.snd_cwnd`) as a distinct
+  series. They are never conflated (in-flight ≤ cwnd; see §4). Divergence is a diagnostic
+  signal only when both share a vantage — i.e. at-sender live capture; elsewhere the kernel
+  series is simply absent.
 
 ## 7. Error handling
 
@@ -146,14 +210,32 @@ Arbitrary seek requires knowing every connection's state at any time `T` cheaply
 - Malformed packets in a capture are **skipped and counted**, not fatal; the count is
   surfaced in the UI status line. A truncated capture renders what parsed.
 - Missing `CAP_NET_RAW` for live capture produces a clear message naming the `setcap`
-  fix. Absent `sock_diag`/`/proc` enrichment degrades gracefully (wire-only series).
-- No silent fallbacks: any degraded mode is shown to the user.
+  fix. If the unprivileged handle opens but yields no packets, that is detected and
+  surfaced as a privilege problem (not silent "idle network") — verified in M11.
+- Enrichment is per-connection optional: a connection with no local socket (remote peer),
+  no `/proc` entry, or missing `sock_diag` shows an explicit `n/a` in the kernel columns
+  rather than blank or stale data. No silent fallbacks: any degraded mode is shown.
+- **Capture-size policy (memory).** Replay holds per-connection series in memory (§5,
+  [ADR-0004](../adr/0004-seekable-timeseries-timeline.md)). v1 enforces a configurable
+  sample/size ceiling; exceeding it fails fast with a clear message (size, ceiling, and the
+  `--max-*` override) rather than risking OOM. Streaming/indexing of very large captures is
+  a post-v1 enhancement, explicitly out of v1 scope.
 
 ## 8. Testing strategy
 
-- **engine**: pure unit tests fed hand-built segment vectors — reorder, retransmit, SACK,
-  zero-window, mid-stream (no handshake) captures. `proptest` for serial-number arithmetic.
-- **ingest**: small committed `.pcap`/`.pcapng` fixtures, one per link type.
+- **engine**: pure unit tests fed hand-built `Vec<Item>` — reorder, retransmit, SACK,
+  zero-window, mid-stream (no handshake), simultaneous-open, mid-stream RST, 4-tuple reuse
+  (instance disambiguation), `u32` seq wraparound, and `Tick`-driven idle/RTO/decay.
+  `proptest` for serial-number arithmetic.
+- **validation oracle**: derived metrics for a fixture set are cross-checked against an
+  independent tool (`tcptrace`, Wireshark TCP stream graphs, or live `ss`/`TCP_INFO` on a
+  self-generated capture). This catches a *systematically wrong* estimate — which the
+  hand-built unit tests cannot, since they assert the author's own expectation, and the
+  kernel overlay that would expose it does not exist in replay-only v0.1.
+- **ingest parity**: one capture fed through both faucets (libpcap and `pcap-parser`) must
+  produce identical `Item` streams, guarding the "one engine, identical behavior" promise.
+- **ingest**: small committed `.pcap`/`.pcapng` fixtures, one per link type (incl. SLL2 and
+  an IPv6 extension-header chain).
 - **tui**: `ratatui::TestBackend` frame snapshot tests.
 - **enrich**: behind a trait so it is mockable; the only component needing a live host.
 - Behavior, not implementation: tests assert what the metrics say, not how they are computed.
@@ -184,19 +266,19 @@ tasks within a milestone map to **sub-issues**. See [§12](#12-development-workf
 | ID | Title | Definition of Done | Release |
 |----|-------|--------------------|---------|
 | **M0** | Repo & toolchain | green CI (fmt, clippy `-D warnings`, test); `cargo run -- --help`; lint set, `cargo-deny`, prek hooks, templates, LICENSE | v0.1 |
-| **M1** | Packet model & replay parser | `tcp-visr parse f.pcap` prints decoded TCP segments; fixtures per link type | v0.1 |
-| **M2** | Connection state machine | `tcp-visr conns f.pcap` lists connections with state, bytes, duration; handles mid-stream captures | v0.1 |
-| **M3** | Metric derivation | `tcp-visr metrics f.pcap --conn N` dumps the time series (JSON); in-flight, RTT, throughput, retransmit/OOO/SACK | v0.1 |
+| **M1** | Packet model & replay parser | `tcp-visr parse f.pcap` prints decoded TCP segments; fixtures per link type incl. SLL2 and an IPv6 extension-header chain; both faucets pass the parity test (§8) | v0.1 |
+| **M2** | Connection state machine | `tcp-visr conns f.pcap` lists connections with state, bytes, duration; passes fixtures for mid-stream (no SYN), simultaneous-open, mid-stream RST, and 4-tuple reuse (distinct instances, §4) | v0.1 |
+| **M3** | Metric derivation | `tcp-visr metrics f.pcap --conn N` dumps the series (JSON); in-flight, throughput (defined window), retransmit/OOO/SACK; RTT paired under Karn's algorithm; passes `u32` seq-wrap fixtures and the validation oracle (§8) | v0.1 |
 | **M4** | TUI shell: master list | browse a capture's connections; sort, `/` filter, selection; port→service labels | v0.1 |
-| **M5** | Timeline + transport controls | scrub a capture; play/pause, 0.1–10× speed, seek, step; list updates "as of T" | v0.1 |
+| **M5** | Timeline + transport controls (replay) | scrub a *replayed* capture; play/pause, 0.1–10× speed, seek, step; master list resolves all active connections "as of T" via the cross-connection interval index (§5). Live-timeline semantics are M11 | v0.1 |
 | **M6** | Detail: Time/Sequence (Stevens) | seq-vs-time graph with retransmit/SACK marks, cursor-driven | v0.1 |
 | **M7** | Detail: In-flight / cwnd | wire-estimated in-flight sawtooth; overlay hooks for kernel cwnd | v0.1 |
 | **M8** | Detail: RTT | per-ack RTT samples + smoothed line | v0.1 |
 | **M9** | Detail: Throughput/goodput | sliding-window bytes/sec, goodput vs retransmitted; detail view switcher finalized | v0.1 |
 | **M10** | Name resolution | capture-DNS (IP→name from DNS packets) + live reverse-DNS with caching | v0.1 |
-| **M11** | Live capture (libpcap) | `tcp-visr live -i eth0`; interface select, BPF filter, ring-buffer retention, tail + pause/freeze + bounded scrollback | v0.2 |
-| **M12** | Live kernel enrichment | `sock_diag` real cwnd/srtt/retrans + `/proc` attribution by 5-tuple; overlays on M7/M8; graceful on replay | v0.2 |
-| **M13** | Ship 1.0 | config + themes, error UX, man page, asciinema README, install docs, crates.io metadata, release CI (cross-compiled binaries + checksums), CHANGELOG | v1.0 |
+| **M11** | Live capture (libpcap) | `tcp-visr live -i eth0`; interface select, BPF filter, nanosecond-precision timestamps (fallback micro); `Tick` injection drives idle/decay; bounded ring buffer with eviction; pause/freeze with cursor clamped to the eviction horizon; running per-connection baseline retained for connection life independent of display retention (§5, ADR-0004); unprivileged open errors rather than yielding silent-empty | v0.2 |
+| **M12** | Live kernel enrichment | `sock_diag` real cwnd/srtt/retrans + `/proc` attribution joined by `ConnId` (instance-aware, §4); defined poll cadence, sample-to-wire-timeline alignment, socket-disappearance and recycled-tuple guards; `n/a` for unenriched connections; overlays on M7/M8; absent on replay | v0.2 |
+| **M13** | Ship 1.0 | config + themes, error UX, man page, asciinema README, install docs (incl. per-platform libpcap requirement for `live`), crates.io metadata, release CI (replay-capable static binary + libpcap-dynamic binary for live; checksums), CHANGELOG | v1.0 |
 
 **Ordering rationale**: replay-first (M1–M10) exercises the engine against deterministic
 files before introducing the nondeterminism of a live wire, root, and a real NIC
@@ -277,11 +359,22 @@ and roadmap ordering already encode those, and duplicate state rots.
 
 ## 14. Risks
 
-- **Estimated vs. real cwnd** — wire-derived in-flight is an estimate; kept as a distinct
-  series, never presented as the kernel's cwnd.
+- **Outstanding-bytes vs. real cwnd** — the wire series is *bytes in flight*, not cwnd;
+  labeled and kept distinct (§4), never presented as the kernel's cwnd.
+- **Large-capture memory** — full per-connection series in RAM (ADR-0004) scales with
+  packet count; a large well-formed capture is the simplest resource-exhaustion path.
+  Mitigated by the v1 capture-size ceiling with fail-fast (§7); streaming is post-v1.
+- **Capture vantage point** — at-sender vs. mid-path changes what is observable (RTT halves,
+  visible retransmits) and whether the wire/kernel overlay is meaningful. Vantage is recorded
+  and shown; the overlay is gated to at-sender live capture (§4).
+- **Faucet timestamp skew** — libpcap defaults to microsecond precision while pcapng files
+  may carry nanosecond; live nanosecond is requested explicitly (fallback micro) and both
+  faucets normalize to one internal time unit, so RTT fidelity tracks the source, not the
+  faucet. Wall-clock timestamps are not assumed monotonic.
 - **TUI chart resolution** — terminal cells limit graph fidelity; braille/`Canvas`
   mitigate, but dense captures may need downsampling per visible window.
 - **libpcap system dependency** — documented install + `setcap`; replay path stays
-  libpcap-free so the tool is useful without it.
+  libpcap-free so the tool (and its static binary) is useful without it.
 - **Hostile capture input** — parsing untrusted pcaps; mitigated by malformed-packet
-  skip-and-count and `etherparse`'s allocation-free, fuzz-tested slicing.
+  skip-and-count and `etherparse`'s allocation-free, fuzz-tested slicing. Crafted IPv6
+  extension-header chains are skipped-and-counted when unsupported (§2 notes ext-header scope).
