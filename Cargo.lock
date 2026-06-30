@@ -544,7 +544,9 @@ name = "tcp-visr"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "etherparse",
  "tcpvisr-core",
+ "tcpvisr-engine",
  "tcpvisr-ingest",
 ]
 
@@ -558,6 +560,10 @@ dependencies = [
 [[package]]
 name = "tcpvisr-engine"
 version = "0.0.0"
+dependencies = [
+ "proptest",
+ "tcpvisr-core",
+]
 
 [[package]]
 name = "tcpvisr-enrich"

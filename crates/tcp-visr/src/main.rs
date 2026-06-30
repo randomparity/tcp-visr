@@ -27,7 +27,10 @@ enum Command {
         file: PathBuf,
     },
     /// List connections in a capture.
-    Conns,
+    Conns {
+        /// The `.pcap`/`.pcapng` capture file to analyze.
+        file: PathBuf,
+    },
     /// Dump a connection's metric series.
     Metrics,
 }
@@ -38,7 +41,7 @@ impl Command {
             Command::Replay => "replay",
             Command::Live => "live",
             Command::Parse { .. } => "parse",
-            Command::Conns => "conns",
+            Command::Conns { .. } => "conns",
             Command::Metrics => "metrics",
         }
     }
@@ -63,6 +66,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     match command {
         Command::Parse { file } => run_parse(&file),
+        Command::Conns { file } => run_conns(&file),
         other => Err(format!(
             "`{}` is not implemented yet (see the milestone roadmap)",
             other.name()
@@ -108,6 +112,56 @@ fn run_parse(file: &Path) -> Result<(), Box<dyn std::error::Error>> {
     writeln!(
         out,
         "{count} segments, skipped: {} total{breakdown}",
+        skipped.total()
+    )?;
+    Ok(())
+}
+
+/// Streams `file` through the replay faucet into the engine and prints one line per
+/// connection plus a skip summary.
+fn run_conns(file: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    use tcpvisr_engine::{EngineConfig, Tracker};
+
+    let mut tracker = Tracker::new(EngineConfig::default());
+    let (_link, skipped) = tcpvisr_ingest::parse_file_visit(file, &mut |item| {
+        tracker.observe(item);
+    })?;
+
+    let mut out = std::io::stdout().lock();
+    let conns = tracker.into_connections();
+    for c in &conns {
+        let marker = if c.origin_inferred {
+            " (mid-stream)"
+        } else {
+            ""
+        };
+        writeln!(
+            out,
+            "{} -> {}  state={:?}  inst={}  bytes={}/{}  segs={}  dur={}{marker}",
+            c.origin,
+            c.responder,
+            c.state,
+            c.id.instance,
+            c.bytes_o2r,
+            c.bytes_r2o,
+            c.segments,
+            c.duration(),
+        )?;
+    }
+    let reasons: Vec<String> = skipped
+        .nonzero()
+        .into_iter()
+        .map(|(reason, n)| format!("{reason}={n}"))
+        .collect();
+    let breakdown = if reasons.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", reasons.join(", "))
+    };
+    writeln!(
+        out,
+        "{} connections, skipped: {} total{breakdown}",
+        conns.len(),
         skipped.total()
     )?;
     Ok(())

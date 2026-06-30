@@ -1,0 +1,610 @@
+//! The pure connection tracker (design §10.M2, ADR-0006).
+
+use std::collections::HashMap;
+
+use tcpvisr_core::{Endpoint, Item, Nanos, Segment, TcpFlags, TcpSeq};
+
+use crate::config::EngineConfig;
+use crate::conn::{ConnId, Connection, Direction, EndpointPair};
+use crate::state::ConnState;
+
+/// `true` when `seq` sits backward of `baseline` in RFC 1982 serial space by more than
+/// `threshold` — a drop to a fresh ISN, not a retransmit/reorder or a forward `u32` wrap.
+pub(crate) fn is_backward_reset(baseline: TcpSeq, seq: TcpSeq, threshold: u32) -> bool {
+    seq.serial_lt(baseline) && baseline.serial_diff(seq) > threshold
+}
+
+fn is_bare_syn(f: TcpFlags) -> bool {
+    f.syn() && !f.ack()
+}
+
+fn is_syn_ack(f: TcpFlags) -> bool {
+    f.syn() && f.ack()
+}
+
+/// Max serial seq seen in a direction: keep the more-forward of the two.
+fn advance_baseline(current: Option<TcpSeq>, seq: TcpSeq) -> TcpSeq {
+    match current {
+        Some(base) if base.serial_gt(seq) => base,
+        _ => seq,
+    }
+}
+
+/// Full per-instance tracking state (internal). The public view is [`Connection`].
+struct ConnTrack {
+    id: ConnId,
+    state: ConnState,
+    origin: Endpoint,
+    responder: Endpoint,
+    origin_inferred: bool,
+    opened_at: Nanos,
+    last_at: Nanos,
+    bytes_o2r: u64,
+    bytes_r2o: u64,
+    segments: u64,
+    fin_o2r: bool,
+    fin_r2o: bool,
+    base_o2r: Option<TcpSeq>,
+    base_r2o: Option<TcpSeq>,
+}
+
+impl ConnTrack {
+    fn direction_of(&self, src: Endpoint) -> Direction {
+        if src == self.origin {
+            Direction::OriginToResponder
+        } else {
+            Direction::ResponderToOrigin
+        }
+    }
+
+    fn baseline(&self, dir: Direction) -> Option<TcpSeq> {
+        match dir {
+            Direction::OriginToResponder => self.base_o2r,
+            Direction::ResponderToOrigin => self.base_r2o,
+        }
+    }
+
+    fn account(&mut self, seg: &Segment, dir: Direction) {
+        self.last_at = Nanos(self.last_at.0.max(seg.ts.0));
+        self.segments += 1;
+        match dir {
+            Direction::OriginToResponder => {
+                self.bytes_o2r += u64::from(seg.payload_len);
+                self.base_o2r = Some(advance_baseline(self.base_o2r, seg.seq));
+            }
+            Direction::ResponderToOrigin => {
+                self.bytes_r2o += u64::from(seg.payload_len);
+                self.base_r2o = Some(advance_baseline(self.base_r2o, seg.seq));
+            }
+        }
+    }
+
+    fn apply_state(&mut self, seg: &Segment, dir: Direction) {
+        let f = seg.flags;
+        if f.rst() {
+            self.state = ConnState::Reset; // terminal override from any state
+            return;
+        }
+        if self.state == ConnState::Reset {
+            return; // terminal
+        }
+        if is_syn_ack(f) {
+            if self.state == ConnState::SynSent {
+                self.state = self.state.advance_to(ConnState::SynReceived);
+            }
+        } else if is_bare_syn(f) {
+            // A bare SYN from the responder side while we have only seen the origin's SYN is
+            // the second leg of a simultaneous open. From the origin side it is a duplicate.
+            if self.state == ConnState::SynSent && dir == Direction::ResponderToOrigin {
+                self.state = self.state.advance_to(ConnState::SynReceived);
+            }
+        }
+        // The ACK that completes the handshake, or any data, after SYN-ACK -> Established.
+        if self.state == ConnState::SynReceived && (f.ack() || seg.payload_len > 0) {
+            self.state = self.state.advance_to(ConnState::Established);
+        }
+        if f.fin() {
+            match dir {
+                Direction::OriginToResponder => self.fin_o2r = true,
+                Direction::ResponderToOrigin => self.fin_r2o = true,
+            }
+            if self.fin_o2r && self.fin_r2o {
+                self.state = self.state.advance_to(ConnState::Closed);
+            } else {
+                self.state = self.state.advance_to(ConnState::FinWait);
+            }
+        }
+    }
+
+    fn view(&self) -> Connection {
+        Connection {
+            id: self.id,
+            state: self.state,
+            origin: self.origin,
+            responder: self.responder,
+            origin_inferred: self.origin_inferred,
+            opened_at: self.opened_at,
+            last_at: self.last_at,
+            bytes_o2r: self.bytes_o2r,
+            bytes_r2o: self.bytes_r2o,
+            segments: self.segments,
+        }
+    }
+}
+
+/// Pure per-connection tracker: fold `Item`s in, read `Connection`s out.
+pub struct Tracker {
+    config: EngineConfig,
+    conns: Vec<ConnTrack>,
+    live: HashMap<EndpointPair, usize>,
+    next_instance: HashMap<EndpointPair, u32>,
+}
+
+impl Tracker {
+    #[must_use]
+    pub fn new(config: EngineConfig) -> Self {
+        Self {
+            config,
+            conns: Vec::new(),
+            live: HashMap::new(),
+            next_instance: HashMap::new(),
+        }
+    }
+
+    /// Folds one `Item` into tracker state. `Tick`s are inert in replay (idle is evaluated
+    /// per-segment from each segment's own ts); they never create a connection.
+    pub fn observe(&mut self, item: &Item) {
+        if let Item::Segment(seg) = item {
+            self.observe_segment(seg);
+        }
+    }
+
+    fn observe_segment(&mut self, seg: &Segment) {
+        let src = seg.flow.source();
+        let dst = seg.flow.destination();
+        let pair = EndpointPair::new(src, dst);
+        if let Some(&idx) = self.live.get(&pair) {
+            if !self.should_split(idx, seg, src) {
+                let dir = self.conns[idx].direction_of(src);
+                self.conns[idx].account(seg, dir);
+                self.conns[idx].apply_state(seg, dir);
+                return;
+            }
+        }
+        self.create_instance(pair, seg, src, dst);
+    }
+
+    /// Whether `seg` should open a new instance instead of joining the live one at `idx`.
+    fn should_split(&self, idx: usize, seg: &Segment, src: Endpoint) -> bool {
+        let track = &self.conns[idx];
+        let f = seg.flags;
+        if is_bare_syn(f) {
+            let terminal = matches!(track.state, ConnState::Closed | ConnState::Reset);
+            let idle = seg.ts.0.saturating_sub(track.last_at.0) > self.config.dead_after.0;
+            return terminal || idle;
+        }
+        // SYN-less mid-stream reset: only meaningful on an established, live instance.
+        if track.state == ConnState::Established {
+            let dir = track.direction_of(src);
+            if let Some(base) = track.baseline(dir) {
+                return is_backward_reset(base, seg.seq, self.config.reset_threshold);
+            }
+        }
+        false
+    }
+
+    fn create_instance(&mut self, pair: EndpointPair, seg: &Segment, src: Endpoint, dst: Endpoint) {
+        let instance = *self.next_instance.entry(pair).or_insert(0);
+        self.next_instance.insert(pair, instance + 1);
+
+        let flags = seg.flags;
+        let (origin, responder, origin_inferred, state) = if is_bare_syn(flags) {
+            (src, dst, false, ConnState::SynSent)
+        } else if is_syn_ack(flags) {
+            (dst, src, false, ConnState::SynReceived)
+        } else if flags.rst() {
+            (src, dst, true, ConnState::Reset)
+        } else if flags.fin() {
+            (src, dst, true, ConnState::FinWait)
+        } else {
+            (src, dst, true, ConnState::Established)
+        };
+
+        let mut track = ConnTrack {
+            id: ConnId { pair, instance },
+            state,
+            origin,
+            responder,
+            origin_inferred,
+            opened_at: seg.ts,
+            last_at: seg.ts,
+            bytes_o2r: 0,
+            bytes_r2o: 0,
+            segments: 0,
+            fin_o2r: false,
+            fin_r2o: false,
+            base_o2r: None,
+            base_r2o: None,
+        };
+        let dir = track.direction_of(src);
+        track.account(seg, dir);
+        if flags.fin() {
+            match dir {
+                Direction::OriginToResponder => track.fin_o2r = true,
+                Direction::ResponderToOrigin => track.fin_r2o = true,
+            }
+        }
+        let idx = self.conns.len();
+        self.conns.push(track);
+        self.live.insert(pair, idx);
+    }
+
+    /// All tracked instances, ordered by `(opened_at, pair, instance)` for determinism.
+    #[must_use]
+    pub fn into_connections(self) -> Vec<Connection> {
+        let mut out: Vec<Connection> = self.conns.iter().map(ConnTrack::view).collect();
+        out.sort_by_key(|c| (c.opened_at, c.id.pair, c.id.instance));
+        out
+    }
+}
+
+/// Tracks every connection in `items` and returns the reported connections (test convenience).
+#[must_use]
+pub fn track<'a>(
+    items: impl IntoIterator<Item = &'a Item>,
+    config: EngineConfig,
+) -> Vec<Connection> {
+    let mut tracker = Tracker::new(config);
+    for item in items {
+        tracker.observe(item);
+    }
+    tracker.into_connections()
+}
+
+#[cfg(test)]
+mod test_support {
+    use core::net::{IpAddr, Ipv4Addr};
+    use tcpvisr_core::{FlowKey, Item, Nanos, Segment, TcpFlags, TcpOptions, TcpSeq};
+
+    pub fn ep(o: u8, p: u16) -> (IpAddr, u16) {
+        (IpAddr::V4(Ipv4Addr::new(10, 0, 0, o)), p)
+    }
+
+    /// Build a one-segment `Item`. `ack` is carried for state tests; pass `0` when unused.
+    pub fn seg(
+        src: (IpAddr, u16),
+        dst: (IpAddr, u16),
+        flags: u16,
+        seq: u32,
+        ack: u32,
+        len: u32,
+        ts: u64,
+    ) -> Item {
+        Item::Segment(Segment {
+            ts: Nanos(ts),
+            flow: FlowKey {
+                src_ip: src.0,
+                src_port: src.1,
+                dst_ip: dst.0,
+                dst_port: dst.1,
+            },
+            seq: TcpSeq(seq),
+            ack: TcpSeq(ack),
+            flags: TcpFlags(flags),
+            window: 0,
+            options: TcpOptions::default(),
+            payload_len: len,
+        })
+    }
+}
+
+#[cfg(test)]
+mod orient_tests {
+    use super::test_support::{ep, seg};
+    use super::*;
+    use tcpvisr_core::{Nanos, TcpFlags};
+
+    #[test]
+    fn bare_syn_sets_origin_and_groups_both_directions() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(EngineConfig::default());
+        t.observe(&seg(c, s, TcpFlags::SYN, 100, 0, 0, 1_000)); // client SYN
+        t.observe(&seg(
+            s,
+            c,
+            TcpFlags::SYN | TcpFlags::ACK,
+            500,
+            101,
+            0,
+            2_000,
+        )); // server SYN-ACK
+        t.observe(&seg(c, s, TcpFlags::ACK, 101, 501, 10, 3_000)); // 10 bytes c->s
+        t.observe(&seg(s, c, TcpFlags::ACK, 501, 111, 20, 4_000)); // 20 bytes s->c
+        let conns = t.into_connections();
+        assert_eq!(conns.len(), 1, "both directions group into one connection");
+        let conn = conns[0];
+        assert_eq!((conn.origin.ip, conn.origin.port), c);
+        assert_eq!((conn.responder.ip, conn.responder.port), s);
+        assert!(!conn.origin_inferred);
+        assert_eq!(conn.bytes_o2r, 10);
+        assert_eq!(conn.bytes_r2o, 20);
+        assert_eq!(conn.segments, 4);
+        assert_eq!(conn.duration(), Nanos(3_000));
+    }
+
+    #[test]
+    fn syn_ack_first_orients_server_as_responder() {
+        let (c, s) = (ep(1, 1234), ep(2, 443));
+        let mut t = Tracker::new(EngineConfig::default());
+        t.observe(&seg(s, c, TcpFlags::SYN | TcpFlags::ACK, 9, 0, 0, 1_000)); // joined mid-handshake
+        let conns = t.into_connections();
+        assert_eq!(
+            (conns[0].origin.ip, conns[0].origin.port),
+            c,
+            "client is origin"
+        );
+        assert_eq!((conns[0].responder.ip, conns[0].responder.port), s);
+        assert!(!conns[0].origin_inferred, "SYN-ACK orientation is observed");
+    }
+
+    #[test]
+    fn mid_stream_infers_origin_from_first_segment() {
+        let (a, b) = (ep(1, 5000), ep(2, 8080));
+        let mut t = Tracker::new(EngineConfig::default());
+        t.observe(&seg(a, b, TcpFlags::ACK, 42, 0, 5, 1_000)); // no SYN ever
+        let conns = t.into_connections();
+        assert_eq!((conns[0].origin.ip, conns[0].origin.port), a);
+        assert!(conns[0].origin_inferred);
+        assert_eq!(conns[0].bytes_o2r, 5);
+    }
+
+    #[test]
+    fn last_at_is_max_under_reordered_timestamps() {
+        let (a, b) = (ep(1, 5000), ep(2, 8080));
+        let mut t = Tracker::new(EngineConfig::default());
+        t.observe(&seg(a, b, TcpFlags::ACK, 42, 0, 5, 5_000)); // later ts first
+        t.observe(&seg(a, b, TcpFlags::ACK, 47, 0, 5, 1_000)); // reordered earlier ts
+        let conns = t.into_connections();
+        assert_eq!(conns[0].opened_at, Nanos(5_000));
+        assert_eq!(
+            conns[0].last_at,
+            Nanos(5_000),
+            "earlier ts must not move last_at back"
+        );
+        assert_eq!(conns[0].duration(), Nanos(0), "saturating, no panic");
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::test_support::{ep, seg};
+    use super::*;
+    use tcpvisr_core::{Item, TcpFlags};
+
+    fn run(items: &[Item]) -> Vec<Connection> {
+        let mut t = Tracker::new(EngineConfig::default());
+        for it in items {
+            t.observe(it);
+        }
+        t.into_connections()
+    }
+
+    #[test]
+    fn three_way_handshake_reaches_established() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let conns = run(&[
+            seg(c, s, TcpFlags::SYN, 100, 0, 0, 1),
+            seg(s, c, TcpFlags::SYN | TcpFlags::ACK, 500, 101, 0, 2),
+            seg(c, s, TcpFlags::ACK, 101, 501, 0, 3),
+        ]);
+        assert_eq!(conns[0].state, ConnState::Established);
+    }
+
+    #[test]
+    fn simultaneous_open_reaches_established() {
+        let (a, b) = (ep(1, 4000), ep(2, 4001));
+        let conns = run(&[
+            seg(a, b, TcpFlags::SYN, 10, 0, 0, 1), // a SYN -> SynSent, a=origin
+            seg(b, a, TcpFlags::SYN, 20, 0, 0, 2), // b SYN (responder) -> SynReceived
+            seg(a, b, TcpFlags::ACK, 11, 21, 0, 3),
+            seg(b, a, TcpFlags::ACK, 21, 11, 0, 4),
+        ]);
+        assert_eq!(conns.len(), 1);
+        assert_eq!(conns[0].state, ConnState::Established);
+        assert!(!conns[0].origin_inferred);
+    }
+
+    #[test]
+    fn graceful_fin_fin_reaches_closed() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let conns = run(&[
+            seg(c, s, TcpFlags::ACK, 100, 1, 5, 1), // mid-stream established
+            seg(c, s, TcpFlags::FIN | TcpFlags::ACK, 105, 1, 0, 2),
+            seg(s, c, TcpFlags::FIN | TcpFlags::ACK, 1, 106, 0, 3),
+        ]);
+        assert_eq!(conns[0].state, ConnState::Closed);
+    }
+
+    #[test]
+    fn rst_overrides_to_reset() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let conns = run(&[
+            seg(c, s, TcpFlags::ACK, 100, 1, 5, 1),
+            seg(s, c, TcpFlags::RST, 1, 0, 0, 2),
+        ]);
+        assert_eq!(conns[0].state, ConnState::Reset);
+    }
+
+    #[test]
+    fn retransmitted_payload_is_recounted_as_wire_bytes() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let conns = run(&[
+            seg(c, s, TcpFlags::ACK, 100, 1, 10, 1), // 10 bytes c->s
+            seg(c, s, TcpFlags::ACK, 100, 1, 10, 2), // retransmit of the same 10 bytes
+        ]);
+        assert_eq!(
+            conns[0].bytes_o2r, 20,
+            "wire bytes count retransmits (M3 owns goodput)"
+        );
+        assert_eq!(conns[0].segments, 2);
+    }
+
+    #[test]
+    fn duplicate_syn_does_not_regress_established() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let conns = run(&[
+            seg(c, s, TcpFlags::SYN, 100, 0, 0, 1),
+            seg(s, c, TcpFlags::SYN | TcpFlags::ACK, 500, 101, 0, 2),
+            seg(c, s, TcpFlags::ACK, 101, 501, 5, 3), // Established
+            seg(c, s, TcpFlags::SYN, 100, 0, 0, 4),   // retransmitted SYN (dup)
+        ]);
+        assert_eq!(conns.len(), 1, "dup SYN on live conn does not split");
+        assert_eq!(conns[0].state, ConnState::Established);
+    }
+}
+
+#[cfg(test)]
+mod instance_tests {
+    use super::test_support::{ep, seg};
+    use super::*;
+    use tcpvisr_core::{Item, Nanos, TcpFlags};
+
+    fn run_cfg(items: &[Item], config: EngineConfig) -> Vec<Connection> {
+        track(items.iter(), config)
+    }
+
+    #[test]
+    fn tuple_reuse_new_syn_after_close_splits() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let conns = run_cfg(
+            &[
+                seg(c, s, TcpFlags::SYN, 100, 0, 0, 1),
+                seg(s, c, TcpFlags::SYN | TcpFlags::ACK, 500, 101, 0, 2),
+                seg(c, s, TcpFlags::ACK, 101, 501, 0, 3),
+                seg(c, s, TcpFlags::FIN | TcpFlags::ACK, 101, 501, 0, 4),
+                seg(s, c, TcpFlags::FIN | TcpFlags::ACK, 501, 102, 0, 5), // Closed
+                seg(c, s, TcpFlags::SYN, 9000, 0, 0, 6),                  // reuse: new SYN
+            ],
+            EngineConfig::default(),
+        );
+        assert_eq!(conns.len(), 2, "reuse after close is a second instance");
+        assert_eq!(conns[0].id.instance, 0);
+        assert_eq!(conns[1].id.instance, 1);
+        assert_eq!(conns[1].state, ConnState::SynSent);
+    }
+
+    #[test]
+    fn forward_wrap_stays_one_instance() {
+        let (a, b) = (ep(1, 5000), ep(2, 8080));
+        let conns = run_cfg(
+            &[
+                seg(a, b, TcpFlags::ACK, u32::MAX - 100, 1, 50, 1), // baseline near top
+                seg(a, b, TcpFlags::ACK, 200, 1, 50, 2),            // wrapped forward — advance
+            ],
+            EngineConfig::default(),
+        );
+        assert_eq!(conns.len(), 1, "a u32 wrap must not split the flow");
+    }
+
+    #[test]
+    fn large_backward_reset_splits_mid_stream() {
+        let (a, b) = (ep(1, 5000), ep(2, 8080));
+        let conns = run_cfg(
+            &[
+                seg(a, b, TcpFlags::ACK, 0x7000_0000, 1, 50, 1), // established baseline
+                seg(a, b, TcpFlags::ACK, 0x1000_0000, 1, 50, 2), // 0x6000_0000 backward -> reset
+            ],
+            EngineConfig::default(),
+        );
+        assert_eq!(conns.len(), 2, "fresh ISN far below baseline splits");
+    }
+
+    #[test]
+    fn small_backward_retransmit_does_not_split() {
+        let (a, b) = (ep(1, 5000), ep(2, 8080));
+        let conns = run_cfg(
+            &[
+                seg(a, b, TcpFlags::ACK, 1_000_000, 1, 50, 1),
+                seg(a, b, TcpFlags::ACK, 999_000, 1, 50, 2), // retransmit
+            ],
+            EngineConfig::default(),
+        );
+        assert_eq!(conns.len(), 1);
+    }
+
+    #[test]
+    fn idle_syn_past_dead_after_splits_even_without_close() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let cfg = EngineConfig {
+            dead_after: Nanos(1_000),
+            ..EngineConfig::default()
+        };
+        let conns = run_cfg(
+            &[
+                seg(c, s, TcpFlags::SYN, 100, 0, 0, 1),
+                seg(s, c, TcpFlags::SYN | TcpFlags::ACK, 500, 101, 0, 2), // SynReceived, live
+                seg(c, s, TcpFlags::SYN, 9000, 0, 0, 10_000), // 9998ns later: idle reuse
+            ],
+            cfg,
+        );
+        assert_eq!(
+            conns.len(),
+            2,
+            "SYN after idle > dead_after starts a new instance"
+        );
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::is_backward_reset;
+    use proptest::prelude::*;
+    use tcpvisr_core::TcpSeq;
+
+    const HALF: u32 = 1 << 31;
+
+    #[test]
+    fn forward_wrap_is_not_a_reset() {
+        // baseline near the top; seq wrapped forward by 0x300 — an advance, not a reset.
+        assert!(!is_backward_reset(
+            TcpSeq(u32::MAX - 0xFF),
+            TcpSeq(0x200),
+            1 << 30
+        ));
+    }
+
+    #[test]
+    fn small_backward_is_not_a_reset() {
+        assert!(!is_backward_reset(
+            TcpSeq(1_000_000),
+            TcpSeq(999_000),
+            1 << 30
+        ));
+    }
+
+    #[test]
+    fn large_backward_is_a_reset() {
+        // 0x6000_0000 backward (> 2^30, < 2^31).
+        assert!(is_backward_reset(
+            TcpSeq(0x7000_0000),
+            TcpSeq(0x1000_0000),
+            1 << 30
+        ));
+    }
+
+    proptest! {
+        #[test]
+        fn forward_delta_never_resets(base in any::<u32>(), d in 1u32..HALF) {
+            let seq = TcpSeq(base.wrapping_add(d));
+            prop_assert!(!is_backward_reset(TcpSeq(base), seq, 1 << 30));
+        }
+
+        #[test]
+        fn backward_delta_splits_iff_over_threshold(
+            base in any::<u32>(), b in 1u32..HALF, thr in 0u32..HALF
+        ) {
+            let seq = TcpSeq(base.wrapping_sub(b));
+            prop_assert_eq!(is_backward_reset(TcpSeq(base), seq, thr), b > thr);
+        }
+    }
+}

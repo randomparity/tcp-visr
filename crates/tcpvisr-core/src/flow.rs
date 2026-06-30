@@ -3,6 +3,8 @@
 use core::fmt;
 use core::net::IpAddr;
 
+use crate::endpoint::Endpoint;
+
 /// TCP 4-tuple. Protocol is implicit (TCP-only). Stored as-seen; not canonicalized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FlowKey {
@@ -10,6 +12,26 @@ pub struct FlowKey {
     pub src_port: u16,
     pub dst_ip: IpAddr,
     pub dst_port: u16,
+}
+
+impl FlowKey {
+    /// The source endpoint as seen on the wire.
+    #[must_use]
+    pub fn source(&self) -> Endpoint {
+        Endpoint {
+            ip: self.src_ip,
+            port: self.src_port,
+        }
+    }
+
+    /// The destination endpoint as seen on the wire.
+    #[must_use]
+    pub fn destination(&self) -> Endpoint {
+        Endpoint {
+            ip: self.dst_ip,
+            port: self.dst_port,
+        }
+    }
 }
 
 fn write_endpoint(f: &mut fmt::Formatter<'_>, ip: IpAddr, port: u16) -> fmt::Result {
