@@ -641,8 +641,12 @@ fn parse_options(tcp: &TcpSlice<'_>) -> TcpOptions {
 - `struct ReplayParse { pub items: Vec<Item>, pub skipped: SkipCounts, pub link_type: LinkType }`.
 - `#[derive(thiserror::Error)] enum IngestError` — variants `Open { path, source }`,
   `Container { path, detail }`, `UnknownLinkType { dlt: u16 }`, `MixedLinkTypes`.
-- `fn parse_file(path: &Path) -> Result<ReplayParse, IngestError>` (pure-Rust faucet).
-- `fn parse_reader(...)`/visitor used by the CLI for streaming (holds one frame at a time).
+- `fn parse_file_visit(path: &Path, sink: &mut dyn FnMut(&Item)) -> Result<(LinkType,
+  SkipCounts), IngestError>` — the streaming core; calls `sink` once per decoded `Item`,
+  holding only the current frame. **The CLI uses this** (constant memory, per spec).
+- `fn parse_file(path: &Path) -> Result<ReplayParse, IngestError>` — thin collector over
+  `parse_file_visit` (pushes each item into a `Vec`); used by tests and the parity test over
+  bounded fixtures.
 - `#[cfg(feature="live")] fn parse_file_libpcap(path: &Path) -> Result<ReplayParse, IngestError>`.
 
 **Fixture builder contract (`tests/support/mod.rs`):** pure functions returning `Vec<u8>`:
@@ -676,8 +680,11 @@ use crate::decode::{decode_frame, DecodeOutcome};
 use crate::link::LinkType;
 use crate::{IngestError, ReplayParse, SkipCounts};
 
-// Visitor callback receives (LinkType, Nanos, frame, is_truncated). Returns the decoded items.
-pub fn parse_file(path: &Path) -> Result<ReplayParse, IngestError> {
+// Streaming core: `sink` is called once per decoded Item; only the current frame is held.
+pub fn parse_file_visit(
+    path: &Path,
+    sink: &mut dyn FnMut(&Item),
+) -> Result<(LinkType, SkipCounts), IngestError> {
     let file = File::open(path).map_err(|source| IngestError::Open {
         path: path.to_path_buf(), source,
     })?;
@@ -685,18 +692,27 @@ pub fn parse_file(path: &Path) -> Result<ReplayParse, IngestError> {
         .map_err(|e| IngestError::Container { path: path.to_path_buf(), detail: format!("{e:?}") })?;
 
     let mut state = ParseState::default(); // link_type: Option<LinkType>, baseline: Option<u64>,
-                                           // items, skipped, micros_per_tick per IDB
+                                           // skipped: SkipCounts
     loop {
         match reader.next() {
             Ok((offset, block)) => {
-                handle_block(&mut state, &block)?; // sets link type from header/IDB; for each
-                                                   // packet computes abs_ns, Nanos, decode_frame,
-                                                   // records skip or pushes Item
+                handle_block(&mut state, &block, sink)?; // sets link type from header/IDB; per
+                                                         // packet: abs_ns, Nanos, decode_frame,
+                                                         // record skip or call sink(&item)
                 reader.consume(offset);
             }
             Err(PcapError::Eof) => break,
             Err(PcapError::Incomplete(_)) => {
-                reader.refill().map_err(/* Container */)?;
+                // No-progress guard: a refill that adds no buffered bytes means a
+                // truncated/garbage container at EOF — fail fast instead of looping forever on
+                // hostile input. (`data()` is the unconsumed buffer; `refill` grows it from disk.)
+                let before = reader.data().len();
+                reader.refill().map_err(|e| IngestError::Container {
+                    path: path.to_path_buf(), detail: format!("{e:?}") })?;
+                if reader.data().len() == before {
+                    return Err(IngestError::Container {
+                        path: path.to_path_buf(), detail: "incomplete/truncated container".into() });
+                }
             }
             Err(e) => return Err(IngestError::Container { path: path.to_path_buf(),
                                                           detail: format!("{e:?}") }),
@@ -705,7 +721,14 @@ pub fn parse_file(path: &Path) -> Result<ReplayParse, IngestError> {
     let link_type = state.link_type.ok_or(IngestError::Container {
         path: path.to_path_buf(), detail: "no packets / interface in capture".into(),
     })?;
-    Ok(ReplayParse { items: state.items, skipped: state.skipped, link_type })
+    Ok((link_type, state.skipped))
+}
+
+// Thin collector for tests / parity over bounded fixtures.
+pub fn parse_file(path: &Path) -> Result<ReplayParse, IngestError> {
+    let mut items = Vec::new();
+    let (link_type, skipped) = parse_file_visit(path, &mut |item| items.push(item.clone()))?;
+    Ok(ReplayParse { items, skipped, link_type })
 }
 ```
   `handle_block` rules:
@@ -865,16 +888,22 @@ fn parse_missing_file_exits_nonzero_with_message() {
 Command::Parse { file } => run_parse(&file),
 // ...
 fn run_parse(file: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-    let parsed = tcpvisr_ingest::parse_file(file)?;
     let mut out = std::io::stdout().lock();
-    for item in &parsed.items {
+    let mut count: u64 = 0;
+    let mut sink_err: Option<std::io::Error> = None;
+    // Stream: hold only the current item. Capture a write error to surface after the walk.
+    let (_link, skipped) = tcpvisr_ingest::parse_file_visit(file, &mut |item| {
+        if sink_err.is_some() { return; }
         if let tcpvisr_core::Item::Segment(s) = item {
-            writeln!(out, "{} {} {} seq={} ack={} win={} len={}",
-                s.ts, s.flow, s.flags, s.seq.0, s.ack.0, s.window, s.payload_len)?;
+            count += 1;
+            if let Err(e) = writeln!(out, "{} {} {} seq={} ack={} win={} len={}",
+                s.ts, s.flow, s.flags, s.seq.0, s.ack.0, s.window, s.payload_len) {
+                sink_err = Some(e);
+            }
         }
-    }
-    writeln!(out, "{} segments, skipped: {} total",
-        parsed.items.len(), parsed.skipped.total())?;
+    })?;
+    if let Some(e) = sink_err { return Err(e.into()); }
+    writeln!(out, "{count} segments, skipped: {} total", skipped.total())?;
     Ok(())
 }
 ```
