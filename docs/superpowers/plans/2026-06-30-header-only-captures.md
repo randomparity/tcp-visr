@@ -88,6 +88,10 @@ unchanged in this task (still `tcp.payload().len()`); Task 2 changes it.
 Add a test helper and two tests to the `#[cfg(test)] mod tests` block. The helper
 calls `decode_frame` with `wire_len == frame.len()` (a full frame):
 
+`ipv4_tcp_with_options()` is an **existing** helper already defined in the
+decode.rs `#[cfg(test)] mod tests` block (it builds a SYN with MSS/WS/SACK-perm/TS
+options, a 40-byte TCP header) — reuse it as-is; do not redefine it.
+
 ```rust
 fn decode_full(link: LinkType, frame: &[u8]) -> DecodeOutcome {
     let wire_len = u32::try_from(frame.len()).unwrap_or(u32::MAX);
@@ -458,8 +462,13 @@ fn header_only_capture_decodes_like_full_snaplen() {
     assert_eq!(full_parsed.items, hdr_parsed.items, "items differ");
     assert_eq!(full_parsed.skipped, hdr_parsed.skipped, "skip counts differ");
     assert_eq!(full_parsed.skipped.total(), 0, "nothing should be skipped");
-    // Sanity: the single decoded segment carries the on-wire payload length.
-    assert_eq!(full_parsed.items.len(), 1);
+    // The header-only segment must carry the *non-zero on-wire* payload length
+    // (acceptance criterion 3), not the truncated captured length.
+    assert_eq!(hdr_parsed.items.len(), 1);
+    let tcpvisr_core::Item::Segment(seg) = &hdr_parsed.items[0] else {
+        panic!("expected a decoded segment");
+    };
+    assert_eq!(seg.payload_len, 80);
 }
 ```
 
@@ -470,10 +479,14 @@ top of the file before editing).
 - [ ] **Step 2: Run the test to verify it fails or passes for the right reason**
 
 Run: `cargo test -p tcpvisr-ingest --test parse header_only_capture_decodes_like_full_snaplen`
-Expected: PASS once Tasks 1–2 are in (this test is the integration-level proof). If
-run against pre-Task-1 code it would FAIL (the header-only record would be skipped
-as `Truncated`, so `items` would differ and `skipped.truncated == 1`). Confirm it
-passes now and would have caught the old behavior.
+Expected: PASS once Tasks 1–2 are in (this test is the integration-level proof).
+
+Then **verify it is a real regression guard** (fail-first): temporarily reinstate
+the old gate by adding `if data.len() < origlen as usize { state.skipped.record(
+crate::decode::SkipReason::Truncated); return Ok(()); }` at the top of
+`process_packet` in `replay.rs`, re-run the test, and confirm it FAILS (`items`
+differ and `hdr_parsed.skipped.truncated == 1`). Remove the temporary gate and
+confirm PASS again. This proves the test would have caught the pre-fix behavior.
 
 - [ ] **Step 3: Write the both-faucets parity test in `parity.rs`**
 
