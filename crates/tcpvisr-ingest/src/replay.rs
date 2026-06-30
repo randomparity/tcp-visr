@@ -118,7 +118,7 @@ fn handle_block(
             let abs_ns = u64::from(b.ts_sec)
                 .saturating_mul(1_000_000_000)
                 .saturating_add(u64::from(b.ts_usec).saturating_mul(state.nanos_per_tick));
-            process_packet(state, abs_ns, b.caplen, b.origlen, b.data, path, sink)
+            process_packet(state, abs_ns, b.origlen, b.data, path, sink)
         }
         PcapBlockOwned::NG(Block::InterfaceDescription(idb)) => {
             let link = dlt_to_link(idb.linktype.0, path)?;
@@ -148,7 +148,7 @@ fn handle_block(
         PcapBlockOwned::NG(Block::EnhancedPacket(epb)) => {
             let ticks = (u64::from(epb.ts_high) << 32) | u64::from(epb.ts_low);
             let abs_ns = ticks.saturating_mul(state.nanos_per_tick);
-            process_packet(state, abs_ns, epb.caplen, epb.origlen, epb.data, path, sink)
+            process_packet(state, abs_ns, epb.origlen, epb.data, path, sink)
         }
         // Section headers and other pcapng blocks (statistics, name resolution, ...) carry no
         // packet for M1 and are ignored.
@@ -175,7 +175,6 @@ fn dlt_to_link(dlt: i32, _path: &Path) -> Result<LinkType, IngestError> {
 fn process_packet(
     state: &mut State,
     abs_ns: u64,
-    caplen: u32,
     origlen: u32,
     data: &[u8],
     path: &Path,
@@ -183,15 +182,11 @@ fn process_packet(
 ) -> Result<(), IngestError> {
     let baseline = *state.baseline.get_or_insert(abs_ns);
     let ts = Nanos(abs_ns.saturating_sub(baseline));
-    if caplen < origlen {
-        state.skipped.record(crate::decode::SkipReason::Truncated);
-        return Ok(());
-    }
     let link = state.link_type.ok_or_else(|| IngestError::Container {
         path: path.to_path_buf(),
         detail: "packet before any interface description".to_owned(),
     })?;
-    match decode_frame(link, ts, data) {
+    match decode_frame(link, ts, data, origlen) {
         DecodeOutcome::Decoded(seg) => sink(&Item::Segment(seg)),
         DecodeOutcome::Skipped(reason) => state.skipped.record(reason),
     }

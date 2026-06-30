@@ -1,6 +1,8 @@
 //! The single shared header decoder used by both faucets (design §3.2, ADR-0003).
 
 use etherparse::err::Layer;
+use etherparse::err::ip::LaxHeaderSliceError;
+use etherparse::err::packet::SliceError;
 use etherparse::{LaxNetSlice, LaxSlicedPacket, TcpOptionElement, TcpSlice, TransportSlice};
 use tcpvisr_core::{FlowKey, Nanos, Segment, TcpFlags, TcpOptions, TcpSeq};
 
@@ -28,13 +30,18 @@ pub enum DecodeOutcome {
 ///
 /// Both faucets call this; there is no second header-parsing path (design §3.2).
 #[must_use]
-pub fn decode_frame(link: LinkType, ts: Nanos, frame: &[u8]) -> DecodeOutcome {
+pub fn decode_frame(link: LinkType, ts: Nanos, frame: &[u8], wire_len: u32) -> DecodeOutcome {
+    let truncated = wire_len as usize > frame.len();
     let ip = match strip_link(link, frame) {
         Stripped::Ip(bytes) => bytes,
         Stripped::Skip(reason) => return DecodeOutcome::Skipped(reason),
     };
-    let Ok(sliced) = LaxSlicedPacket::from_ip(ip) else {
-        return DecodeOutcome::Skipped(SkipReason::Malformed);
+    let sliced = match LaxSlicedPacket::from_ip(ip) {
+        Ok(sliced) => sliced,
+        Err(LaxHeaderSliceError::Len(_)) if truncated => {
+            return DecodeOutcome::Skipped(SkipReason::Truncated);
+        }
+        Err(_) => return DecodeOutcome::Skipped(SkipReason::Malformed),
     };
     let Some(net) = sliced.net.as_ref() else {
         return DecodeOutcome::Skipped(SkipReason::Malformed);
@@ -62,11 +69,7 @@ pub fn decode_frame(link: LinkType, ts: Nanos, frame: &[u8]) -> DecodeOutcome {
         return DecodeOutcome::Skipped(SkipReason::Ipv6Fragment);
     }
     let Some(TransportSlice::Tcp(tcp)) = sliced.transport.as_ref() else {
-        // No TCP transport: tell an unsupported IP-extension chain apart from plain non-TCP.
-        return DecodeOutcome::Skipped(match sliced.stop_err {
-            Some((_, Layer::Ipv6ExtHeader | Layer::IpHeader)) => SkipReason::UnsupportedExtChain,
-            _ => SkipReason::NonTcp,
-        });
+        return DecodeOutcome::Skipped(classify_no_tcp(&sliced, truncated));
     };
     DecodeOutcome::Decoded(Segment {
         ts,
@@ -83,6 +86,19 @@ pub fn decode_frame(link: LinkType, ts: Nanos, frame: &[u8]) -> DecodeOutcome {
         options: parse_options(tcp),
         payload_len: u32::try_from(tcp.payload().len()).unwrap_or(u32::MAX),
     })
+}
+
+/// Classifies a frame that parsed an IP header but produced no TCP transport.
+///
+/// A byte-shortage (`Len`) on a snaplen-cut frame means the TCP header itself was
+/// cut off -> `Truncated`. Otherwise the existing mappings apply: an unsupported
+/// IPv6 extension chain -> `UnsupportedExtChain`, anything else -> `NonTcp`.
+fn classify_no_tcp(sliced: &LaxSlicedPacket<'_>, truncated: bool) -> SkipReason {
+    match sliced.stop_err {
+        Some((SliceError::Len(_), _)) if truncated => SkipReason::Truncated,
+        Some((_, Layer::Ipv6ExtHeader | Layer::IpHeader)) => SkipReason::UnsupportedExtChain,
+        _ => SkipReason::NonTcp,
+    }
 }
 
 fn build_flags(tcp: &TcpSlice<'_>) -> TcpFlags {
@@ -135,6 +151,11 @@ mod tests {
         PacketBuilder, TcpOptionElement,
     };
     use tcpvisr_core::Nanos;
+
+    fn decode_full(link: LinkType, frame: &[u8]) -> DecodeOutcome {
+        let wire_len = u32::try_from(frame.len()).unwrap_or(u32::MAX);
+        decode_frame(link, Nanos(0), frame, wire_len)
+    }
 
     fn ipv4_tcp_syn() -> Vec<u8> {
         let mut buf = Vec::new();
@@ -229,7 +250,7 @@ mod tests {
     #[test]
     fn decodes_ipv4_tcp_syn() {
         let frame = ipv4_tcp_syn();
-        match decode_frame(LinkType::RawIp, Nanos(0), &frame) {
+        match decode_full(LinkType::RawIp, &frame) {
             DecodeOutcome::Decoded(seg) => {
                 assert_eq!(seg.flow.src_port, 1234);
                 assert_eq!(seg.flow.dst_port, 80);
@@ -244,7 +265,7 @@ mod tests {
     #[test]
     fn parses_tcp_options() {
         let frame = ipv4_tcp_with_options();
-        let DecodeOutcome::Decoded(seg) = decode_frame(LinkType::RawIp, Nanos(0), &frame) else {
+        let DecodeOutcome::Decoded(seg) = decode_full(LinkType::RawIp, &frame) else {
             panic!("expected decode");
         };
         assert_eq!(seg.options.mss, Some(1460));
@@ -257,7 +278,7 @@ mod tests {
     fn non_tcp_is_skipped_non_tcp() {
         let frame = ipv4_udp();
         assert_eq!(
-            decode_frame(LinkType::RawIp, Nanos(0), &frame),
+            decode_full(LinkType::RawIp, &frame),
             DecodeOutcome::Skipped(SkipReason::NonTcp)
         );
     }
@@ -265,7 +286,7 @@ mod tests {
     #[test]
     fn garbage_is_malformed() {
         assert_eq!(
-            decode_frame(LinkType::RawIp, Nanos(0), &[0xff, 0x00, 0x01]),
+            decode_full(LinkType::RawIp, &[0xff, 0x00, 0x01]),
             DecodeOutcome::Skipped(SkipReason::Malformed)
         );
     }
@@ -273,7 +294,7 @@ mod tests {
     #[test]
     fn decodes_ipv6_tcp() {
         let frame = ipv6_tcp();
-        let DecodeOutcome::Decoded(seg) = decode_frame(LinkType::RawIp, Nanos(0), &frame) else {
+        let DecodeOutcome::Decoded(seg) = decode_full(LinkType::RawIp, &frame) else {
             panic!("expected decode");
         };
         assert_eq!(seg.flow.dst_port, 443);
@@ -285,7 +306,7 @@ mod tests {
     fn ipv6_fragmented_tcp_is_skipped() {
         let frame = ipv6_fragment_tcp();
         assert_eq!(
-            decode_frame(LinkType::RawIp, Nanos(0), &frame),
+            decode_full(LinkType::RawIp, &frame),
             DecodeOutcome::Skipped(SkipReason::Ipv6Fragment)
         );
     }
@@ -293,7 +314,7 @@ mod tests {
     #[test]
     fn decodes_through_ethernet() {
         let frame = ethernet(&ipv4_tcp_syn(), false);
-        let DecodeOutcome::Decoded(seg) = decode_frame(LinkType::Ethernet, Nanos(0), &frame) else {
+        let DecodeOutcome::Decoded(seg) = decode_full(LinkType::Ethernet, &frame) else {
             panic!("expected decode");
         };
         assert_eq!(seg.flow.dst_port, 80);
@@ -302,10 +323,23 @@ mod tests {
     #[test]
     fn decodes_through_sll2() {
         let frame = sll2(&ipv6_tcp(), true);
-        let DecodeOutcome::Decoded(seg) = decode_frame(LinkType::LinuxSll2, Nanos(0), &frame)
-        else {
+        let DecodeOutcome::Decoded(seg) = decode_full(LinkType::LinuxSll2, &frame) else {
             panic!("expected decode");
         };
         assert_eq!(seg.flow.dst_port, 443);
+    }
+
+    #[test]
+    fn tcp_header_cut_on_truncated_frame_is_truncated() {
+        // Full IPv4/TCP SYN with options (40-byte TCP header); cut the captured
+        // bytes inside the TCP options so the data offset points past the captured
+        // slice. wire_len is the full on-wire length, so this is a snaplen-cut frame.
+        let full = ipv4_tcp_with_options();
+        let cut = &full[..full.len() - 8];
+        let wire_len = u32::try_from(full.len()).unwrap_or(u32::MAX);
+        assert_eq!(
+            decode_frame(LinkType::RawIp, Nanos(0), cut, wire_len),
+            DecodeOutcome::Skipped(SkipReason::Truncated)
+        );
     }
 }

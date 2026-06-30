@@ -9,7 +9,7 @@ use std::path::Path;
 use pcap::Capture;
 use tcpvisr_core::{Item, Nanos};
 
-use crate::decode::{DecodeOutcome, SkipReason, decode_frame};
+use crate::decode::{DecodeOutcome, decode_frame};
 use crate::link::LinkType;
 use crate::{IngestError, ReplayParse, SkipCounts};
 
@@ -42,11 +42,7 @@ pub fn parse_file_libpcap(path: &Path) -> Result<ReplayParse, IngestError> {
                 let abs_ns = sec * 1_000_000_000 + usec * 1_000;
                 let base = *baseline.get_or_insert(abs_ns);
                 let ts = Nanos(abs_ns.saturating_sub(base));
-                if header.caplen < header.len {
-                    skipped.record(SkipReason::Truncated);
-                    continue;
-                }
-                match decode_frame(link, ts, packet.data) {
+                match decode_frame(link, ts, packet.data, header.len) {
                     DecodeOutcome::Decoded(seg) => items.push(Item::Segment(seg)),
                     DecodeOutcome::Skipped(reason) => skipped.record(reason),
                 }
