@@ -178,6 +178,15 @@ git commit -m "feat(core): add Endpoint and FlowKey endpoint accessors"
 
 ---
 
+> **Tasks 2–5 are TDD slices of ONE commit (the engine).** The engine's non-public items
+> (`Direction`, `ConnState::advance_to`, `is_backward_reset`, `ConnTrack`'s FIN flags) are
+> introduced before their consumers across these slices, so an intermediate
+> `clippy --all-targets -- -D warnings` would flag `dead_code`/never-read fields — and the
+> workspace denies `clippy::allow_attributes`, so there is no inline escape. Therefore the
+> intermediate slices (Tasks 2–4) end at a **`cargo test -p tcpvisr-engine` checkpoint, not a
+> commit**; the single warning-clean full guardrail + commit for the whole engine happens at
+> the end of Task 5. Execute Tasks 2–5 back-to-back without committing in between.
+
 ### Task 2: engine foundation — config, state, conn types, split helper
 
 **Files:**
@@ -414,13 +423,13 @@ pub use state::ConnState;
 
 - [ ] **Step 5: Run, expect pass** — `cargo test -p tcpvisr-engine` → PASS (the split tests).
 
-- [ ] **Step 6: Guardrails + commit**
+- [ ] **Step 6: Checkpoint (no commit — see the Tasks 2–5 banner)**
 
 ```bash
-cargo fmt --all --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test -p tcpvisr-engine
-git add crates/tcpvisr-engine
-git commit -m "feat(engine): add config, state, conn types, and reset-split helper"
+cargo test -p tcpvisr-engine   # split tests pass; full clippy + commit deferred to Task 5
 ```
+Do **not** run `clippy --all-targets -- -D warnings` here: `is_backward_reset` has no non-test
+consumer until Task 5, so it would (correctly) flag `dead_code`. Continue straight to Task 3.
 
 ---
 
@@ -721,13 +730,13 @@ impl Tracker {
 
 - [ ] **Step 4: Run, expect pass** — `cargo test -p tcpvisr-engine` → PASS.
 
-- [ ] **Step 5: Guardrails + commit**
+- [ ] **Step 5: Checkpoint (no commit — see the Tasks 2–5 banner)**
 
 ```bash
-cargo fmt --all --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test -p tcpvisr-engine
-git add crates/tcpvisr-engine
-git commit -m "feat(engine): track connection grouping, orientation, and byte accounting"
+cargo test -p tcpvisr-engine   # orient tests pass; full clippy + commit deferred to Task 5
 ```
+`Direction` and the FIN flags still lack non-test consumers until Task 4, so skip
+`clippy --all-targets -- -D warnings` here. Continue straight to Task 4.
 
 ---
 
@@ -889,13 +898,13 @@ event).
 
 - [ ] **Step 4: Run, expect pass** — `cargo test -p tcpvisr-engine` → PASS.
 
-- [ ] **Step 5: Guardrails + commit**
+- [ ] **Step 5: Checkpoint (no commit — see the Tasks 2–5 banner)**
 
 ```bash
-cargo fmt --all --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test -p tcpvisr-engine
-git add crates/tcpvisr-engine
-git commit -m "feat(engine): implement observed connection state transitions"
+cargo test -p tcpvisr-engine   # state tests pass; full clippy + commit deferred to Task 5
 ```
+`is_backward_reset` still has no non-test consumer until Task 5's `should_split`, so skip the
+full clippy guardrail here. Continue straight to Task 5.
 
 ---
 
@@ -1068,13 +1077,19 @@ pub use tracker::{Tracker, track};
 - [ ] **Step 4: Run, expect pass** — `cargo test -p tcpvisr-engine` → PASS (all engine tests
   + proptests).
 
-- [ ] **Step 5: Guardrails + commit**
+- [ ] **Step 5: Full engine guardrails + single commit (covers Tasks 2–5)**
+
+Now every introduced item has a non-test consumer (`should_split` uses `is_backward_reset`;
+`apply_state` uses `advance_to` and the FIN flags; `Direction` is matched throughout), so the
+full guardrail is warning-clean:
 
 ```bash
 cargo fmt --all --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test -p tcpvisr-engine
 git add crates/tcpvisr-engine
-git commit -m "feat(engine): disambiguate connection instances and order output"
+git commit -m "feat(engine): add pure connection tracker with instance disambiguation"
 ```
+This is the **one** engine commit (core's `Endpoint` was already committed in Task 1); Tasks
+2–4 left no committed state.
 
 ---
 
