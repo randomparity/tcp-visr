@@ -1305,13 +1305,28 @@ seq_wrap.pcap (--conn 0), o2r = client(10.0.0.1:1234)->server(10.0.0.2:80):
   seg3 r2o seq=1 ack=300 len=10 ts=3us: r2o in_flight=serial_diff(11,1)=10; ack=300 advances acked[o2r],
         covers o2r sends (seq_end 2^32-51, 250 <= 300) -> rtt pairs oldest (ts1=1us): rtt = 3us-1us = 2000ns.
 
-metrics_basic.pcap (--conn 0):
-  seg1 o2r SYN seq=1000 ts=1us: snd_nxt=1001 (phantom), acked[o2r]=1000, in_flight=1. eligible RTT send (end 1001).
-  seg2 r2o SYN-ACK seq=5000 ack=1001 ts=2us: r2o snd_nxt=5001, acked[r2o]=5000, in_flight=1;
-        ack=1001 advances acked[o2r], covers SYN(end 1001) -> rtt = 2us-1us = 1000ns (handshake RTT).
-  seg3 o2r data seq=1001 len=100 ts=3us: snd_nxt=1101, in_flight=serial_diff(1101,1001)=100. eligible send (end 1101).
-  seg4 r2o ACK ack=1101 ts=4us: ack covers o2r data(end 1101) -> rtt = 4us-3us = 1000ns (data RTT). r2o in_flight: snd_nxt=5001, acked[r2o]=5001? ack handling: this is r2o, carries ack=1101 for o2r; r2o's own in_flight = serial_diff(5001, 5000)=1 (the SYN-ACK phantom, unacked).
-  throughput: window 1s; at seg3, 100 bytes in (3us-1s,3us] -> 8*100*1e9/1e9 = 800 bps.
+metrics_basic.pcap (--conn 0) — ALL four samples enumerated; this fixture deliberately
+exercises a piggybacked ACK (seg3 carries data AND acks the SYN-ACK), so trace every field:
+  seg1 o2r SYN seq=1000 ts=1us: acked[o2r]=1000, snd_nxt[o2r]=1001 (SYN phantom),
+        in_flight=serial_diff(1001,1000)=1. No ACK flag -> no rtt. pending_rtt[o2r]=[(1001,1us)].
+        throughput: 0 bytes payload -> 0 bps.   => {dir o2r, in_flight 1, tput 0, rtt null}
+  seg2 r2o SYN-ACK seq=5000 ack=1001 ts=2us: acked[r2o]=5000 (init), snd_nxt[r2o]=5001 (SYN phantom),
+        in_flight[r2o]=serial_diff(5001,5000)=1. ack=1001 advances acked[o2r] (1000->1001), pops
+        pending_rtt[o2r]=[(1001,1us)] -> rtt=2us-1us=1000ns (HANDSHAKE RTT). pending_rtt[r2o]=[(5001,2us)].
+        throughput[r2o]: 0 payload -> 0 bps.    => {dir r2o, in_flight 1, tput 0, rtt 1000}
+  seg3 o2r data seq=1001 len=100 ack=5001 ts=3us: snd_nxt[o2r]=1101,
+        in_flight[o2r]=serial_diff(1101,1001)=100. Data (not retransmit) -> pending_rtt[o2r]=[(1101,3us)].
+        ack=5001 advances acked[r2o] (5000->5001), pops pending_rtt[r2o]=[(5001,2us)]
+        -> rtt=3us-2us=1000ns (SYN-ACK round trip — DO NOT OMIT). throughput[o2r]: 100 bytes in
+        (3us-1s,3us] -> 8*100*1e9/1e9 = 800 bps.  => {dir o2r, in_flight 100, tput 800, rtt 1000}
+  seg4 r2o pure-ACK seq=5001 ack=1101 len=0 ts=4us: snd_nxt[r2o]=serial_max(5001,5001)=5001;
+        acked[r2o] was already advanced to 5001 by seg3, so in_flight[r2o]=serial_diff(5001,5001)=0
+        (NOT 1). ack=1101 advances acked[o2r] (1001->1101), pops pending_rtt[o2r]=[(1101,3us)]
+        -> rtt=4us-3us=1000ns (DATA RTT). throughput[r2o]: 0 payload -> 0 bps.
+                                                  => {dir r2o, in_flight 0, tput 0, rtt 1000}
+  So metrics_basic yields rtts [null, 1000, 1000, 1000] (THREE rtt samples) and in_flight
+  [1, 1, 100, 0]. Confirm the golden matches exactly; if it shows only two rtts, the trace above
+  is the authority and the discrepancy is a code bug to investigate, not a golden to overwrite.
 
 metrics_retransmit.pcap (--conn 0): seg2 seq=100 < frontier 200, gap 3.0001s >= 3ms -> retransmit=true;
         clears pending RTT. (Both o2r, no reverse ACK, so no RTT anywhere.)
