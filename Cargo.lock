@@ -558,6 +558,10 @@ dependencies = [
 [[package]]
 name = "tcpvisr-engine"
 version = "0.0.0"
+dependencies = [
+ "proptest",
+ "tcpvisr-core",
+]
 
 [[package]]
 name = "tcpvisr-enrich"

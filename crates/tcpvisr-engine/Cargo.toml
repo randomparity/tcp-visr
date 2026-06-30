@@ -5,5 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[dependencies]
+tcpvisr-core = { path = "../tcpvisr-core" }
+
+[dev-dependencies]
+proptest = "=1.11.0"
+
 [lints]
 workspace = true
