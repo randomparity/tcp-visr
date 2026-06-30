@@ -23,8 +23,10 @@ Direction, orientation, grouping, and instance identity are settled in
 [ADR-0006](../../adr/0006-connection-identity-and-direction.md):
 
 - Connections are grouped by a canonicalized, orientation-independent `EndpointPair`.
-- Orientation (`origin`/`responder`) comes from a bare SYN when present, else from the first
-  observed segment with `origin_inferred = true`.
+- Orientation (`origin`/`responder`) comes from a bare SYN (origin = SYN source) when
+  present; failing that, from a **SYN-ACK** (responder = SYN-ACK source, origin = its
+  destination — orientation is observed, not inferred); failing both, from the first observed
+  segment with `origin_inferred = true`.
 - **Direction is engine-derived**, not a field on the wire `Segment`; `tcpvisr-core` is
   unchanged except for the additions below.
 - Instance identity is `ConnId = (EndpointPair, instance)`; a new instance begins on a
@@ -70,9 +72,13 @@ fixed here):
   - `id: ConnId`
   - `state: ConnState`
   - `origin: Endpoint`, `responder: Endpoint`
-  - `origin_inferred: bool` (true when no bare SYN was observed)
+  - `origin_inferred: bool` (true only when neither a bare SYN nor a SYN-ACK was observed —
+    i.e. orientation was guessed from the first segment; a SYN-ACK-oriented connection is
+    `false`)
   - `opened_at: Nanos` (first observed segment ts for the instance)
-  - `last_at: Nanos` (last observed segment ts for the instance)
+  - `last_at: Nanos` (the **maximum** segment ts seen for the instance — `max`, not
+    file-order-last, so a reordered earlier-ts segment never moves it backward; see the
+    non-monotonic-time note below)
   - `bytes_o2r: u64`, `bytes_r2o: u64` (**wire** TCP payload bytes per direction —
     `payload_len` summed as observed, retransmissions included; unique/goodput accounting is
     M3)
@@ -122,7 +128,10 @@ row).
 **Instance disambiguation** (ADR-0006), all serial comparisons via `TcpSeq`:
 
 - A bare SYN observed for a pair whose current instance is `Closed`/`Reset`, or has been idle
-  (`now − last_at > dead_after`), opens a **new** instance (next `instance`).
+  (`now.saturating_sub(last_at) > dead_after`, where `now` is the incoming segment's ts),
+  opens a **new** instance (next `instance`). The `saturating_sub` matters: capture time is
+  **not monotonic** (see the non-monotonic-time note below), so a reordered earlier-ts segment
+  yields a gap of `0` (not idle) rather than underflowing.
 - For an `Established` instance with a tracked per-direction sequence baseline, a segment
   whose `seq` is **backward** in RFC 1982 serial space from that baseline (i.e.
   `seq.serial_lt(baseline)`) by **more than `reset_threshold`** opens a new instance (a
@@ -181,7 +190,10 @@ the crate that owns the end-to-end test (see "Testing"):
   per-direction byte attribution (with a retransmit, asserting the duplicate payload **is**
   re-counted per the wire-bytes decision), SYN-less mid-stream **backward-reset split**
   (backward distance in `(reset_threshold, 2^31)`) vs. small-backward (retransmit) no-split,
-  and idle-`dead_after` reuse. Tests assert **what** the tracker reports
+  idle-`dead_after` reuse, **non-monotonic time** (a reordered earlier-ts segment: no panic,
+  `last_at`/`duration` unchanged, not treated as idle), and **SYN-ACK-first orientation** (the
+  SYN-ACK source is `responder`, `origin_inferred = false`). Tests assert **what** the tracker
+  reports
   (state, instance count, bytes, duration), not how it is computed.
 - **`proptest`** for the instance-split decision boundary: for any baseline and any forward
   delta in `[1, 2^31)` (including deltas that cross the `u32` boundary), the segment never
@@ -267,6 +279,17 @@ the crate that owns the end-to-end test (see "Testing"):
   over noise suppression; a capture with many unsolicited RSTs (scan/backscatter) will list
   one connection each. Bulk-RST/scan suppression is a later-milestone heuristic, deliberately
   out of M2 scope — recorded here, not silently dropped.
+- **Capture time is non-monotonic; M2 tolerates it.** Design §14 / the M1 spec establish that
+  wall-clock is not assumed monotonic and that the faucet emits segments in **file order**
+  (a pre-baseline packet clamps to `Nanos(0)` via `saturating_sub`). M2's time arithmetic is
+  therefore defensive: `last_at` is the **max** ts seen, `duration` and the idle gap both use
+  `saturating_sub`, so a reordered earlier-ts segment never panics (the lint policy denies
+  `panic`), never moves `last_at`/`duration` backward, and never falsely reads as idle. An
+  out-of-order-ts engine test asserts this.
+- **Orientation uses the SYN-ACK signal.** A capture joined mid-handshake (first segment a
+  SYN-ACK) records the SYN-ACK source as `responder` and its destination as `origin`
+  (`origin_inferred = false`), rather than mislabeling the server as the client via the
+  first-segment fallback. A SYN-ACK-first engine test asserts the labels.
 - **Engine takes `&Item` by reference and is fed by the streaming faucet**, so `conns` holds
   only the current frame plus the connection table (bounded by connection count, not capture
   size) — consistent with M1's streaming `parse` and deferring the series ceiling to M3.

@@ -49,8 +49,11 @@ Concretely, in `tcpvisr-engine`:
   - If a segment with **SYN set and ACK clear** is observed, its source is the `origin`
     (authoritative: only a client sends a bare SYN). For a simultaneous open (both sides send
     a bare SYN), the source of the **first** such SYN in stream order wins.
-  - Otherwise (mid-stream capture, no bare SYN seen) the `origin` is the source of the
-    **first segment** observed for the connection, and the connection is flagged
+  - Failing that, if a **SYN-ACK** is observed (capture joined mid-handshake), its source is
+    the `responder` and its destination the `origin` (a SYN-ACK is sent only by the server) —
+    orientation is **observed**, not inferred, so `origin_inferred = false`.
+  - Otherwise (mid-stream capture, neither a bare SYN nor a SYN-ACK seen) the `origin` is the
+    source of the **first segment** observed for the connection, and the connection is flagged
     `origin_inferred = true`. The orientation is then arbitrary-but-stable, and the inference
     is surfaced (never presented as if a handshake were seen).
 
