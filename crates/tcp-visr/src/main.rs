@@ -95,6 +95,20 @@ fn run_parse(file: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(e) = write_err {
         return Err(e.into());
     }
-    writeln!(out, "{count} segments, skipped: {} total", skipped.total())?;
+    let reasons: Vec<String> = skipped
+        .nonzero()
+        .into_iter()
+        .map(|(reason, n)| format!("{reason}={n}"))
+        .collect();
+    let breakdown = if reasons.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", reasons.join(", "))
+    };
+    writeln!(
+        out,
+        "{count} segments, skipped: {} total{breakdown}",
+        skipped.total()
+    )?;
     Ok(())
 }

@@ -67,6 +67,15 @@ fn parse_skip_fixture_exits_zero_and_counts_skips() {
         stdout.contains("1 segments"),
         "one TCP segment decoded: {stdout}"
     );
+    // skip.pcap holds one UDP (non_tcp) and one truncated record; the summary names reasons.
+    assert!(
+        stdout.contains("non_tcp=1"),
+        "per-reason breakdown: {stdout}"
+    );
+    assert!(
+        stdout.contains("truncated=1"),
+        "per-reason breakdown: {stdout}"
+    );
 }
 
 #[test]

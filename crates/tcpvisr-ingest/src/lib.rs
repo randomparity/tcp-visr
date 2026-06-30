@@ -40,6 +40,20 @@ impl SkipCounts {
         }
     }
 
+    /// The non-zero per-reason counts, for surfacing why packets were skipped (design §7).
+    #[must_use]
+    pub fn nonzero(&self) -> Vec<(&'static str, u64)> {
+        let all = [
+            ("non_tcp", self.non_tcp),
+            ("malformed", self.malformed),
+            ("unsupported_link_type", self.unsupported_link_type),
+            ("ipv6_fragment", self.ipv6_fragment),
+            ("unsupported_ext_chain", self.unsupported_ext_chain),
+            ("truncated", self.truncated),
+        ];
+        all.into_iter().filter(|&(_, count)| count > 0).collect()
+    }
+
     /// Total number of skipped packets.
     #[must_use]
     pub fn total(&self) -> u64 {
