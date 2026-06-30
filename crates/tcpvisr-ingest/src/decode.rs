@@ -8,6 +8,9 @@ use tcpvisr_core::{FlowKey, Nanos, Segment, TcpFlags, TcpOptions, TcpSeq};
 
 use crate::link::{LinkType, Stripped, strip_link};
 
+/// Bytes in the fixed IPv6 header (RFC 8200); IPv6 `payload_length` counts after it.
+const IPV6_HEADER_LEN: usize = 40;
+
 /// Why a packet was skipped rather than decoded to a `Segment` (design §7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SkipReason {
@@ -84,7 +87,7 @@ pub fn decode_frame(link: LinkType, ts: Nanos, frame: &[u8], wire_len: u32) -> D
         flags: build_flags(tcp),
         window: tcp.window_size(),
         options: parse_options(tcp),
-        payload_len: u32::try_from(tcp.payload().len()).unwrap_or(u32::MAX),
+        payload_len: derive_payload_len(ip, net, tcp),
     })
 }
 
@@ -99,6 +102,42 @@ fn classify_no_tcp(sliced: &LaxSlicedPacket<'_>, truncated: bool) -> SkipReason 
         Some((_, Layer::Ipv6ExtHeader | Layer::IpHeader)) => SkipReason::UnsupportedExtChain,
         _ => SkipReason::NonTcp,
     }
+}
+
+/// On-wire TCP payload length, derived from the IP length field rather than the
+/// captured payload (which is short for a snaplen-cut frame). Falls back to the
+/// captured payload length when the IP length field is implausible — e.g. hardware
+/// offload (`total_len`/`payload_length` 0) or an IPv6 jumbogram (ADR-0008).
+fn derive_payload_len(ip: &[u8], net: &LaxNetSlice<'_>, tcp: &TcpSlice<'_>) -> u32 {
+    let captured = u32::try_from(tcp.payload().len()).unwrap_or(u32::MAX);
+    let onwire_ip_len = match net {
+        LaxNetSlice::Ipv4(v4) => usize::from(v4.header().total_len()),
+        LaxNetSlice::Ipv6(v6) => IPV6_HEADER_LEN + usize::from(v6.header().payload_length()),
+        LaxNetSlice::Arp(_) => return captured, // ARP is skipped before decode reaches here
+    };
+    let Some(tcp_offset) = subslice_offset(ip, tcp.slice()) else {
+        return captured;
+    };
+    // `tcp.slice()` is the whole segment (header + payload); the on-wire payload is
+    // everything in the IP packet past the end of the TCP header.
+    let tcp_header_len = usize::from(tcp.data_offset()) * 4;
+    let need = tcp_offset + tcp_header_len;
+    if need <= ip.len() && onwire_ip_len >= need {
+        u32::try_from(onwire_ip_len - need).unwrap_or(u32::MAX)
+    } else {
+        captured
+    }
+}
+
+/// Byte offset of `inner` within `outer`, when `inner` borrows from `outer`'s
+/// allocation (ADR-0008 invariant: etherparse's lax slices borrow the input).
+/// Returns `None` if `inner` does not lie within `outer`, so callers fall back
+/// instead of trusting an out-of-range offset.
+fn subslice_offset(outer: &[u8], inner: &[u8]) -> Option<usize> {
+    let outer_start = outer.as_ptr() as usize;
+    let inner_start = inner.as_ptr() as usize;
+    let offset = inner_start.checked_sub(outer_start)?;
+    (offset <= outer.len()).then_some(offset)
 }
 
 fn build_flags(tcp: &TcpSlice<'_>) -> TcpFlags {
@@ -341,5 +380,57 @@ mod tests {
             decode_frame(LinkType::RawIp, Nanos(0), cut, wire_len),
             DecodeOutcome::Skipped(SkipReason::Truncated)
         );
+    }
+
+    fn ipv4_tcp_with_payload(payload: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        PacketBuilder::ipv4([10, 0, 0, 1], [10, 0, 0, 2], 64)
+            .tcp(1234, 80, 1000, 64240)
+            .ack(1)
+            .write(&mut buf, payload)
+            .unwrap();
+        buf
+    }
+
+    #[test]
+    fn header_only_frame_reports_onwire_payload_len() {
+        // Full frame has 100 payload bytes; the captured frame keeps only the
+        // headers (cut all payload). wire_len is the full on-wire length.
+        let full = ipv4_tcp_with_payload(&[0x5a; 100]);
+        let header_end = full.len() - 100; // IPv4(20) + TCP(20)
+        let captured = &full[..header_end];
+        let wire_len = u32::try_from(full.len()).unwrap_or(u32::MAX);
+        let DecodeOutcome::Decoded(seg) =
+            decode_frame(LinkType::RawIp, Nanos(0), captured, wire_len)
+        else {
+            panic!("expected decode of a header-only frame");
+        };
+        assert_eq!(seg.payload_len, 100);
+        assert_eq!(seg.flow.dst_port, 80);
+    }
+
+    #[test]
+    fn full_frame_payload_len_matches_captured() {
+        // Deriving from the IP length field yields the same value as the captured
+        // payload for a well-formed full frame.
+        let full = ipv4_tcp_with_payload(&[0x11; 42]);
+        let DecodeOutcome::Decoded(seg) = decode_full(LinkType::RawIp, &full) else {
+            panic!("expected decode");
+        };
+        assert_eq!(seg.payload_len, 42);
+    }
+
+    #[test]
+    fn implausible_total_len_falls_back_to_captured() {
+        // Hardware offload (TSO/GRO) reports IPv4 total_len == 0. The on-wire length
+        // is unknowable, so a full frame must fall back to the captured payload
+        // length (here 30) rather than underflow (ADR-0008).
+        let mut frame = ipv4_tcp_with_payload(&[0x33; 30]);
+        frame[2] = 0; // zero the IPv4 total_len field (bytes 2..4)
+        frame[3] = 0;
+        let DecodeOutcome::Decoded(seg) = decode_full(LinkType::RawIp, &frame) else {
+            panic!("expected decode of an offload-style frame");
+        };
+        assert_eq!(seg.payload_len, 30);
     }
 }
