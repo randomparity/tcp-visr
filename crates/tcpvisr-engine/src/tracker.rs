@@ -198,8 +198,12 @@ impl Tracker {
                 let dir = self.conns[idx].direction_of(src);
                 self.conns[idx].account(seg, dir);
                 self.conns[idx].apply_state(seg, dir);
-                let sample = self.conns[idx].metrics.observe(seg, dir, &self.config);
-                self.record_sample(idx, sample);
+                // Derive metrics only for collected instances: `conns` (None) pays nothing, and
+                // the per-direction RTT/throughput state cannot grow for unrelated flows.
+                if self.should_collect(self.conns[idx].id) {
+                    let sample = self.conns[idx].metrics.observe(seg, dir, &self.config);
+                    self.record_sample(idx, sample);
+                }
                 return;
             }
         }
@@ -268,11 +272,16 @@ impl Tracker {
                 Direction::ResponderToOrigin => track.fin_r2o = true,
             }
         }
-        let sample = track.metrics.observe(seg, dir, &self.config);
+        // Derive the first sample only for collected instances (see `observe_segment`).
+        let sample = self
+            .should_collect(track.id)
+            .then(|| track.metrics.observe(seg, dir, &self.config));
         let idx = self.conns.len();
         self.conns.push(track);
         self.live.insert(pair, idx);
-        self.record_sample(idx, sample);
+        if let Some(sample) = sample {
+            self.record_sample(idx, sample);
+        }
     }
 
     /// All tracked instances, ordered by `(opened_at, pair, instance)` for determinism.
@@ -696,6 +705,32 @@ mod metric_wire_tests {
         );
         assert_eq!(m.len(), 1);
         assert!(m[0].series.is_empty());
+    }
+
+    #[test]
+    fn none_collection_does_not_accumulate_metric_state_for_unacked_flow() {
+        // A long one-directional, never-acknowledged flow under `None` (the `conns` path) must
+        // not buffer samples or grow per-connection RTT state — guards the cross-mode OOM path.
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(EngineConfig {
+            series_collection: SeriesCollection::None,
+            ..EngineConfig::default()
+        });
+        for i in 0..10_000u32 {
+            // distinct, advancing, never-acked data segments
+            t.observe(&seg(
+                c,
+                s,
+                TcpFlags::ACK,
+                100 + i * 10,
+                1,
+                10,
+                u64::from(i) + 1,
+            ));
+        }
+        let m = t.into_metrics().expect("no ceiling under None");
+        assert_eq!(m.len(), 1);
+        assert!(m[0].series.is_empty(), "None must store no samples");
     }
 
     #[test]
