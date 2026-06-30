@@ -25,13 +25,15 @@ re-parses; playback speed only changes how fast the cursor advances.
   (last-value-carried-forward) — not interpolation. `throughput_bps` is a trailing
   sliding-window average of fixed length (default 1 s), **frozen into each sample at ingest
   time** because seeking never re-parses; its window cannot be changed at scrub time.
-- **Cost is two-level.** Within one connection, seek is binary search, O(log m). The UI must
-  resolve **all connections active at `T`** (master list), so a random seek is **O(A·log m)**
-  per frame (A = active connections), found via a cross-connection interval index keyed by
-  `[opened_at, closed_at]`. During monotonic playback each connection advances O(1) from its
-  prior sample (O(A) per frame). A is bounded by a display cap; off-screen connections resolve
-  lazily. The "constant-feeling" property holds for bounded A, not for unbounded connection
-  counts.
+- **Cost is two-level.** Within one connection, seek is binary search, O(log m). Across
+  connections, an interval index over `[opened_at, closed_at]` yields the set active at `T`;
+  still-open connections (no `closed_at`) are indexed with an open right bound (`+∞` / running
+  "now") so they match every `T ≥ opened_at` — this is the common live case and must be
+  representable. Let `N_T` be connections active at `T`. A random seek that orders the master
+  list by a *time-varying* column resolves all `N_T` — **O(N_T·log m)** per frame, the honest
+  worst case. With a *static* sort key only the visible rows are resolved (lazy, display-capped).
+  During monotonic playback each connection advances O(1) from its prior sample (O(N_T) per
+  frame). "Constant-feeling" holds for bounded `N_T`, not for unbounded connection counts.
 - **Replay**: the whole capture is parsed once into complete series, subject to a configurable
   capture-size ceiling (fail-fast when exceeded; design §7).
 - **Live**: samples are maintained in a bounded ring buffer (configurable retention) for
@@ -39,8 +41,11 @@ re-parses; playback speed only changes how fast the cursor advances.
   highest seq/ack), which is retained for the connection's life regardless of display
   retention — so evicting old display samples never corrupts in-flight derivation. Pause
   freezes the cursor; retention still applies during pause, and the frozen cursor is clamped
-  to the eviction horizon (with an indicator) so the buffer never grows unbounded during a
-  long pause.
+  to the eviction horizon so the buffer never grows unbounded during a long pause. The
+  consequence is loss of evidence: pausing does **not** extend retention, so inspecting a
+  moment longer than the retention window evicts it. The UI warns as the viewed range nears
+  the eviction horizon; preserving an arbitrarily long window is what saving a pcap and
+  replaying it is for.
 
 ## Consequences
 

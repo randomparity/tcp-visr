@@ -33,8 +33,13 @@ experience and is simply absent during replay.
   ephemeral port reuse, `TIME_WAIT` recycling, and NAT mean the same 4-tuple recurs within a
   capture for *different* connections. Keying on the 4-tuple alone would splice independent
   sequence spaces and corrupt in-flight/RTT/retransmit derivation. We key by
-  `ConnId = (4-tuple, instance)`, a new instance opening on a SYN after a prior close/RST/idle
-  (and inferred from a large backward seq discontinuity for SYN-less mid-stream captures).
+  `ConnId = (4-tuple, instance)`, a new instance opening on a SYN after a prior close/RST or
+  after idle past the single configurable idle/dead timeout (shared with the `Tick` machinery,
+  [ADR-0002](0002-pure-engine-io-boundary.md)). For SYN-less mid-stream captures, a new instance
+  is inferred only from a sequence reset that is **backward in RFC 1982 serial-number space**
+  (a drop to a plausible fresh ISN) — never a benign `u32` wrap, which is *forward* under serial
+  comparison. Instance inference thus shares the serial arithmetic used for gap detection; a
+  naive `u32` "backward jump" test would falsely split a flow on every wrap.
 - The wire series is **bytes in flight (outstanding)** = highest seq sent − highest ack seen.
   This is `min(cwnd, rwnd, app-limited)` and equals cwnd *only* for an at-sender, non-rwnd-
   limited, non-app-limited sender. It is labeled "bytes in flight," never "cwnd"; the term

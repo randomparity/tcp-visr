@@ -44,8 +44,11 @@ data, not the faucet.
 - **v1.0 release binaries are split (M13).** libpcap is a dynamic C library, awkward to
   cross-compile and link statically. So the release ships a **statically-linked,
   dependency-free binary that does replay only**, plus a **libpcap-dynamic binary for
-  `live`**; M13 install docs state the per-platform libpcap requirement for live mode. This
-  resolves the tension between "ship static binaries" (M13) and the libpcap dependency.
+  `live`**. Mechanism: libpcap is an **optional Cargo dependency gated behind a `live`
+  feature (default on)**; the static binary is built `--no-default-features`, which
+  `#[cfg(feature = "live")]`-excludes both the libpcap link and the `live` subcommand.
+  M13 install docs state the per-platform libpcap requirement for live mode. This resolves the
+  tension between "ship static binaries" (M13) and the libpcap dependency.
 - Cost: live mode adds a `libpcap`/`libpcap-dev` dependency and a `CAP_NET_RAW` requirement.
   An unprivileged open that returns zero packets instead of erroring is detected and surfaced
   as a privilege problem (verified by an M11 test), not shown as an idle network.

@@ -22,7 +22,8 @@ Because the engine never reads a clock, "now" advances only via the timestamps i
 For event-driven behavior, segment timestamps suffice. For time-driven behavior in live mode
 — declaring a silent connection idle/dead, expiring an inferred RTO when no retransmit
 arrives, decaying throughput toward zero — there may be no segment for a long interval, so
-`tcpvisr-ingest` injects periodic `Tick(ts)` items carrying the current time. The engine's
+`tcpvisr-ingest` injects `Tick(ts)` items at a configurable cadence (default 250 ms) carrying
+the current time; the cadence bounds the resolution of idle/RTO/decay detection. The engine's
 timers fire off `Tick`s. Replay needs no ticks: "now" is the last segment's timestamp.
 
 ## Consequences
@@ -44,8 +45,15 @@ timers fire off `Tick`s. Replay needs no ticks: "now" is the last segment's time
   of display retention, so eviction of old samples never corrupts in-flight derivation.
 - **Purity precludes engine-side spilling.** A pure engine cannot page series to disk, so
   unbounded replay memory is bounded only by the external capture-size policy (design §7,
-  ADR-0004), not by the engine. The engine is **push-driven** with bounded input buffering at
-  the faucet providing back-pressure; it never blocks on I/O because it does none.
+  ADR-0004), not by the engine. The per-connection running baseline set also grows with the
+  number of concurrently-open connections; that growth is bounded by the active-connection cap
+  in [ADR-0004](0004-seekable-timeseries-timeline.md).
+- **Flow control differs by mode.** The engine is push-driven and never blocks (it does no
+  I/O). For **replay** the file faucet is a synchronous read→push chain, so a slow engine
+  naturally throttles reads — genuine flow control. For **live** the producer is the NIC and
+  cannot be throttled; when the bounded input buffer fills, segments are **dropped and
+  counted** (surfaced in the UI per design §7), never silently lost or buffered unbounded.
+  "Back-pressure" applies only to replay; live degrades by counted drop.
 - Cost: timestamps (including `Tick`s) must be supplied explicitly; the engine cannot read a
   clock.
 
