@@ -495,12 +495,13 @@ mod derive_tests {
     #[test]
     fn karn_drops_rtt_for_retransmitted_range() {
         let mut m = MetricState::new();
-        let c = cfg();
-        m.observe(&seg(ACK, 100, 1, 100, 1_000, false), Direction::OriginToResponder, &c); // A
-        // Retransmit of A after a gap >= reorder_window (default 3ms): clears pending RTT.
-        let r = m.observe(&seg(ACK, 100, 1, 100, 5_000, false), Direction::OriginToResponder, &c);
-        assert!(r.retransmit, "behind-frontier re-send after a long gap is a retransmit");
-        let s = m.observe(&seg(ACK, 1, 200, 0, 6_000, false), Direction::ResponderToOrigin, &c);
+        let c = cfg(); // reorder_window = 3ms = 3_000_000 ns
+        m.observe(&seg(ACK, 100, 1, 100, 1_000, false), Direction::OriginToResponder, &c); // A @1us
+        // Retransmit of A after a gap >= reorder_window (3ms): gap = 3_001_000 - 1_000 = 3_000_000.
+        let r = m.observe(&seg(ACK, 100, 1, 100, 3_001_000, false),
+                          Direction::OriginToResponder, &c);
+        assert!(r.retransmit, "behind-frontier re-send after a >= 3ms gap is a retransmit");
+        let s = m.observe(&seg(ACK, 1, 200, 0, 3_002_000, false), Direction::ResponderToOrigin, &c);
         assert_eq!(s.rtt, None, "Karn: no RTT after a retransmit");
     }
 
@@ -765,34 +766,43 @@ impl MetricState {
         if window == 0 {
             return 0;
         }
-        // Evict entries older than one window behind the running max ts (lazy, non-monotonic-safe).
+        // Membership is `ts > t - window`, written as `ts + window > t` to avoid u64 underflow
+        // when the window extends before t=0 (else the first window of a capture drops its bytes).
+        // Use u128 throughout so `ts + window` cannot overflow.
+        let w = u128::from(window);
+        // Evict entries that can never fall in any future window: an entry is excludable once
+        // `ts + window <= max_ts` (the most permissive future window starts at max_ts - window).
         if let Some(max_ts) = self.dir[d].tput_max_ts {
-            let horizon = max_ts.0.saturating_sub(window);
+            let max = u128::from(max_ts.0);
             while let Some(&(ts, _)) = self.dir[d].tput.front() {
-                if ts.0 <= horizon {
+                if u128::from(ts.0) + w <= max {
                     self.dir[d].tput.pop_front();
                 } else {
                     break;
                 }
             }
         }
-        // Sum bytes in (seg.ts - window, seg.ts].
-        let lo = seg.ts.0.saturating_sub(window);
+        // Sum bytes in (seg.ts - window, seg.ts]  ==  ts + window > seg.ts  &&  ts <= seg.ts.
+        let t = u128::from(seg.ts.0);
         let mut bytes: u128 = 0;
         for &(ts, len) in &self.dir[d].tput {
-            if ts.0 > lo && ts.0 <= seg.ts.0 {
+            let ts = u128::from(ts.0);
+            if ts + w > t && ts <= t {
                 bytes += u128::from(len);
             }
         }
         let bits = bytes.saturating_mul(8).saturating_mul(1_000_000_000);
-        u64::try_from(bits / u128::from(window)).unwrap_or(u64::MAX)
+        match u64::try_from(bits / w) {
+            Ok(v) => v,
+            Err(_) => u64::MAX,
+        }
     }
 }
 ```
 
-Note on `unwrap_or(u64::MAX)`: `u64::try_from` returns `Result`; `.unwrap_or` is **not**
-`Result::unwrap` and is allowed by the `unwrap_used` lint (which targets `Option::unwrap`/
-`Result::unwrap`). If clippy flags it, use `match … { Ok(v) => v, Err(_) => u64::MAX }`.
+Note: the final saturating cast uses an explicit `match` (not `Result::unwrap`) to satisfy the
+`unwrap_used` lint without an `#[allow]`. The `bits / w` cannot divide by zero (the `window ==
+0` early return guarantees `w > 0`).
 
 - [ ] **Step 4: Run tests to verify they pass**
 
