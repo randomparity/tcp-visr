@@ -69,10 +69,17 @@ Concretely, in `tcpvisr-engine`:
   2. **Backward sequence reset (mid-stream, no SYN).** For an `Established` instance, a
      segment in a given direction whose `seq` lies **backward in RFC 1982 serial space**
      relative to that direction's established sequence baseline by **more than
-     `reset_threshold` (default 2^31, i.e. the serial-space midpoint)** is read as a drop to
-     a fresh ISN — a new instance. A **forward** move (`serial_gt`, which is how a `u32` wrap
-     reads under RFC 1982) is an advance and never splits. Small backward moves (retransmits,
-     reordering) are below the threshold and never split.
+     `reset_threshold`** is read as a drop to a fresh ISN — a new instance. A **forward** move
+     (`serial_gt`, which is how a `u32` wrap reads under RFC 1982) is an advance and never
+     splits. Small backward moves (retransmits, reordering) are below the threshold and never
+     split. Because any backward serial distance is in `(0, 2^31)`, `reset_threshold` is the
+     **minimum** backward distance that counts as a reset and **must be `< 2^31`** — a
+     midpoint (`2^31`) threshold would be unreachable, silently disabling the rule. The
+     default is `2^30`, the largest representable TCP window with scaling, above which a
+     backward jump cannot be in-flight retransmit/reorder data. A fresh ISN that lands within
+     `2^31` *forward* of the prior sequence is indistinguishable from an advance and will not
+     split; this is the inherent limit of SYN-less inference (rule 1's SYN is the
+     authoritative signal).
 
   All sequence comparisons use `tcpvisr-core::TcpSeq` RFC 1982 arithmetic — the same code the
   wrap-vs-reset distinction depends on. Instance inference and gap/wrap detection share one
@@ -94,9 +101,10 @@ Concretely, in `tcpvisr-engine`:
   a large backward jump splits.
 - **Two tunable thresholds become part of the engine's contract** (`dead_after`,
   `reset_threshold`). Defaults are chosen to match common practice (tcptrace-style dead
-  timeout; serial midpoint for reset). They are configuration, not magic numbers, and are
-  documented in the spec. Mis-tuning trades false splits against false merges; the defaults
-  are conservative toward *not* splitting.
+  timeout; `2^30` — the max scaled window — for the reset band). They are configuration, not
+  magic numbers, and are documented in the spec. `reset_threshold` must stay `< 2^31` or the
+  backward-reset rule becomes unreachable. Mis-tuning trades false splits against false
+  merges; the defaults are conservative toward *not* splitting.
 - **`Segment` does not grow a field that the faucet cannot populate**, avoiding an `Option`
   or sentinel that every faucet would have to fill with "unknown". The design §4
   `Segment.direction` entry is realized as the engine's derived `Direction`, and the design

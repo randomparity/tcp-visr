@@ -50,8 +50,12 @@ A pure tracker with this public surface (exact names may be refined in the plan,
 fixed here):
 
 - **`EngineConfig`**: `{ dead_after: Nanos, reset_threshold: u32 }` with a `Default`
-  (`dead_after = 120 s`, `reset_threshold = 2^31`). Constructible so tests can pin small
-  timeouts.
+  (`dead_after = 120 s`, `reset_threshold = 2^30`). Constructible so tests can pin small
+  timeouts/thresholds. `reset_threshold` is the **minimum backward serial distance** that
+  counts as a fresh-ISN reset; `2^30` is the largest representable TCP in-flight window
+  (window 65535 × max window-scale 2^14 ≈ 2^30), so a backward jump exceeding it cannot be
+  in-flight retransmit/reorder data. It must be `< 2^31` (the serial-space midpoint) to be
+  satisfiable at all (see instance disambiguation).
 - **`ConnState`** (observed lifecycle, design §10.M2):
   - `SynSent` — a bare SYN (SYN set, ACK clear) from the origin observed; nothing back yet.
   - `SynReceived` — a SYN-ACK observed (or, in a simultaneous open, both sides' bare SYNs).
@@ -69,7 +73,9 @@ fixed here):
   - `origin_inferred: bool` (true when no bare SYN was observed)
   - `opened_at: Nanos` (first observed segment ts for the instance)
   - `last_at: Nanos` (last observed segment ts for the instance)
-  - `bytes_o2r: u64`, `bytes_r2o: u64` (TCP payload bytes per direction)
+  - `bytes_o2r: u64`, `bytes_r2o: u64` (**wire** TCP payload bytes per direction —
+    `payload_len` summed as observed, retransmissions included; unique/goodput accounting is
+    M3)
   - `segments: u64` (count of segments attributed to the instance)
   - `duration(&self) -> Nanos` = `last_at − opened_at` (saturating).
 - **`Tracker`**:
@@ -83,33 +89,52 @@ fixed here):
 - A convenience `track(items, config) -> Vec<Connection>` over an `IntoIterator<Item=&Item>`
   for unit tests.
 
-**State-transition contract** (per instance; RST is a terminal override at any point):
+**State-transition contract** (per instance; RST is a terminal override at any point). A
+**bare SYN** is SYN-set/ACK-clear; the two SYN columns distinguish a SYN whose source is the
+recorded `origin` (the connection's first SYN sender) from one whose source is the
+`responder` side (the *second* SYN of a simultaneous open):
 
-| Current → event | bare SYN (orig) | SYN-ACK | other w/ no handshake seen | ACK completing handshake / data after SynReceived | FIN (1st dir) | FIN (2nd dir) | RST |
-|---|---|---|---|---|---|---|---|
-| (new) | `SynSent` | `SynReceived` | `Established` (`origin_inferred`) | — | `FinWait`* | — | `Reset` |
-| `SynSent` | — | `SynReceived` | — | — | `FinWait` | — | `Reset` |
-| `SynReceived` | — | — | — | `Established` | `FinWait` | — | `Reset` |
-| `Established` | (see instance rules) | — | — | — | `FinWait` | — | `Reset` |
-| `FinWait` | — | — | — | — | — | `Closed` | `Reset` |
-| `Closed` | new instance | — | — | — | — | — | `Reset` |
-| `Reset` | new instance | — | — | — | — | — | — |
+| Current → event | bare SYN (origin side) | bare SYN (responder side) | SYN-ACK | other w/ no handshake seen | ACK completing handshake / data after SynReceived | FIN (1st dir) | FIN (2nd dir) | RST |
+|---|---|---|---|---|---|---|---|---|
+| (new) | `SynSent` | `SynSent` | `SynReceived` | `Established` (`origin_inferred`) | — | `FinWait`* | — | `Reset` |
+| `SynSent` | — (dup) | `SynReceived` (sim-open) | `SynReceived` | — | — | `FinWait` | — | `Reset` |
+| `SynReceived` | — (dup) | — (dup) | — (dup) | — | `Established` | `FinWait` | — | `Reset` |
+| `Established` | see instance rules† | — (dup) | — (dup) | — | — | `FinWait` | — | `Reset` |
+| `FinWait` | see instance rules† | — | — | — | — | — | `Closed` | `Reset` |
+| `Closed` | new instance | new instance | — | — | — | — | — | `Reset` |
+| `Reset` | new instance | new instance | — | — | — | — | — | — |
 
 \* A FIN as the very first observed segment is a degenerate mid-stream tail: the connection
 is created `origin_inferred`, `Established` is implied, and the FIN moves it to `FinWait`.
-State is **monotonic** along `SynSent → SynReceived → Established → FinWait → Closed`
-(an out-of-order/duplicate event never moves state backward); `Reset` overrides from any
-non-`Reset` state and is terminal.
+
+† On a live (non-terminal, non-idle) instance a bare SYN is an absorbed **duplicate**
+(retransmitted SYN): no transition, no new instance. A new instance is opened only per the
+instance-disambiguation rules below (terminal/idle, or backward reset).
+
+"— (dup)" cells are absorbed no-ops (duplicate/retransmitted control segment, or a segment
+that does not advance the lifecycle). State is **monotonic** along
+`SynSent → SynReceived → Established → FinWait → Closed` (an out-of-order or duplicate event
+never moves state backward); `Reset` overrides from any non-`Reset` state and is terminal.
+The "responder side" of a SYN is determined by the already-recorded `origin` (set by the
+first bare SYN); when no `origin` is yet recorded the first bare SYN sets it (the `(new)`
+row).
 
 **Instance disambiguation** (ADR-0006), all serial comparisons via `TcpSeq`:
 
 - A bare SYN observed for a pair whose current instance is `Closed`/`Reset`, or has been idle
   (`now − last_at > dead_after`), opens a **new** instance (next `instance`).
 - For an `Established` instance with a tracked per-direction sequence baseline, a segment
-  whose `seq` is backward in RFC 1982 serial space from that baseline by **more than**
-  `reset_threshold` opens a new instance (a SYN-less fresh start). A forward move (including a
-  `u32` wrap, which reads forward under RFC 1982) advances the same instance. Backward moves
-  within `reset_threshold` (retransmit/reorder) do not split.
+  whose `seq` is **backward** in RFC 1982 serial space from that baseline (i.e.
+  `seq.serial_lt(baseline)`) by **more than `reset_threshold`** opens a new instance (a
+  SYN-less fresh start). A forward move (including a `u32` wrap, which reads *forward* under
+  RFC 1982 — `serial_gt`) advances the same instance and never splits. Backward moves of
+  `≤ reset_threshold` (retransmit/reorder, bounded by the in-flight window) do not split.
+  Because any backward serial distance is in `(0, 2^31)`, `reset_threshold` must be `< 2^31`
+  for the rule to be reachable; the `2^30` default leaves the band `(2^30, 2^31)` as "reset".
+  **Inherent limit:** a fresh ISN that happens to land within `2^31` *forward* of the prior
+  sequence is indistinguishable from an advance and will not split — acceptable because the
+  authoritative split signal is the SYN (rule 1); the backward-reset rule is the SYN-less
+  best effort design §4 mandates, not a guarantee.
 - Bytes and `segments` are attributed to the instance a segment resolves to.
 
 ### `tcp-visr conns` subcommand
@@ -131,8 +156,10 @@ non-`Reset` state and is terminal.
 
 Five committed `.pcap` fixtures, one per DoD scenario, built by the **same code-generated,
 drift-guarded builder** approach as M1 (`tests/support`), so each is reviewable as source.
-Built with microsecond timestamps. Fixtures live in the crate that owns the end-to-end test
-(see "Testing"):
+Built with microsecond timestamps, and — unlike M1's single-`TS` fixtures — using **strictly
+increasing per-packet timestamps** so `opened_at`, `last_at`, and `duration` are non-zero and
+testable (M1's `Pkt::new(ts_us, …)` already takes a per-packet timestamp). Fixtures live in
+the crate that owns the end-to-end test (see "Testing"):
 
 1. **`mid_stream.pcap`** — data/ACK segments with no SYN: one connection, `Established`,
    `origin_inferred`.
@@ -151,12 +178,15 @@ Built with microsecond timestamps. Fixtures live in the crate that owns the end-
   mid-stream (no handshake), simultaneous-open, mid-stream RST, 4-tuple reuse (distinct
   instances), `u32` seq wraparound (single instance), plus: graceful FIN/FIN close to
   `Closed`, RST as terminal override, monotonic state under duplicate/reordered events,
-  per-direction byte attribution, backward-reset split vs. small-backward (retransmit)
-  no-split, and idle-`dead_after` reuse. Tests assert **what** the tracker reports
+  per-direction byte attribution (with a retransmit, asserting the duplicate payload **is**
+  re-counted per the wire-bytes decision), SYN-less mid-stream **backward-reset split**
+  (backward distance in `(reset_threshold, 2^31)`) vs. small-backward (retransmit) no-split,
+  and idle-`dead_after` reuse. Tests assert **what** the tracker reports
   (state, instance count, bytes, duration), not how it is computed.
 - **`proptest`** for the instance-split decision boundary: for any baseline and any forward
-  delta (including across the `u32` wrap), the segment never splits; for a backward delta
-  greater than `reset_threshold`, it splits. This guards the wrap-vs-reset rule directly.
+  delta in `[1, 2^31)` (including deltas that cross the `u32` boundary), the segment never
+  splits; for a backward delta in `(reset_threshold, 2^31)`, it splits. This guards the
+  wrap-vs-reset rule directly and pins the satisfiable band.
 - **CLI/fixture integration** (`tcp-visr` crate, the five committed fixtures): `tcp-visr
   conns <fixture>` exits 0 and prints the expected connection count, states, instance
   numbers, and the `(mid-stream)` marker where applicable. A missing file exits non-zero with
@@ -220,12 +250,23 @@ Built with microsecond timestamps. Fixtures live in the crate that owns the end-
   wire, deliberately coarser than RFC 793's eleven endpoint states (no `TIME_WAIT`/`LAST_ACK`
   distinction — unobservable and unneeded for M2's DoD). Stated so the challenge review does
   not read missing endpoint states as a gap.
-- **`dead_after = 120 s`, `reset_threshold = 2^31` defaults**, both configurable
-  (`EngineConfig`). The reset threshold is the serial-space midpoint: the largest
-  unambiguous backward jump under RFC 1982. The dead timeout is a conservative
-  tcptrace-style default; it only matters for SYN-after-idle reuse.
-- **Bytes are TCP payload bytes per direction**, a connection-level scalar summary, not a
-  time series (that is M3). SYN/FIN phantom sequence bytes are **not** counted as payload.
+- **`dead_after = 120 s`, `reset_threshold = 2^30` defaults**, both configurable
+  (`EngineConfig`). `reset_threshold` is the **minimum** backward serial distance that counts
+  as a fresh-ISN reset and **must be `< 2^31`** (no backward distance can exceed the
+  serial-space midpoint, so a midpoint threshold would make the rule unreachable); `2^30`
+  is the largest representable TCP window with scaling, above which a backward jump cannot be
+  in-flight data. The dead timeout is a conservative tcptrace-style default; it only matters
+  for SYN-after-idle reuse.
+- **Bytes are *wire* TCP payload bytes per direction** (each segment's `payload_len`
+  summed as observed, **including retransmissions**), a connection-level scalar summary, not
+  a time series (that is M3). SYN/FIN phantom sequence bytes are **not** counted as payload;
+  unique-bytes/goodput-vs-retransmitted accounting is deferred to M3.
+- **A lone RST (or any single segment) creates a tracked connection.** The first observed
+  segment of any kind for a pair opens an instance; a contextless RST therefore yields a
+  one-segment `Reset` connection. This favors *visibility* (the analyzer shows RST activity)
+  over noise suppression; a capture with many unsolicited RSTs (scan/backscatter) will list
+  one connection each. Bulk-RST/scan suppression is a later-milestone heuristic, deliberately
+  out of M2 scope — recorded here, not silently dropped.
 - **Engine takes `&Item` by reference and is fed by the streaming faucet**, so `conns` holds
   only the current frame plus the connection table (bounded by connection count, not capture
   size) — consistent with M1's streaming `parse` and deferring the series ceiling to M3.
