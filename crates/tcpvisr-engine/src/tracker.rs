@@ -199,8 +199,10 @@ impl Tracker {
                 self.conns[idx].account(seg, dir);
                 self.conns[idx].apply_state(seg, dir);
                 // Derive metrics only for collected instances: `conns` (None) pays nothing, and
-                // the per-direction RTT/throughput state cannot grow for unrelated flows.
-                if self.should_collect(self.conns[idx].id) {
+                // the per-direction RTT/throughput state cannot grow for unrelated flows. Once
+                // the ceiling has tripped the result is already doomed, so stop deriving entirely
+                // rather than keep growing per-connection state on a discarded series.
+                if !self.overflowed && self.should_collect(self.conns[idx].id) {
                     let sample = self.conns[idx].metrics.observe(seg, dir, &self.config);
                     self.record_sample(idx, sample);
                 }
@@ -272,9 +274,9 @@ impl Tracker {
                 Direction::ResponderToOrigin => track.fin_r2o = true,
             }
         }
-        // Derive the first sample only for collected instances (see `observe_segment`).
-        let sample = self
-            .should_collect(track.id)
+        // Derive the first sample only for collected instances, and not past the ceiling
+        // (see `observe_segment`).
+        let sample = (!self.overflowed && self.should_collect(track.id))
             .then(|| track.metrics.observe(seg, dir, &self.config));
         let idx = self.conns.len();
         self.conns.push(track);
