@@ -23,8 +23,8 @@ re-parses; playback speed only changes how fast the cursor advances.
 - **Sample cadence**: one sample per processed segment (per-event). The series time index is
   therefore irregular. "State as of `T`" is the **last sample at or before `T`**
   (last-value-carried-forward) — not interpolation. `throughput_bps` is a trailing
-  sliding-window average of fixed length (default 1 s), **frozen into each sample at ingest
-  time** because seeking never re-parses; its window cannot be changed at scrub time.
+  sliding-window average of fixed length (default 1 s, configurable at ingest), **frozen into
+  each sample at ingest time** because seeking never re-parses; its window cannot be changed at scrub time.
 - **Cost is two-level.** Within one connection, seek is binary search, O(log m). Across
   connections, an interval index over `[opened_at, closed_at]` yields the set active at `T`;
   still-open connections (no `closed_at`) are indexed with an open right bound (`+∞` / running
@@ -49,7 +49,7 @@ re-parses; playback speed only changes how fast the cursor advances.
 
 ## Consequences
 
-- Speed is free: 0.1× and 10× cost the same. Random seek is O(A·log m) per frame (above),
+- Speed is free: 0.1× and 10× cost the same. Random seek is O(N_T·log m) per frame (above),
   not a replay; render performance is decoupled from parse/capture performance.
 - Cost: memory scales with retained samples. Replay holds the full series in memory, which is
   the direct cause of the large-capture memory risk (design §14). v1 bounds it with a
@@ -59,7 +59,10 @@ re-parses; playback speed only changes how fast the cursor advances.
   diagnostic captures (≤ low-millions of segments), not multi-hour full-link taps.
 - Live engine state has two lifetimes: bounded sample history (display) vs. per-connection
   running baseline (connection lifetime). Many simultaneously-open long-lived connections make
-  the baseline set grow with connection count — bounded by the same active-connection cap.
+  the baseline set grow with concurrent connection count. v1 does **not** enforce a hard
+  active-connection cap; it accepts this growth because target captures stay within the
+  interactive-diagnostic envelope above (≤ low-millions of segments, modest concurrency). A
+  hard cap with fail-fast is a post-v1 option if real workloads need it.
 - Dense windows may need per-view downsampling to fit terminal resolution; the series
   granularity is the source, downsampling is a render-time concern.
 

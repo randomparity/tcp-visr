@@ -24,8 +24,8 @@ We will use **libpcap (the `pcap` crate) for live capture** in v1. We will parse
 libpcap.
 
 The two faucets differ **only in the container/source layer**. Both hand raw link-layer
-frames to a **single shared decoder** (`etherparse`, plus our own SLL/SLL2 cooked-header
-decode since `etherparse` 0.20.2 does not handle SLL2) that produces `Segment`s. There is
+frames to a **single shared decoder** (`etherparse`, plus our own SLL2 cooked-header decode
+since `etherparse` 0.20.2 parses SLL v1 but not SLL2) that produces `Segment`s. There is
 no second header-parsing path, so libpcap and `pcap-parser` cannot decode identical bytes
 into different segments. Live capture requests **nanosecond timestamp precision**
 (`PCAP_TSTAMP_PRECISION_NANO`, falling back to microsecond when the device cannot supply

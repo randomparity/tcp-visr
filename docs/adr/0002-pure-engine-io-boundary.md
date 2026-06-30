@@ -46,8 +46,9 @@ timers fire off `Tick`s. Replay needs no ticks: "now" is the last segment's time
 - **Purity precludes engine-side spilling.** A pure engine cannot page series to disk, so
   unbounded replay memory is bounded only by the external capture-size policy (design §7,
   ADR-0004), not by the engine. The per-connection running baseline set also grows with the
-  number of concurrently-open connections; that growth is bounded by the active-connection cap
-  in [ADR-0004](0004-seekable-timeseries-timeline.md).
+  number of concurrently-open connections; v1 accepts this within the targeted capture envelope
+  rather than enforcing a hard connection cap (see
+  [ADR-0004](0004-seekable-timeseries-timeline.md)).
 - **Flow control differs by mode.** The engine is push-driven and never blocks (it does no
   I/O). For **replay** the file faucet is a synchronous read→push chain, so a slow engine
   naturally throttles reads — genuine flow control. For **live** the producer is the NIC and

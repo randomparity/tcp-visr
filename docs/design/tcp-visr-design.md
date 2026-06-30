@@ -80,7 +80,7 @@ interface, and is testable in isolation.
 | `tcpvisr-core` | shared types: `FlowKey` (TCP 4-tuple, v4/v6), `ConnId`, `Item`, `Segment`, `MetricSample`; time as nanoseconds-since-capture-start (`u64`); serial-number arithmetic | — | none |
 | `tcpvisr-ingest` | `.pcap`/`.pcapng` parse (replay) + libpcap capture (live) → `Item` stream (§4.1); link types: Ethernet II, Linux SLL & SLL2, raw IP, loopback | core | files; libpcap (optional, `live` feature) |
 | `tcpvisr-engine` | TCP connection state machine + metric derivation → per-connection time-indexed series | core | **none (pure)** |
-| `tcpvisr-enrich` | live-only: `sock_diag` (real cwnd/srtt/retrans) + `/proc` (process attribution), matched by `FlowKey` | core | netlink, procfs |
+| `tcpvisr-enrich` | live-only: `sock_diag` (real cwnd/srtt/retrans) + `/proc` (process attribution), matched by `ConnId` (instance-aware) | core | netlink, procfs |
 | `tcpvisr-tui` | ratatui master/detail UI, timeline cursor, the four graph views | core, engine | terminal |
 | `tcp-visr` (bin) | clap CLI; subcommands `replay`, `live`, `parse`, `conns`, `metrics`; wires faucet → engine → tui | all | — |
 
