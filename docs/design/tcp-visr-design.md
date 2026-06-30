@@ -369,6 +369,8 @@ and roadmap ordering already encode those, and duplicate state rots.
 | [0003](../adr/0003-libpcap-for-live-capture.md) | Live capture uses libpcap (`pcap` crate); replay parsing is pure-Rust | Accepted |
 | [0004](../adr/0004-seekable-timeseries-timeline.md) | Precomputed time-indexed series + cursor for seek/speed | Accepted |
 | [0005](../adr/0005-libpcap-file-faucet-at-m1.md) | libpcap enters at M1 as a default-off file faucet for the parity test (amends ADR-0003 timing) | Accepted |
+| [0006](../adr/0006-connection-identity-and-direction.md) | Connection grouping, orientation, direction, and instance identity are engine-derived (RFC 1982 wrap-vs-reset) | Accepted |
+| [0007](../adr/0007-metric-derivation-model.md) | Per-event/per-direction metric sampling; `ConnectionMetrics` series; reorder-window retransmit/OOO; Karn RTT; sample ceiling; serde in the CLI | Accepted |
 
 ## 14. Risks
 
