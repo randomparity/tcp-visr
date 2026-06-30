@@ -1,0 +1,20 @@
+[advisories]
+version = 2
+
+[bans]
+multiple-versions = "warn"
+
+# Only the SPDX ids actually present in M0's tree (clap + std deps). Add more as later
+# milestones introduce dependencies — an unused `allow` entry emits a license-not-encountered
+# warning, which the zero-warnings policy forbids.
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Unicode-3.0",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
