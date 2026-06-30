@@ -1330,8 +1330,15 @@ exercises a piggybacked ACK (seg3 carries data AND acks the SYN-ACK), so trace e
 
 metrics_retransmit.pcap (--conn 0): seg2 seq=100 < frontier 200, gap 3.0001s >= 3ms -> retransmit=true;
         clears pending RTT. (Both o2r, no reverse ACK, so no RTT anywhere.)
-metrics_ooo.pcap (--conn 0): seg2 seq=100 < frontier 300, gap 1us < 3ms -> out_of_order=true.
-metrics_sack.pcap (--conn 0): seg2 (r2o) carries SACK [200,260) -> sack=true on that sample.
+metrics_ooo.pcap (--conn 0): seg1 {o2r, in_flight 100, rtt null}; seg2 seq=100 < frontier 300,
+        gap 1us < 3ms -> {o2r, out_of_order true, in_flight serial_diff(300,200)=100, rtt null}.
+        (Both o2r, no reverse ACK -> no rtt anywhere.)
+metrics_sack.pcap (--conn 0) — seg2 also acks seg1, so it carries a data RTT; enumerate both:
+  seg1 o2r seq=100 len=50 ack=1 ts=1us: acked[o2r]=100, snd_nxt=150, in_flight=50.
+        ack=1 but r2o has no send -> no rtt. pending_rtt[o2r]=[(150,1us)]. => {o2r, in_flight 50, rtt null}
+  seg2 r2o seq=1 ack=151 len=0 SACK[200,260) ts=2us: acked[r2o]=1, snd_nxt[r2o]=1, in_flight[r2o]=0.
+        ack=151 advances acked[o2r] (100->151), pops (150,1us) -> rtt=2us-1us=1000ns (DATA RTT).
+        sack_blocks non-empty -> sack=true. => {r2o, in_flight 0, rtt 1000, sack true}
 ```
 
 Write the five golden JSON files by running the command once the `metrics` subcommand exists
