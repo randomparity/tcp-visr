@@ -86,12 +86,15 @@ series is **not** added to M2's `Copy` `Connection`; it is delivered alongside i
 
 - **`ConnectionMetrics`**: `{ conn: Connection, series: Vec<MetricSample> }` — the M2
   `Connection` (lifecycle/scalar view, unchanged) bundled with its derived series.
-- **`EngineConfig`** gains three knobs (all with `Default`, all configurable so tests can pin
-  small values):
-  - `collect_series: bool` (**default `false`**) — when `false`, the tracker derives only M2
-    lifecycle/scalar state and stores **no** samples (zero added cost for `conns`); when
-    `true`, it derives and stores the per-event series. Metric *state* needed for correctness
-    is only advanced when `collect_series` is on.
+- **`EngineConfig`** gains the knobs below (all with `Default`, all configurable so tests can
+  pin small values):
+  - `series_collection: SeriesCollection` (**default `None`**) — an enum controlling which
+    instances buffer a series: `None` (the `conns` path — derive only M2 lifecycle/scalar
+    state, store **no** samples, zero added cost), `All` (every instance buffers), or
+    `Only(ConnId)` (only the named instance buffers). The `metrics` command uses `Only(target)`
+    so a large multi-connection capture never builds — or blows the ceiling on — series the
+    user did not ask for (see the subcommand's two-pass below). Metric *state* the buffering
+    instance needs is advanced only when that instance is collected.
   - `throughput_window: Nanos` (**default 1 s** = `1_000_000_000`) — the trailing window
     length for `throughput_bps` (§4.1).
   - `reorder_window: Nanos` (**default 3 ms** = `3_000_000`) — a behind-frontier data segment
@@ -99,8 +102,10 @@ series is **not** added to M2's `Copy` `Connection`; it is delivered alongside i
     is classified **out-of-order** (reordering); at or above it, **retransmit** (loss). This
     mirrors Wireshark's reordering heuristic (ADR-0007) and makes the gated external
     cross-check meaningful.
-  - `max_samples: usize` (**default `10_000_000`**) — total retained-sample ceiling across the
-    capture, a coarse OOM guard (§7). Enforced only when `collect_series`.
+  - `max_samples: usize` (**default `10_000_000`**) — retained-sample ceiling across the
+    **collected** series (one connection under `metrics`'s `Only`, all under `All`), a coarse
+    OOM guard (§7). A non-collected instance contributes nothing to it, so `metrics --conn N`
+    is bounded by connection `N`'s own series, never by unrelated flows.
 - **`Tracker`** (M2) gains, internal to each tracked instance, the per-direction derivation
   state and (when collecting) the series buffer. Public surface added:
   - `into_metrics(self) -> Result<Vec<ConnectionMetrics>, MetricError>` — finalizes and returns
@@ -141,25 +146,45 @@ State per direction `d` (lazily initialized on the first segment seen in `d`):
 On observing segment `S` in direction `d` (with the metric state above advanced **after**
 reading the references it needs), produce exactly one `MetricSample`:
 
-1. **in-flight.** Advance `snd_nxt[d]` with `seq_end(S)`. If `S` has ACK set, advance
-   `acked[¬d]` with `S.ack` (only when `S.ack` serial-advances it; duplicate/old ACKs do not
-   move it). `in_flight_bytes = serial_diff(snd_nxt[d], acked[d])` when `snd_nxt[d]` is serial-≥
-   `acked[d]`, else **0** (clamp — at a mid-path vantage an ACK can be observed before the data
-   it covers; design §4).
+0. **ACK advance, computed once.** Before any state mutation, compute the single predicate
+   `ack_advances = S.flags.ack() && S.ack.serial_gt(acked[¬d])` against the **pre-update**
+   `acked[¬d]`. Both the in-flight update (step 1) and the RTT gate (step 4) read this one
+   value; a duplicate/old ACK has `ack_advances = false` and therefore neither moves `acked`
+   nor yields RTT. (Stated as a distinct pre-step so the read-before-write ordering is
+   unambiguous.)
+1. **in-flight.** Advance `snd_nxt[d]` with `seq_end(S)`. If `ack_advances`, set
+   `acked[¬d] = S.ack`. `in_flight_bytes = serial_diff(snd_nxt[d], acked[d])` when `snd_nxt[d]`
+   is serial-≥ `acked[d]`, else **0** (clamp — at a mid-path vantage an ACK can be observed
+   before the data it covers; design §4). **Pure-ACK / drain semantics:** the sample reports
+   `dir`'s own outstanding, so a pure ACK (which advances `acked[¬d]`, draining the *opposite*
+   direction) records `dir`'s in-flight (~0 for a one-way receiver), **not** the drained
+   direction. The drained direction's reduction surfaces on its **next data sample** (whose
+   `snd_nxt − acked` already nets out the intervening ACKs), so the in-flight sawtooth is
+   reconstructable at each same-direction send. The one value not sampled in replay is the
+   **final drain after a direction's last data segment** (no later same-direction event to
+   carry it); live mode samples it via `Tick` decay (M11). This is the per-event-sampling
+   contract (§4.1, ADR-0004), made explicit here and asserted by a data-then-only-ACKs test.
 2. **retransmit / out-of-order.** Only for a **data** segment (`payload_len > 0`); pure ACKs and
    bare control segments are neither. Let `f = frontier[d]` (pre-`S`). If `S.seq` is serial-< `f`
    (re-covers seen sequence space): it is `out_of_order` when `S.ts − last_data_ts[d]` (saturating)
    is **<** `reorder_window`, else `retransmit`. Otherwise (`S.seq` serial-≥ `f`, new data or a
    forward gap) both are `false`. Then advance `frontier[d]` and set `last_data_ts[d]`.
 3. **SACK.** `sack = !S.options.sack_blocks.is_empty()`.
-4. **RTT (Karn).** RTT-eligibility is per data segment: a **new-data** send (step 2 classified
-   neither retransmit nor OOO, `payload_len > 0` or SYN/FIN phantom) pushes `(seq_end(S), S.ts)`
-   onto `pending_rtt[d]`. A **retransmit** in `d` **clears** `pending_rtt[d]` (Karn: the
-   retransmission makes every outstanding sample ambiguous — conservative, no false RTT). When
-   `S` carries an ACK that serial-advances `acked[¬d]` (a new acknowledgement, not a dup ACK),
-   pop from `pending_rtt[¬d]` every entry with `seq_end` serial-≤ `S.ack`; if any were popped,
-   `rtt = Some(S.ts − send_ts)` of the **oldest** popped entry (the segment this ACK first
-   acknowledges, saturating subtraction). A dup ACK yields no RTT.
+4. **RTT (Karn).** RTT-eligibility is per **sequence-consuming** segment: a send that consumes
+   sequence space (`payload_len > 0`, or a SYN/FIN phantom byte) **and** is not a retransmit
+   pushes `(seq_end(S), S.ts)` onto `pending_rtt[d]`; pure ACKs (no payload, no SYN/FIN)
+   register nothing. A **retransmit** in `d` **clears** `pending_rtt[d]` (Karn: the
+   retransmission makes every outstanding sample ambiguous — conservative, no false RTT). If
+   `ack_advances` (step 0), pop from `pending_rtt[¬d]` every entry with `seq_end` serial-≤
+   `S.ack`; if any were popped, `rtt = Some(S.ts − send_ts)` of the **oldest** popped entry,
+   else no RTT. The oldest popped entry is the segment that was **outstanding the longest among
+   those this ACK newly acknowledges** — i.e. the byte at the old `acked[¬d]` frontier — so
+   `S.ts − send_ts` is that segment's true round trip (RFC 6298 times the segment at `snd.una`).
+   It biases the single per-ACK sample toward the largest in-burst RTT when one delayed
+   cumulative ACK covers a burst; this is the documented definition the gated `tcptrace`
+   cross-check must compare against (tcptrace emits per-segment samples, so the comparison
+   filters to the oldest-acked segment per cumulative ACK). A dup ACK (`!ack_advances`) yields
+   no RTT.
 5. **throughput.** `throughput_bps` = `8 ·` (sum of `payload_len` over `d` **data** segments
    whose ts ∈ `(S.ts − throughput_window, S.ts]`) `· 1e9 / throughput_window_ns`, computed in
    `u128` and saturating-cast to `u64`. Wire bytes (retransmissions **included**); goodput is
@@ -167,18 +192,24 @@ reading the references it needs), produce exactly one `MetricSample`:
    own trailing window over bytes accumulated so far (non-monotonic-safe, saturating).
 
 `Tick` items produce **no** sample (replay emits none; live decay-to-zero is M11). The
-sample's `t` is `S.ts`. When `collect_series`, push the sample to the instance's buffer; if
-the total retained count would exceed `max_samples`, stop pushing and record the overflow so
-`into_metrics` returns `MetricError::SampleCeiling`.
+sample's `t` is `S.ts`. When the instance is being collected (`series_collection` is `All`, or
+`Only` names it), push the sample to its buffer; if the retained count across collected series
+would exceed `max_samples`, stop pushing and record the overflow so `into_metrics` returns
+`MetricError::SampleCeiling`.
 
 ### `tcp-visr metrics` subcommand
 
 - `tcp-visr metrics <FILE> --conn <N> [--throughput-window-ms <MS>] [--reorder-window-ms <MS>]
-  [--max-samples <K>]` streams the capture through the **pure-Rust replay faucet**
-  (`parse_file_visit`, no libpcap) into a `Tracker` configured with `collect_series = true`,
-  then serializes connection `N`'s series as JSON to a locked `io::stdout()` via
+  [--max-samples <K>]` resolves and serializes one connection's series in **two passes** over
+  the capture through the **pure-Rust replay faucet** (`parse_file_visit`, no libpcap):
+  **pass 1** runs a `series_collection = None` tracker to `into_connections()`, fixing the
+  deterministic order and resolving `N` to its `ConnId` (and rejecting an out-of-range `N`
+  before any series is built); **pass 2** re-runs with `series_collection = Only(target)` so
+  only connection `N` buffers samples (bounded by `N`'s own `max_samples`, never by unrelated
+  flows). The selected `ConnectionMetrics` is serialized as JSON to a locked `io::stdout()` via
   `serde_json::to_writer_pretty` (the `print_stdout` lint is denied; serde writes through the
-  writer, no macros).
+  writer, no macros). Two passes are cheap and safe because replay is deterministic — the
+  connection order is identical across passes (design §3.2/§5; the faucet re-reads the file).
 - **`--conn N`** is **required** and is the **0-based index** into the deterministic connection
   order (the same order `tcp-visr conns` prints). `N ≥ count` is an actionable error:
   `connection index N out of range (capture has K connections, 0..K-1); run `tcp-visr conns
@@ -236,16 +267,25 @@ fixture is reviewable as source. M3 adds metric-specific fixtures and **golden o
      across the `u32` boundary must be serial-correct (a naive subtraction would be grossly
      wrong); an RTT pairs across the wrap.
 - **Oracle goldens** (`crates/tcp-visr/tests/oracle/<fixture>.metrics.json`): the expected
-  `metrics --conn N` JSON for each fixture, **hand-derived from first principles** and committed.
-  Each golden's load-bearing values (in-flight at/around the wrap, the RTT pairings, the
-  retransmit/OOO/SACK flags, the throughput in a known window) are derived in this spec's
-  **Oracle derivation** appendix and re-stated in a comment-free `README` beside the goldens.
-  An integration test asserts `metrics` output **byte-matches** the golden (drift-guarded;
-  regenerate-on-change, matching M1/M2).
-- **Gated external cross-check**: an `#[ignore]`d test (`tcptrace_cross_check`) documents how to
-  regenerate an independent reference with `tcptrace`/Wireshark on the same fixtures. It is run
-  by maintainers, **skipped in CI** (no external tool), mirroring the existing `live`-gate
-  pattern. This realizes design §8's "independent tool" oracle without a CI dependency.
+  `metrics --conn N` JSON for each fixture. To be a real check and not a re-snapshot of the
+  code's own output, every load-bearing value (in-flight at/around the wrap, the RTT pairings,
+  the retransmit/OOO/SACK flags, the throughput in a known window) is **hand-derived from the
+  fixture's segments by RFC 1982 serial arithmetic** — the plan enumerates the full per-segment
+  numbers for **all five** fixtures (not just `seq_wrap`) in the same form as this spec's Oracle
+  derivation appendix, and that enumeration, not program output, is what the committed golden is
+  written from. An integration test asserts `metrics` output **byte-matches** the golden. The
+  drift guard's `regenerate` path is **explicitly gated** (`#[ignore]`, run only after a
+  reviewed derivation change), so a casual `cargo test` can never silently bless a changed
+  golden; a derivation change requires re-deriving the numbers by hand and reviewing the diff.
+- **Gated external cross-check (release gate)**: an `#[ignore]`d test (`tcptrace_cross_check`)
+  documents how to regenerate an independent reference with `tcptrace`/Wireshark on the same
+  fixtures (using the oldest-acked-per-cumulative-ACK RTT definition above). It is run by
+  maintainers, **skipped in CI** (no external tool), mirroring the existing `live`-gate pattern.
+  **CI therefore provides drift-guarding and the hand-derived analytic check, not an independent
+  tool comparison** — the external cross-check is a documented **release-checklist gate** (run
+  before tagging a release; record the reference). This is the honest realization of design §8's
+  "independent tool" oracle without a CI dependency, and it is why the analytic goldens must be
+  hand-derived rather than code-emitted (a shared author error would otherwise pass both).
 
 ## Testing (design §8: engine is pure unit tests fed hand-built `Vec<Item>`)
 
@@ -264,10 +304,16 @@ fixture is reviewable as source. M3 adds metric-specific fixtures and **golden o
     the window are excluded; the boundary (`ts − window`, exclusive) is asserted;
   - phantom-byte accounting: a SYN/FIN advances the sequence frontier (in-flight reflects it) but
     is **not** counted in `bytes_*`;
-  - `collect_series = false` yields **empty** series (and no ceiling cost); `true` yields one
-    sample per segment;
+  - `series_collection = None` yields **empty** series (and no ceiling cost); `All` yields one
+    sample per segment per connection; `Only(id)` yields samples for **only** the named instance
+    (others stay empty and contribute nothing to the ceiling);
+  - **drain visibility**: a data-then-only-ACKs tail samples the sawtooth peaks at each data
+    send, the same-direction drain on the next send, and **no** post-last-data drain in replay
+    (the documented per-event-sampling limit);
   - **`max_samples`** ceiling: a small limit makes `into_metrics` return
-    `MetricError::SampleCeiling` with the count/limit; below the limit it returns `Ok`;
+    `MetricError::SampleCeiling` with the count/limit; below the limit it returns `Ok`; an
+    `Only` collection is bounded by the named connection alone (unrelated large flows do not
+    trip it);
   - **non-monotonic time**: a reordered earlier-ts segment does not panic and computes its own
     trailing window (saturating).
 - **`proptest`** for the in-flight/serial property: for any baseline and any sequence of forward
@@ -276,8 +322,10 @@ fixture is reviewable as source. M3 adds metric-specific fixtures and **golden o
   wrap directly).
 - **CLI/oracle integration** (`tcp-visr` crate): `tcp-visr metrics <fixture> --conn N` exits 0
   and its stdout **byte-matches** the committed golden for every fixture; an out-of-range
-  `--conn`, a missing file, and an exceeded `--max-samples` each exit non-zero with the
-  actionable message.
+  `--conn` (rejected in pass 1, before any series is built), a missing file, and an exceeded
+  `--max-samples` each exit non-zero with the actionable message. A multi-connection capture with
+  a small `--max-samples` still succeeds for a small target connection (the `Only` ceiling is not
+  tripped by unrelated flows).
 - **Drift guard**: committed fixture bytes **and** committed oracle goldens match their
   generators (regenerate on change), matching M1/M2.
 
@@ -312,18 +360,20 @@ fixture is reviewable as source. M3 adds metric-specific fixtures and **golden o
    valid capture + in-range index, and non-zero with an actionable message on a missing file, an
    out-of-range index, or an exceeded `--max-samples`.
 8. The series carries in-flight, throughput, retransmit/OOO/SACK, and Karn-paired RTT; the
-   **`u32` seq-wrap fixture** and the **validation oracle goldens** pass (byte-match), and the
-   drift guards (fixtures + goldens) pass.
+   **`u32` seq-wrap fixture** and the **hand-derived analytic oracle goldens** pass (byte-match),
+   and the drift guards (fixtures + goldens) pass. (The independent external-tool cross-check is
+   a release-checklist gate, not a CI gate — see Fixtures + validation oracle.)
 
 ## Task breakdown (→ sub-issues)
 
 - **Task 1 — core `MetricSample` + `SampleDir`** (`area:core`): the `Copy` sample struct and
   direction enum, pure, unit-tested. No deps added to core.
 - **Task 2 — engine derivation state** (`area:engine`): per-direction `snd_nxt`/`acked`/
-  `frontier`/`last_data_ts`/`pending_rtt`, the `EngineConfig` knobs (`collect_series`,
-  `throughput_window`, `reorder_window`, `max_samples`), `MetricError`, the phantom-byte
-  `seq_end`, and the in-flight/retransmit/OOO/SACK/RTT/throughput derivation, wired into the
-  existing `observe`/`account` path behind `collect_series`. Hand-built `Vec<Item>` unit tests +
+  `frontier`/`last_data_ts`/`pending_rtt`, the `EngineConfig` knobs (`series_collection`,
+  `throughput_window`, `reorder_window`, `max_samples`) with the `SeriesCollection` enum,
+  `MetricError`, the phantom-byte `seq_end`, the once-computed `ack_advances` predicate, and the
+  in-flight/retransmit/OOO/SACK/RTT/throughput derivation, wired into the existing
+  `observe`/`account` path behind `series_collection`. Hand-built `Vec<Item>` unit tests +
   the in-flight `proptest`. Depends on Task 1.
 - **Task 3 — `ConnectionMetrics` + `into_metrics`** (`area:engine`): the bundled view, the
   deterministic ordering, and the ceiling-enforcing finalizer. Depends on Task 2.
@@ -342,7 +392,12 @@ fixture is reviewable as source. M3 adds metric-specific fixtures and **golden o
   tagged with the segment's `dir`; `in_flight`/`throughput`/`retransmit`/`out_of_order` pertain to
   `dir`. `rtt` is a round-trip measurement placed on the acknowledging segment's sample; `sack` is
   the segment's own option. A single flat series faithfully carries a two-half-stream connection
-  because each event is directional.
+  because each event is directional. A **pure ACK** reports its own (`dir`) outstanding, not the
+  opposite direction it drains; the drained direction's reduction appears on that direction's
+  next data sample, and the final post-last-data drain is unsampled in replay (per-event
+  sampling, §4.1) — stated so the in-flight series' behavior on a bulk transfer is not read as a
+  bug. The `ack_advances` predicate (step 0) is computed once against pre-update `acked` so the
+  in-flight update and the RTT dup-ACK gate cannot disagree.
 - **Two sequence accumulators.** Byte counters stay payload-only (M2, unchanged); the in-flight/
   RTT/retransmit **frontier** counts SYN/FIN phantom bytes, because they consume wire sequence
   space — otherwise in-flight is off by one around the handshake/close. Stated so the review does
@@ -379,8 +434,11 @@ fixture is reviewable as source. M3 adds metric-specific fixtures and **golden o
   pure (no I/O). *(Spec leaves the mechanism to the plan; the **behavior** — an actionable
   ceiling error — is fixed here.)*
 - **Capture-size ceiling lands in M3 (design §7, deferred here by M2).** `max_samples` is a coarse
-  total-sample OOM guard, enforced only when collecting series, failing fast at finalize with the
-  count, the limit, and the `--max-samples` override. Per-byte ceilings and streaming are post-v1.
+  OOM guard over the **collected** series, failing fast at finalize with the count, the limit, and
+  the `--max-samples` override. Because `metrics` collects only the requested connection
+  (`Only(target)`, resolved in a first lifecycle-only pass), the ceiling bounds that one
+  connection and a large multi-connection capture cannot make `metrics --conn N` fail on series
+  the user never asked for. Per-byte ceilings and streaming are post-v1.
 - **No M2 regressions.** `Connection`, `observe`, `into_connections`, the `conns` command, and all
   M2 tests/fixtures are untouched; M3 adds `into_metrics` and new fixtures/goldens only.
 - **No new runtime deps in core/engine beyond the optional `thiserror`; serde/serde_json in the

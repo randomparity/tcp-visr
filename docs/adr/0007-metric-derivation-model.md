@@ -63,9 +63,12 @@ Concretely:
   `ConnectionMetrics { conn: Connection, series: Vec<MetricSample> }` by a new
   `Tracker::into_metrics(self) -> Result<Vec<ConnectionMetrics>, MetricError>`. M2's `Connection`
   stays `Copy` and unchanged; `observe`/`into_connections` and the `conns` command are untouched.
-  A `collect_series` config flag (default `false`) means `conns` derives only scalar state and
-  stores **no** samples; `metrics` sets it `true`. This realizes design §4's `series` as a layered
-  view rather than a mutation of the lifecycle type.
+  A `series_collection: SeriesCollection` config (`None` | `All` | `Only(ConnId)`, default
+  `None`) selects which instances buffer samples: `conns` uses `None` (scalar state only, no
+  samples); `metrics` uses `Only(target)` so only the requested connection buffers — resolved in
+  a first lifecycle-only pass, then collected in a second pass, so a large multi-connection
+  capture neither builds nor blows the sample ceiling on series the user did not ask for. This
+  realizes design §4's `series` as a layered view rather than a mutation of the lifecycle type.
 
 - **Retransmit vs out-of-order by a reorder window.** A data segment whose `seq` is serial-behind
   the direction's data frontier re-covers seen sequence space. It is **out-of-order** when its
@@ -87,10 +90,21 @@ Concretely:
   (goodput vs retransmitted is M9). Frozen into each sample because seeking never re-parses
   (ADR-0004, §5).
 
-- **Capture-size ceiling.** A configurable `max_samples` (default 10 000 000), enforced only when
-  collecting series, stops retaining samples past the limit and makes `into_metrics` fail fast
+- **Capture-size ceiling.** A configurable `max_samples` (default 10 000 000) over the
+  **collected** series stops retaining samples past the limit and makes `into_metrics` fail fast
   with `MetricError::SampleCeiling { samples, limit }` naming the count, the limit, and the
-  `--max-samples` override (design §7). Per-byte ceilings and streaming are post-v1.
+  `--max-samples` override (design §7). Under `metrics`'s `Only(target)` collection the ceiling
+  bounds the single requested connection, never unrelated flows. Per-byte ceilings and streaming
+  are post-v1.
+
+- **The oracle's independence is structural, not incidental.** The committed goldens are
+  hand-derived from the fixtures by RFC 1982 serial arithmetic (the plan enumerates every
+  fixture's numbers), and the regenerate path is `#[ignore]`-gated so `cargo test` cannot silently
+  re-bless a changed golden. CI runs the analytic goldens + drift guard; the independent
+  external-tool (`tcptrace`/Wireshark) cross-check is a **release-checklist gate**, not a CI gate
+  (no external tool in CI). This keeps design §8's "independent tool" promise honest without a CI
+  dependency, and is why the goldens must not be code-emitted (a shared author error would pass
+  both the code and a snapshot golden).
 
 - **serde confined to the CLI.** `tcpvisr-core`/`tcpvisr-engine` stay serde-free and pure
   (ADR-0002). The `tcp-visr` binary owns `serde`/`serde_json` and defines local `Serialize` DTOs
