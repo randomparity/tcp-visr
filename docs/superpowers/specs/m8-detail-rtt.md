@@ -176,10 +176,15 @@ RTT via an integer, **unit-adapting** formatter `fmt_rtt(Nanos)` — it picks `n
 the value's magnitude and prints `<whole>.<3-frac><unit>` (e.g. `450ns`, `1.500ms`, `2.000s`),
 mirroring how `fmt_seq` adapts SI suffixes, so a loopback capture whose whole `max_rtt` is
 sub-millisecond does not collapse to `0.000ms`. It is integer-only (no float). Note the plotted
-rows are unaffected — `row()` maps raw nanoseconds — so only the axis label adapts units. When
-marks of different series compete for a cell in the final glyph buffer, the renderer draws **raw
-first, then smoothed, then kernel** so the smoothed line and the diagnostic kernel overlay stay
-visible; each keeps its own colour.
+rows are unaffected — `row()` maps raw nanoseconds — so only the axis label adapts units.
+**Same-cell precedence is resolved in the projection, not at render.** Following M7's single-grid
+model (ADR-0012 §2), the projection writes marks into one cell grid in the order **raw, then
+smoothed, then kernel**, so when two series map to the *same* `(col, row)` the later-placed series
+wins that cell (kernel > smoothed > raw) — keeping the smoothed line and the diagnostic kernel
+overlay visible over the raw scatter. This coincidence is common at graph start, where the first
+sample's `srtt == rtt` places raw and smoothed in the same cell (the smoothed mark shows). Where
+the series map to *different* rows (the usual case, `rtt ≠ srtt`) both marks survive and the
+renderer draws each in its own colour.
 
 ## 4. Architecture
 
@@ -256,10 +261,11 @@ Dependency direction is unchanged (TUI → engine → core).
    with only `collect_state_timeline` set produces an empty RTT series. (Engine/config unit
    tests.)
 7. **Point placement (exact indices).** In a plot rectangle `W×H`: a wire sample at
-   `(effective_end, rtt = srtt = max_rtt)` lands its `Raw` and `Smoothed` marks at `(col W-1, row
-   H-1)`; a sample at `(opened_at, rtt = 0)` lands its `Raw` mark at `(col 0, row 0)`; a sample at
-   `opened_at + span_t/2` lands at `col (W-1)/2`. No index reaches `W` or `H`. (Projection unit
-   test.)
+   `(effective_end, rtt = srtt = max_rtt)` lands a mark at `(col W-1, row H-1)` (raw and smoothed
+   coincide there, so the single-grid projection keeps the last-placed Smoothed — §3.7); a sample
+   at `(opened_at, rtt = 0)` lands a mark at `(col 0, row 0)`; a sample at `opened_at + span_t/2`
+   lands at `col (W-1)/2`. No index reaches `W` or `H`. (The raw/smoothed *distinctness* — both
+   marks present at different rows — is criterion 14, where `rtt ≠ srtt`.) (Projection unit test.)
 8. **Fixed axes.** The projected X range is `[opened_at, effective_end]` and Y range is
    `[0, max_rtt]` regardless of the cursor; moving the cursor changes which marks are revealed,
    not the axis ranges. (Projection unit test.)
