@@ -38,9 +38,12 @@ explicitly, never as an idle or lossless display.
     Each successful read → shared `decode_frame(link, ts, data, orig_len)` → emits
     `LiveEvent::Item(Item::Segment)` or `LiveEvent::Name(NameObservation)`; a per-packet decode
     problem is counted in `SkipCounts` (design §7), never fatal. On read-**timeout** (no packet
-    within the read timeout) it emits `LiveEvent::Tick(Item::Tick(now))` where `now` is the
-    current libpcap-domain timestamp, so idle/decay advance during silence. The loop exits when
-    `stop` is set or the handle ends.
+    within the read timeout) it emits `LiveEvent::Tick(Item::Tick(now))`. libpcap attaches a
+    timestamp only to a real packet, so on a timeout `now` is read from the **same wall clock
+    libpcap stamps packets with** (`CLOCK_REALTIME` via `SystemTime`), normalized against the same
+    capture-start baseline as segments — so ticks and segments share one monotonic-origin axis and
+    the engine's `now = max(now, t)` guard only ever absorbs small intra-domain jitter, never a
+    clock-domain mismatch. The loop exits when `stop` is set or the handle ends.
   - Timestamps are normalized to `Nanos` from the capture start (matching the replay faucet's
     baseline-relative convention) so the engine sees a single monotonic-ish origin.
 - **Engine — bounded retention + live Ticks** (`tcpvisr-engine`, pure, no feature gate):
@@ -53,7 +56,16 @@ explicitly, never as an idle or lossless display.
     the oldest retained sample is evicted (never an error). `states` always retains **at least the
     most recent sample** so the connection stays resolvable at "now".
   - Each connection's **cumulative baseline** (`Connection` view: `state`, `bytes_o2r`,
-    `bytes_r2o`, `last_at`, `opened_at`, `segments`) is never evicted.
+    `bytes_r2o`, `last_at`, `opened_at`, `segments`) is retained for the connection's life and is
+    never evicted *by the sample evictor*.
+  - **Whole-connection eviction (bounds connection *count*, not just samples).** Sample eviction
+    alone does not bound memory: `Tracker` holds `conns`, `live`, and `next_instance` which are
+    otherwise append-only, so a churny interface (many short connections) would grow without bound
+    despite windowed samples. A connection that is terminal (`Closed`/`Reset`) **or** idle past
+    `dead_after`, *and* whose `last_at < retention_horizon`, is therefore removed **whole** — from
+    `conns`, the `live`/`next_instance` bookkeeping, and (via `retarget`) the App's per-connection
+    `metas` — on the eviction pass. Total tracked connections stay bounded under sustained churn. A
+    later reuse of that 4-tuple simply starts a fresh instance.
   - `observe(Item::Tick(t))` becomes active under `Evict`: advances the tracker's `now` to
     `max(now, t)`, evicts, and for each still-active connection emits a decay `ThroughputSample`
     (and, when collected, in-flight sample) at `t` when its trailing window is non-empty, so a
@@ -86,13 +98,18 @@ explicitly, never as an idle or lossless display.
 - **CLI** (`tcp-visr`):
   - `tcp-visr live -i <iface> [--filter <bpf>] [--retention-secs <S=120>] [--list-interfaces]`.
     `--list-interfaces` prints capturable devices and exits. Interface is required otherwise. The
-    `max_samples` memory backstop uses an internal default (no flag; live never surfaces a ceiling
-    error — it evicts).
+    `max_samples` memory backstop uses a modest live default (**2_000_000**, well below replay's
+    10M; no flag — live never surfaces a ceiling error, it evicts). The per-redraw `snapshot()` is
+    O(retained samples + tracked connections), both bounded by the retention window, this backstop,
+    and whole-connection eviction above.
   - `run_live` binary wiring: spawn the capture thread (`LiveCapture::run`) with a bounded channel
     (`sync_channel`) + a shared `AtomicBool` stop + atomic drop counter; the main thread owns the
     `Tracker` (Evict policy, all five series on) and a `NameTable`; `next_frame` drains the channel
     (`try_recv`) into the tracker + name table, counts channel-full drops, builds a `snapshot`, and
-    `retarget`s the app. On Ctrl-C / `q`, set `stop`, join the thread, restore the terminal.
+    `retarget`s the app. A capture-lifetime **RAII guard** owns the `stop` flag and the join
+    handle; its `Drop` sets `stop` and joins the capture thread, so **both** normal exit
+    (`q`/Ctrl-C) **and** a panic/unwind tear the capture down and release the device — the terminal
+    restore (ratatui hook) alone would otherwise leave the thread and handle leaked.
   - Without the `live` feature, `tcp-visr live` is a clear "built without live capture support
     (rebuild with --features live)" error, and `--help` still lists the subcommand.
 
@@ -134,8 +151,11 @@ capture thread (impure, owns the clock)          main thread (impure shell)
 2. `tcp-visr live --list-interfaces` prints capturable devices and exits 0 without capturing.
 3. An unprivileged open that libpcap rejects returns a typed `LiveError::Privilege` naming the
    `setcap cap_net_raw,cap_net_admin+eip` (or run-as-root) fix — **not** a silent-empty capture.
-4. A handle that activates but delivers **zero** packets past a startup grace window surfaces a
-   distinct "no packets — check privileges/interface/filter" status, not an idle-network display.
+4. A handle that activates but delivers **zero** packets past a **5 s** startup grace window
+   surfaces a distinct **advisory** "no packets yet — check privileges/interface/filter" hint. It
+   is non-fatal (a genuinely idle interface or a legitimately not-yet-matching `--filter` must not
+   be reported as a failure) and clears as soon as any packet arrives — it is not a silent
+   idle-network display, per DoD.
 5. Segments and `Tick`s emitted by the faucet carry monotonic-origin `Nanos` timestamps in one
    clock domain; a read-timeout injects a `Tick(now)`.
 6. Under `RetentionPolicy::Evict { window }`, samples older than `now − window` are evicted from
@@ -161,15 +181,24 @@ capture thread (impure, owns the clock)          main thread (impure shell)
     `next_frame` increments the drop counter and never blocks the producer or grows unbounded.
 15. Building **without** `--features live`: `tcp-visr live` errors with a clear "built without live
     support" message; the whole default (replay) build and its tests are unchanged and libpcap-free.
-16. `q`/Ctrl-C stops the capture thread (sets `stop`, joins) and restores the terminal, including
-    on a render/IO error or panic.
+16. `q`/Ctrl-C stops the capture thread (sets `stop`, joins) and restores the terminal. On a
+    render/IO error or panic, the RAII guard's `Drop` still signals `stop` and joins the capture
+    thread (the device is released), not just the ratatui terminal restore.
+17. Under sustained connection churn, total tracked connections and `metas` stay bounded: a
+    connection terminal-or-idle-past-`dead_after` **and** older than the retention horizon is
+    evicted **whole**, not merely its samples.
 
 ## 5. Error handling (design §7)
 
 - **Whole-capture failures** are `LiveError` (open/activate/filter/link-type/privilege) — fail
   fast with what failed, the interface, and the fix. **Per-packet** decode problems are counted in
   `SkipCounts`, never fatal.
-- **Silent-empty privilege trap:** zero packets past the grace window → explicit status, per DoD.
+- **Silent-empty privilege trap:** zero packets past the 5 s grace window → an explicit
+  **advisory** status (non-fatal, so a quiet interface is not misreported; clears on first packet),
+  per DoD.
+- **Unbounded growth trap:** whole-connection eviction (terminal-or-idle **and** past the horizon)
+  bounds the connection count so a long-running capture with churn cannot leak memory despite
+  windowed samples.
 - **Engine-behind:** channel-full → drop + atomic count; surfaced and flags metrics approximate.
   Replay's genuine flow control is unaffected (it never drops; ADR-0002).
 - **Cursor clamp:** frozen or seeked cursor is clamped to `[horizon, now]`; the eviction horizon
@@ -181,9 +210,12 @@ capture thread (impure, owns the clock)          main thread (impure shell)
 ## 6. Testing
 
 - **Engine unit tests** (pure, CI): retention eviction by window across all five series; the
-  states-keeps-latest rule; baseline-survives-eviction; `max_samples` evict-vs-fail-fast per
+  states-keeps-latest rule; baseline-survives-eviction; **whole-connection eviction** (a
+  terminal-or-idle connection past the horizon is removed from `conns`/`live`/`next_instance`, and
+  the tracked count stays bounded under a churn workload); `max_samples` evict-vs-fail-fast per
   policy; `FailFast` regression (existing tests unchanged); Tick-driven throughput decay and
-  idle-drop; `snapshot()` non-consuming + equivalence to `into_timeline`; horizon/now accessors.
+  idle-drop; the injected-Tick `max(now, t)` monotonicity guard; `snapshot()` non-consuming +
+  equivalence to `into_timeline`; horizon/now accessors.
 - **TUI unit tests** (pure, CI): `retarget` preserves UI state and moves/clamps the cursor for
   follow vs freeze; live `space`/seek semantics and horizon clamp; status-line approximate flag on
   drop; `TestBackend` render of a live snapshot showing the follow/freeze + drop indicators.

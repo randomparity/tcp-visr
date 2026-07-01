@@ -44,7 +44,11 @@ sample and each Tick; `max_samples` remains a hard memory backstop that, when hi
 evicts the oldest rather than erroring. Each connection's **cumulative baseline** (state and byte
 totals — the `Connection` view / latest `StateSample`) is retained for the connection's life,
 independent of the display window, so the master list is always resolvable at "now" even after
-detail samples age out.
+detail samples age out. Because the tracker's connection maps are otherwise append-only, sample
+eviction alone would still leak memory on a churny interface; a connection's "life" therefore
+**ends** — and it is evicted whole (from `conns` and the instance-bookkeeping maps) — once it is
+terminal (`Closed`/`Reset`) or idle past `dead_after` **and** older than the retention horizon.
+This bounds the connection *count*, not only samples-per-connection.
 
 **3. The TUI renders an immutable `Timeline` snapshot rebuilt per redraw.** The live loop, on each
 frame (~20 Hz), builds a fresh immutable `Timeline` from the tracker's *bounded* retained samples
