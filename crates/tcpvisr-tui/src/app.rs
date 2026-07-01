@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use tcpvisr_core::{Endpoint, Nanos, SampleDir};
-use tcpvisr_engine::{AsOf, ConnId, ConnState, SeqSample, Timeline};
+use tcpvisr_engine::{AsOf, ConnId, ConnState, InFlightSample, SeqSample, Timeline};
 
 use crate::service::service_name;
 use crate::transport::Transport;
@@ -19,6 +19,14 @@ pub struct FocusConn<'a> {
     pub x_span: (Nanos, Nanos),
     pub focus_dir: SampleDir,
     pub series: &'a [SeqSample],
+    pub inflight: &'a [InFlightSample],
+}
+
+/// Which detail graph the pane shows when open (`Tab` cycles it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetailView {
+    TimeSequence,
+    InFlight,
 }
 
 /// One master-list row: a connection projected as of the cursor time.
@@ -87,6 +95,7 @@ pub struct App {
     selected: Option<ConnId>,
     title: String,
     detail_open: bool,
+    detail_view: DetailView,
 }
 
 impl App {
@@ -123,6 +132,7 @@ impl App {
             selected: None,
             title,
             detail_open: false,
+            detail_view: DetailView::TimeSequence,
         };
         app.selected = app.visible().first().map(|r| r.id);
         app
@@ -202,7 +212,22 @@ impl App {
             x_span,
             focus_dir,
             series: self.timeline.seq_series(id),
+            inflight: self.timeline.inflight_series(id),
         })
+    }
+
+    /// The detail graph shown when the pane is open.
+    #[must_use]
+    pub fn detail_view(&self) -> DetailView {
+        self.detail_view
+    }
+
+    /// Advances the detail view (wrapping): Time/Sequence -> In-flight -> Time/Sequence.
+    pub fn cycle_detail_view(&mut self) {
+        self.detail_view = match self.detail_view {
+            DetailView::TimeSequence => DetailView::InFlight,
+            DetailView::InFlight => DetailView::TimeSequence,
+        };
     }
 
     /// Toggles play/pause; reconciles the selection because rewinding can change the row set.
@@ -817,6 +842,40 @@ mod tests {
         assert_eq!(f.responder, ep(2, 443));
         assert_eq!(f.x_span, (Nanos(0), Nanos(10)));
         assert_eq!(f.focus_dir, SampleDir::ResponderToOrigin);
+    }
+
+    #[test]
+    fn tab_cycles_detail_view() {
+        let mut app = app_of(vec![entry(ep(1, 1), ep(2, 22), 0, 0, 0)]);
+        assert_eq!(app.detail_view(), DetailView::TimeSequence);
+        app.cycle_detail_view();
+        assert_eq!(app.detail_view(), DetailView::InFlight);
+        app.cycle_detail_view();
+        assert_eq!(app.detail_view(), DetailView::TimeSequence);
+    }
+
+    #[test]
+    fn focus_exposes_inflight_series() {
+        use tcpvisr_core::SampleDir;
+        use tcpvisr_engine::InFlightSample;
+        let c = full_conn(ep(1, 1), ep(2, 443), 0, 0, 10, ConnState::Established);
+        let mut c2 = c;
+        c2.bytes_o2r = 100;
+        let inflight = vec![InFlightSample {
+            t: Nanos(0),
+            dir: SampleDir::OriginToResponder,
+            bytes: 100,
+        }];
+        let tl = Timeline::with_seq(vec![(
+            c2,
+            vec![ss(0, ConnState::Established, 100, 0)],
+            vec![],
+            inflight,
+        )]);
+        let app = App::new(tl, "t".to_string());
+        let f = app.focus().expect("selected");
+        assert_eq!(f.inflight.len(), 1);
+        assert_eq!(f.inflight[0].bytes, 100);
     }
 
     #[test]
