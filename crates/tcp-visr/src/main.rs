@@ -23,6 +23,10 @@ enum Command {
     Replay {
         /// The `.pcap`/`.pcapng` capture file to browse.
         file: PathBuf,
+        /// Ceiling on retained per-segment state samples across all connections (must be >= 1).
+        /// Exceeding it fails fast rather than risking OOM on a very large capture.
+        #[arg(long, default_value_t = 10_000_000)]
+        max_samples: usize,
     },
     /// Capture live from a network interface.
     Live,
@@ -85,7 +89,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("no subcommand given; run `tcp-visr --help`".into());
     };
     match command {
-        Command::Replay { file } => run_replay(&file),
+        Command::Replay { file, max_samples } => run_replay(&file, max_samples),
         Command::Parse { file } => run_parse(&file),
         Command::Conns { file } => run_conns(&file),
         Command::Metrics {
@@ -224,13 +228,17 @@ fn build_replay_app(
 /// Streams `file` into the engine, then browses the resulting connections in the interactive
 /// timeline TUI. Requires an interactive terminal; refuses to run when stdout is redirected so
 /// it never blocks a pipe.
-fn run_replay(file: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn run_replay(file: &Path, max_samples: usize) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::IsTerminal;
+    if max_samples == 0 {
+        return Err("--max-samples must be at least 1 (got 0)".into());
+    }
     if !std::io::stdout().is_terminal() {
         return Err("replay requires an interactive terminal (stdout is not a tty)".into());
     }
     let cfg = EngineConfig {
         collect_state_timeline: true,
+        max_samples,
         ..EngineConfig::default()
     };
     let app = build_replay_app(file, cfg)?;

@@ -54,8 +54,10 @@ end-of-capture.
 1. Streams `file` through the replay faucet into a `Tracker` configured to collect the state
    timeline (`collect_state_timeline = true`).
 2. Builds a `Timeline` from the tracked connections and their `StateSample` series.
-3. If collection exceeds `max_samples`, exits non-zero with the existing actionable
-   `SampleCeiling` message (names the count, the limit, and `--max-samples`).
+3. `replay` accepts `--max-samples <N>` (default 10,000,000, must be `>= 1`), mirroring
+   `metrics`, so the `SampleCeiling` message's advice is actionable on `replay` too. If
+   collection exceeds the ceiling, `replay` exits non-zero with the actionable `SampleCeiling`
+   message (names the count, the limit, and `--max-samples`).
 4. Requires an interactive terminal; a non-TTY stdout still exits non-zero with
    `replay requires an interactive terminal (stdout is not a tty)`.
 
