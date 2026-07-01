@@ -219,6 +219,14 @@ impl App {
         self.reconcile_selection();
     }
 
+    /// Records a capture-DNS name observation into the live name table, so connections that appear
+    /// on a later [`retarget`] resolve to `host:port`. In replay all names are known up front, so
+    /// this is only used on the live path (a connection whose meta was already built before its
+    /// name arrived keeps its numeric label — names usually precede the connection).
+    pub fn observe_name(&mut self, obs: tcpvisr_core::NameObservation) {
+        self.names.observe(obs);
+    }
+
     /// The filtered + sorted rows active at the cursor, in display order.
     #[must_use]
     pub fn visible(&self) -> Vec<ConnRow> {
@@ -1181,6 +1189,32 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].peer, ep(4, 80), "old connection's row is gone");
         assert_eq!(app.live_status().dropped, 7);
+    }
+
+    #[test]
+    fn observe_name_before_connection_resolves_the_row_host() {
+        let mut app = App::new_live(&NameTable::default(), "live".into());
+        // A capture-DNS answer arrives first (as in the wire order), then the connection appears.
+        app.observe_name(tcpvisr_core::NameObservation {
+            ts: Nanos(1),
+            ip: ep(2, 443).ip,
+            name: HostName::new("example.com").unwrap(),
+        });
+        let a = full_conn(ep(1, 1), ep(2, 443), 0, 0, 100, ConnState::Established);
+        let tl = Timeline::with_seq_ending(
+            vec![(
+                a,
+                vec![ss(0, ConnState::Established, 10, 0)],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+            )],
+            Nanos(100),
+        );
+        app.retarget(tl, Nanos(0), Nanos(100), LiveStatus::default());
+        let row = &app.visible()[0];
+        assert_eq!(row.host.as_ref().map(HostName::as_ref), Some("example.com"));
     }
 
     #[test]
