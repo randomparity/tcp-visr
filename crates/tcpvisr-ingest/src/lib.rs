@@ -1,6 +1,7 @@
 //! Capture faucets: pcap/pcapng replay and libpcap live capture -> Item stream.
 
 pub mod decode;
+pub mod dns;
 #[cfg(feature = "live")]
 pub mod libpcap;
 pub mod link;
@@ -9,6 +10,7 @@ pub mod replay;
 use std::path::PathBuf;
 
 pub use decode::{DecodeOutcome, SkipReason, decode_frame};
+pub use dns::parse_dns_answers;
 #[cfg(feature = "live")]
 pub use libpcap::parse_file_libpcap;
 pub use link::LinkType;
