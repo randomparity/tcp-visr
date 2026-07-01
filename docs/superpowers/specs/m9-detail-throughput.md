@@ -203,8 +203,10 @@ marks survive and the renderer draws each in its own colour.
   retransmit). `MetricState::observe` passes the segment's `retransmit` classification into the
   window push. Add a pure read `throughput_at(&self, dir: Direction, t: Nanos, cfg: &EngineConfig)
   -> Option<(u64, u64)>` returning `(throughput_bps, goodput_bps)` (`None` if `dir` never sent
-  data) — mirroring `in_flight(dir)`. `observe` fills `MetricSample.throughput_bps` from its `.0`
-  (unchanged value). The window push/evict logic is unchanged except for carrying the flag.
+  data) — mirroring `in_flight(dir)`. `observe` fills `MetricSample.throughput_bps` from its `.0`,
+  **mapping `None` to `0`** for a direction that has not sent data — byte-identical to the current
+  `throughput()` (which sums an empty window to `0`), so the frozen M3 oracle is undisturbed. The
+  window push/evict logic is unchanged except for carrying the flag.
 - `config.rs`: add `collect_throughput_timeline: bool` (default `false`); add a `defaults_off` unit
   test mirroring `rtt_timeline_defaults_off`; update the `struct_excessive_bools` justification to
   five gates.
@@ -272,6 +274,14 @@ Dependency direction is unchanged (TUI → engine → core).
 7. **A direction that never sent data contributes no sample.** A connection where R2O sends only
    pure ACKs (no payload) yields **no** R2O `ThroughputSample`; the O2R data sender does.
    (Engine unit test.)
+7a. **The sender flow is sampled at a reverse-direction segment's time, showing decay (the
+    both-directions snapshot, ADR-0014 §1).** Fed one O2R data burst at `t = 0`, then an R2O pure
+    ACK at a later `t` inside the window and a second R2O pure ACK *after* the window has elapsed,
+    the O2R `ThroughputSample` series contains a sample **at each R2O ACK's timestamp** (not only at
+    the O2R send), and the post-window sample's `throughput_bps` has **decayed** below the burst
+    sample's (bytes aged out of the trailing window; the final one is `0` once every byte is older
+    than the window). A sparse "sample only on the sender's own data segments" implementation would
+    produce only the `t = 0` sample and fail this. (Engine unit test.)
 8. **Point placement (exact indices).** In a plot rectangle `W×H`: a sample at `(effective_end,
    throughput = goodput = max_rate)` lands a mark at `(col W-1, row H-1)` (the two coincide, so the
    single-grid projection keeps the last-placed Goodput — §3.7); a sample at `(opened_at, rate =
@@ -312,9 +322,13 @@ Dependency direction is unchanged (TUI → engine → core).
     `TestBackend` produces the same buffer as before (existing render assertions still pass;
     `Timeline::new` preserved). (TestBackend test.)
 19. **Render — Throughput view open shows the graph.** With the detail open, the view switched to
-    Throughput, over a connection with throughput data, `render` shows the `DETAIL <origin> →
-    <responder>` title, the throughput legend (naming the total and goodput glyphs), an axis time
-    label, a bits/sec unit label, and at least one plotted glyph. (TestBackend test.)
+    Throughput, over a connection with throughput data (`goodput < throughput` so the goodput mark
+    plots away from the total), `render` shows the `DETAIL <origin> → <responder>` title, the
+    throughput legend (naming the total and goodput glyphs), an axis time label, and a bits/sec unit
+    label. For the plotted-glyph evidence: the goodput glyph `#` already appears **once** in the
+    legend (`# goodput`), so the test requires **at least two** `#` — the extra one is a plotted
+    goodput mark. The `.` total glyph is **not** usable as evidence (it also appears in the time
+    labels `0.000s` and in `fmt_rate` output), so the assertion must key on `#`. (TestBackend test.)
 20. **CLI wiring.** `build_replay_app(<fixture>, cfg with collect_throughput_timeline)` returns an
     `App` whose focus connection's `throughput_series` is non-empty. For the committed
     `metrics_basic.pcap` (single connection, index 0) the focus direction is O2R (SYN + 100 B data
@@ -352,12 +366,13 @@ Dependency direction is unchanged (TUI → engine → core).
 
 ## 7. Testing
 
-- **Engine unit tests** (criteria 1–7) from hand-built segment vectors through `Tracker` with
+- **Engine unit tests** (criteria 1–7a) from hand-built segment vectors through `Tracker` with
   `collect_throughput_timeline = true`, asserting the emitted `ThroughputSample.dir`/
   `throughput_bps`/`goodput_bps` (including the goodput-excludes-retransmit split and the
-  sending-flow attribution), the `Timeline` accessor, the ceiling, the default-off flag, and the
-  no-sample-for-ACK-only-direction gate. Assert the sample values, not how the window is computed
-  (reuse the M3 derivation).
+  sending-flow attribution), the `Timeline` accessor, the ceiling, the default-off flag, the
+  no-sample-for-ACK-only-direction gate, and the both-directions decay sampling (a sender sample at
+  a reverse-ACK time whose rate has decayed). Assert the sample values, not how the window is
+  computed (reuse the M3 derivation).
 - **Projection unit tests** (criteria 8–15a) from hand-built `Vec<ThroughputSample>` and explicit
   viewport sizes, asserting axis ranges and specific `(col, row, glyph, series)` marks — placement,
   fixed axes, reveal-to-`T`, numeric-max bucketing, degenerate spans, cursor column, narrow-terminal
