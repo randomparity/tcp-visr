@@ -7,7 +7,7 @@ pub mod state;
 pub mod timeline;
 pub mod tracker;
 
-pub use config::EngineConfig;
+pub use config::{EngineConfig, RetentionPolicy};
 pub use conn::{ConnId, Connection, EndpointPair};
 pub use metrics::{ConnectionMetrics, MetricError, SeriesCollection};
 pub use state::ConnState;

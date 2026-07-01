@@ -30,13 +30,31 @@ fn handle_nav(app: &mut App, code: KeyCode) -> Outcome {
         KeyCode::Char('/') => app.enter_filter(),
         KeyCode::Char('j') | KeyCode::Down => app.move_down(),
         KeyCode::Char('k') | KeyCode::Up => app.move_up(),
-        KeyCode::Char(' ') => app.toggle_play(),
-        KeyCode::Left => app.seek(false),
-        KeyCode::Right => app.seek(true),
+        KeyCode::Char(' ') => {
+            if app.is_live() {
+                app.toggle_follow();
+            } else {
+                app.toggle_play();
+            }
+        }
+        KeyCode::Left => {
+            app.freeze_if_live();
+            app.seek(false);
+        }
+        KeyCode::Right => {
+            app.freeze_if_live();
+            app.seek(true);
+        }
         KeyCode::Char('+' | '=') => app.faster(),
         KeyCode::Char('-' | '_') => app.slower(),
-        KeyCode::Char('.') => app.step_forward(),
-        KeyCode::Char(',') => app.step_back(),
+        KeyCode::Char('.') => {
+            app.freeze_if_live();
+            app.step_forward();
+        }
+        KeyCode::Char(',') => {
+            app.freeze_if_live();
+            app.step_back();
+        }
         KeyCode::Enter => app.open_detail(),
         KeyCode::Esc => app.close_detail(),
         KeyCode::Tab => app.cycle_detail_view(),
@@ -158,6 +176,39 @@ mod tests {
         assert!(a.is_playing());
         handle_key(&mut a, press(' '));
         assert!(!a.is_playing());
+    }
+
+    fn live_app() -> App {
+        use crate::app::LiveStatus;
+        use tcpvisr_core::NameTable;
+        let mut a = App::new_live(&NameTable::default(), "live".to_string());
+        let (c, s) = entry(ep(1, 1), ep(2, 22));
+        let tl =
+            Timeline::with_seq_ending(vec![(c, s, vec![], vec![], vec![], vec![])], Nanos(1000));
+        a.retarget(tl, Nanos(0), Nanos(1000), LiveStatus::default());
+        a
+    }
+
+    #[test]
+    fn space_toggles_follow_in_live_mode() {
+        let mut a = live_app();
+        assert!(a.is_following(), "live starts following");
+        handle_key(&mut a, press(' '));
+        assert!(!a.is_following(), "space freezes");
+        assert!(
+            !a.is_playing(),
+            "space does not start replay playback in live mode"
+        );
+        handle_key(&mut a, press(' '));
+        assert!(a.is_following(), "space re-follows");
+    }
+
+    #[test]
+    fn seek_freezes_in_live_mode() {
+        let mut a = live_app();
+        assert!(a.is_following());
+        handle_key(&mut a, key(KeyCode::Left));
+        assert!(!a.is_following(), "a manual seek freezes the live cursor");
     }
 
     #[test]

@@ -2,11 +2,12 @@
 //! row set, each row's state/bytes, sort, filter, and selection are all a function of the
 //! `Timeline` and the `Transport` cursor. No I/O, no clock.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tcpvisr_core::{Endpoint, HostName, NameTable, Nanos, SampleDir};
 use tcpvisr_engine::{
-    AsOf, ConnId, ConnState, InFlightSample, RttSample, SeqSample, ThroughputSample, Timeline,
+    AsOf, ConnId, ConnState, Connection, InFlightSample, RttSample, SeqSample, ThroughputSample,
+    Timeline,
 };
 
 use crate::service::service_name;
@@ -91,6 +92,17 @@ pub enum Outcome {
     Quit,
 }
 
+/// Live-capture status shown in the header: how many segments the bounded channel dropped under
+/// load (which flags metrics approximate; design §7), and how many packets the decoder skipped for
+/// an *unexpected* reason (malformed/truncated/unsupported link; ordinary non-TCP traffic is not
+/// counted here).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LiveStatus {
+    pub dropped: u64,
+    pub approximate: bool,
+    pub skipped: u64,
+}
+
 /// Pure interactive state for the timeline master list. No I/O, no clock.
 #[derive(Debug)]
 pub struct App {
@@ -105,6 +117,14 @@ pub struct App {
     title: String,
     detail_open: bool,
     detail_view: DetailView,
+    /// `true` in live capture (vs. replaying a file). Switches transport semantics to follow/freeze.
+    is_live: bool,
+    /// Live: whether the cursor follows "now" (`true`) or is frozen for inspection (`false`).
+    follow: bool,
+    /// Live drop/approximate status for the header.
+    live_status: LiveStatus,
+    /// The resolver used to label connections that appear on a live `retarget`. Static per capture.
+    names: NameTable,
 }
 
 impl App {
@@ -120,29 +140,7 @@ impl App {
     pub fn new_with_names(timeline: Timeline, names: &NameTable, title: String) -> Self {
         let metas: HashMap<ConnId, ConnMeta> = timeline
             .connections()
-            .map(|c| {
-                let service = service_name(c.responder.port);
-                let host = names.resolve(c.responder.ip).cloned();
-                let host_str = host.as_ref().map_or("", HostName::as_ref);
-                let search_prefix = format!(
-                    "{} {} {} {}",
-                    c.origin,
-                    c.responder,
-                    host_str,
-                    service.unwrap_or("")
-                )
-                .to_lowercase();
-                (
-                    c.id,
-                    ConnMeta {
-                        peer: c.responder,
-                        host,
-                        service,
-                        origin_inferred: c.origin_inferred,
-                        search_prefix,
-                    },
-                )
-            })
+            .map(|c| (c.id, Self::meta_for(c, names)))
             .collect();
         let (start, end) = timeline.bounds();
         let mut app = Self {
@@ -157,9 +155,79 @@ impl App {
             title,
             detail_open: false,
             detail_view: DetailView::TimeSequence,
+            is_live: false,
+            follow: false,
+            live_status: LiveStatus::default(),
+            names: names.clone(),
         };
         app.selected = app.visible().first().map(|r| r.id);
         app
+    }
+
+    /// The time-invariant projection of one connection into a [`ConnMeta`] (resolving its host name
+    /// once via `names`). Shared by construction and live `retarget`.
+    fn meta_for(c: &Connection, names: &NameTable) -> ConnMeta {
+        let service = service_name(c.responder.port);
+        let host = names.resolve(c.responder.ip).cloned();
+        let host_str = host.as_ref().map_or("", HostName::as_ref);
+        let search_prefix = format!(
+            "{} {} {} {}",
+            c.origin,
+            c.responder,
+            host_str,
+            service.unwrap_or("")
+        )
+        .to_lowercase();
+        ConnMeta {
+            peer: c.responder,
+            host,
+            service,
+            origin_inferred: c.origin_inferred,
+            search_prefix,
+        }
+    }
+
+    /// Builds an empty live-capture app (following "now"), to be fed snapshots via [`retarget`].
+    ///
+    /// [`retarget`]: Self::retarget
+    #[must_use]
+    pub fn new_live(names: &NameTable, title: String) -> Self {
+        let mut app = Self::new_with_names(Timeline::new(vec![]), names, title);
+        app.is_live = true;
+        app.follow = true;
+        app
+    }
+
+    /// Swaps in a fresh live snapshot: reconciles `metas` to exactly the snapshot's connection set
+    /// (adds new, drops evicted), updates the transport domain to `[horizon, now]`, and either pins
+    /// the cursor to `now` (following) or clamps a frozen cursor into the domain. UI state
+    /// (selection, filter, sort, view) is preserved.
+    pub fn retarget(&mut self, timeline: Timeline, horizon: Nanos, now: Nanos, status: LiveStatus) {
+        let present: HashSet<ConnId> = timeline.connections().map(|c| c.id).collect();
+        self.metas.retain(|id, _| present.contains(id));
+        let fresh: Vec<Connection> = timeline
+            .connections()
+            .filter(|c| !self.metas.contains_key(&c.id))
+            .copied()
+            .collect();
+        for c in &fresh {
+            self.metas.insert(c.id, Self::meta_for(c, &self.names));
+        }
+        self.timeline = timeline;
+        self.live_status = status;
+        self.transport.set_domain(horizon, now);
+        if self.follow {
+            self.transport.set_cursor(now);
+        }
+        self.reconcile_selection();
+    }
+
+    /// Records a capture-DNS name observation into the live name table, so connections that appear
+    /// on a later [`retarget`] resolve to `host:port`. In replay all names are known up front, so
+    /// this is only used on the live path (a connection whose meta was already built before its
+    /// name arrived keeps its numeric label — names usually precede the connection).
+    pub fn observe_name(&mut self, obs: tcpvisr_core::NameObservation) {
+        self.names.observe(obs);
     }
 
     /// The filtered + sorted rows active at the cursor, in display order.
@@ -401,6 +469,12 @@ impl App {
         &self.title
     }
 
+    /// Replaces the header title. Used by the live path to surface the silent-empty advisory until
+    /// the first packet arrives.
+    pub fn set_title(&mut self, title: String) {
+        self.title = title;
+    }
+
     /// The current sort field.
     #[must_use]
     pub fn sort_field(&self) -> SortField {
@@ -447,6 +521,41 @@ impl App {
     #[must_use]
     pub fn is_playing(&self) -> bool {
         self.transport.is_playing()
+    }
+
+    /// Whether this is a live capture (vs. replaying a file).
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        self.is_live
+    }
+
+    /// Live: whether the cursor is following "now" (`true`) or frozen (`false`).
+    #[must_use]
+    pub fn is_following(&self) -> bool {
+        self.follow
+    }
+
+    /// Live: toggles follow/freeze. Re-enabling follow snaps the cursor back to "now".
+    pub fn toggle_follow(&mut self) {
+        self.follow = !self.follow;
+        if self.follow {
+            let end = self.transport.bounds().1;
+            self.transport.set_cursor(end);
+        }
+    }
+
+    /// Live only: freezes the cursor (stops following "now") on a manual cursor move. A no-op in
+    /// replay, where there is nothing to follow.
+    pub fn freeze_if_live(&mut self) {
+        if self.is_live {
+            self.follow = false;
+        }
+    }
+
+    /// The current live drop/approximate status.
+    #[must_use]
+    pub fn live_status(&self) -> LiveStatus {
+        self.live_status
     }
 
     /// The capture's `[start, end]` time bounds.
@@ -1041,5 +1150,110 @@ mod tests {
         app.step_back(); // cursor 0: late not active -> fall back to early
         assert_eq!(app.cursor(), Nanos(0));
         assert_eq!(app.selected(), Some(early_id));
+    }
+
+    #[test]
+    fn retarget_reconciles_metas_and_follows_now() {
+        let mut app = App::new_live(&NameTable::default(), "live".into());
+        assert!(app.is_live() && app.is_following());
+        // frame 1: one connection, now=100
+        let a = full_conn(ep(1, 1), ep(2, 443), 0, 0, 100, ConnState::Established);
+        let tl = Timeline::with_seq_ending(
+            vec![(
+                a,
+                vec![ss(0, ConnState::Established, 10, 0)],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+            )],
+            Nanos(100),
+        );
+        app.retarget(tl, Nanos(0), Nanos(100), LiveStatus::default());
+        assert_eq!(app.cursor(), Nanos(100), "following pins cursor to now");
+        assert_eq!(app.visible().len(), 1);
+        // frame 2: that connection is gone (evicted); a new one appears. Metas must reconcile.
+        let b = full_conn(ep(3, 3), ep(4, 80), 0, 200, 300, ConnState::Established);
+        let tl2 = Timeline::with_seq_ending(
+            vec![(
+                b,
+                vec![ss(200, ConnState::Established, 5, 0)],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+            )],
+            Nanos(300),
+        );
+        app.retarget(
+            tl2,
+            Nanos(200),
+            Nanos(300),
+            LiveStatus {
+                dropped: 7,
+                approximate: true,
+                skipped: 0,
+            },
+        );
+        let rows = app.visible();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].peer, ep(4, 80), "old connection's row is gone");
+        assert_eq!(app.live_status().dropped, 7);
+    }
+
+    #[test]
+    fn observe_name_before_connection_resolves_the_row_host() {
+        let mut app = App::new_live(&NameTable::default(), "live".into());
+        // A capture-DNS answer arrives first (as in the wire order), then the connection appears.
+        app.observe_name(tcpvisr_core::NameObservation {
+            ts: Nanos(1),
+            ip: ep(2, 443).ip,
+            name: HostName::new("example.com").unwrap(),
+        });
+        let a = full_conn(ep(1, 1), ep(2, 443), 0, 0, 100, ConnState::Established);
+        let tl = Timeline::with_seq_ending(
+            vec![(
+                a,
+                vec![ss(0, ConnState::Established, 10, 0)],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+            )],
+            Nanos(100),
+        );
+        app.retarget(tl, Nanos(0), Nanos(100), LiveStatus::default());
+        let row = &app.visible()[0];
+        assert_eq!(row.host.as_ref().map(HostName::as_ref), Some("example.com"));
+    }
+
+    #[test]
+    fn freeze_clamps_cursor_to_horizon_and_does_not_follow() {
+        let mut app = App::new_live(&NameTable::default(), "live".into());
+        let a = full_conn(ep(1, 1), ep(2, 443), 0, 0, 1000, ConnState::Established);
+        let mk = |end: u64| {
+            Timeline::with_seq_ending(
+                vec![(
+                    a,
+                    vec![ss(0, ConnState::Established, 10, 0)],
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![],
+                )],
+                Nanos(end),
+            )
+        };
+        app.retarget(mk(1000), Nanos(0), Nanos(1000), LiveStatus::default());
+        app.toggle_follow(); // freeze at 1000
+        assert!(!app.is_following());
+        // now advances to 5000, horizon to 4000; frozen cursor (1000) is dragged to the horizon.
+        app.retarget(mk(5000), Nanos(4000), Nanos(5000), LiveStatus::default());
+        assert!(!app.is_following());
+        assert_eq!(
+            app.cursor(),
+            Nanos(4000),
+            "frozen cursor clamped up to the eviction horizon"
+        );
     }
 }

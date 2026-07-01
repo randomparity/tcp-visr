@@ -21,12 +21,16 @@ fn help_flag_exits_zero_and_shows_usage() {
     assert!(stdout.contains("Usage"));
 }
 
+// The default binary is built without the `live` feature (ADR-0003), so `live` exits with a clear
+// "built without live support" message. (A `--features live` build reaches libpcap instead, which
+// this replay-only integration test does not exercise.)
+#[cfg(not(feature = "live"))]
 #[test]
-fn unimplemented_subcommand_exits_nonzero_with_message() {
+fn live_without_feature_exits_nonzero_with_message() {
     let output = bin().arg("live").output().unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("not implemented"));
+    assert!(stderr.contains("without live support"), "stderr: {stderr}");
 }
 
 #[test]

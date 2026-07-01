@@ -145,6 +145,14 @@ impl Timeline {
             .map(|(c, _, _, _, _, _)| c.last_at)
             .max()
             .unwrap_or(Nanos(0));
+        Self::with_seq_ending(conns, end)
+    }
+
+    /// Like [`with_seq`](Self::with_seq), but forces the interval `end` instead of deriving it from
+    /// the connections' `last_at`. A live snapshot passes the tracker's `now` so still-open
+    /// connections stay active at the live cursor even during a quiet period with no recent sample.
+    #[must_use]
+    pub fn with_seq_ending(conns: Vec<ConnSeries>, end: Nanos) -> Self {
         let start = conns
             .iter()
             .flat_map(|(_, s, _, _, _, _)| s.iter().map(|x| x.t))
@@ -675,5 +683,29 @@ mod tests {
         assert_eq!(copy, s);
         assert_eq!(copy.rel, 42);
         assert_ne!(SeqKind::Sack, s.kind);
+    }
+
+    #[test]
+    fn with_seq_ending_extends_open_conns_to_forced_end() {
+        // open connection, last sample at 100, but the forced end (live "now") is 500.
+        let c = conn(0, 0, 100, ConnState::Established);
+        let id = c.id;
+        let tl = Timeline::with_seq_ending(
+            vec![(
+                c,
+                vec![ss(0, ConnState::Established, 0, 0)],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+            )],
+            Nanos(500),
+        );
+        assert_eq!(tl.bounds().1, Nanos(500));
+        assert_eq!(
+            tl.active_at(Nanos(400)),
+            vec![id],
+            "open conn active up to the forced end"
+        );
     }
 }

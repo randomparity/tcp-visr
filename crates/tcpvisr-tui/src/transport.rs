@@ -96,6 +96,14 @@ impl Transport {
         self.cursor = Nanos(t.0.clamp(self.start.0, self.end.0));
     }
 
+    /// Resets the `[start, end]` domain (live: `horizon..now`) and clamps the cursor into it. Used
+    /// each live frame so a frozen cursor is dragged forward as the eviction horizon advances.
+    pub fn set_domain(&mut self, start: Nanos, end: Nanos) {
+        self.start = start;
+        self.end = end;
+        self.cursor = Nanos(self.cursor.0.clamp(start.0, end.0));
+    }
+
     /// When playing, advances the cursor by `speed * dt` ns (exact integer ratio math), clamped
     /// to `end`; reaching `end` auto-pauses. `dt` is injected wall-clock nanoseconds. A no-op
     /// when paused.

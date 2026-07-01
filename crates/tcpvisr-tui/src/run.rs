@@ -48,3 +48,39 @@ fn event_loop(terminal: &mut DefaultTerminal, mut app: App) -> std::io::Result<(
     }
     Ok(())
 }
+
+/// Runs the live-capture TUI: like [`run`], but each frame pulls a fresh snapshot from the capture
+/// pipeline via `next_frame` (which drains the channel, folds items into the tracker, and calls
+/// `App::retarget`) instead of advancing a precomputed timeline by wall-clock `dt`. The caller owns
+/// the capture thread and channel; this owns terminal setup, key handling, and rendering.
+///
+/// # Errors
+///
+/// Returns any I/O error from drawing a frame or reading a terminal event; the terminal is restored
+/// before the error propagates (and on panic, via the hook `ratatui::init` installs).
+pub fn run_live(app: App, next_frame: impl FnMut(&mut App)) -> std::io::Result<()> {
+    let mut terminal = ratatui::init();
+    let result = live_loop(&mut terminal, app, next_frame);
+    ratatui::restore();
+    result
+}
+
+fn live_loop(
+    terminal: &mut DefaultTerminal,
+    mut app: App,
+    mut next_frame: impl FnMut(&mut App),
+) -> std::io::Result<()> {
+    loop {
+        terminal.draw(|frame| render(frame, &app))?;
+        if event::poll(TICK)? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press && handle_key(&mut app, key) == Outcome::Quit {
+                    break;
+                }
+            }
+        }
+        // Pull the latest capture snapshot and retarget; the closure owns the impure channel drain.
+        next_frame(&mut app);
+    }
+    Ok(())
+}

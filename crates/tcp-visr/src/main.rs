@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use tcpvisr_core::{Item, MetricSample, Nanos, SampleDir};
-use tcpvisr_engine::{ConnectionMetrics, EngineConfig, SeriesCollection, Tracker};
+use tcpvisr_engine::{ConnectionMetrics, EngineConfig, RetentionPolicy, SeriesCollection, Tracker};
 
 /// Visualize TCP flow over time from a live system or a pcap/pcapng replay.
 #[derive(Parser)]
@@ -28,8 +28,21 @@ enum Command {
         #[arg(long, default_value_t = 10_000_000)]
         max_samples: usize,
     },
-    /// Capture live from a network interface.
-    Live,
+    /// Capture live from a network interface (requires the `live` feature).
+    Live {
+        /// Interface to capture on (e.g. eth0). Omit with --list-interfaces.
+        #[arg(short = 'i', long)]
+        iface: Option<String>,
+        /// Optional BPF filter expression (e.g. "tcp port 443").
+        #[arg(long)]
+        filter: Option<String>,
+        /// Display/eviction window in seconds (samples older than this age out).
+        #[arg(long, default_value_t = 120)]
+        retention_secs: u64,
+        /// List capturable interfaces and exit.
+        #[arg(long)]
+        list_interfaces: bool,
+    },
     /// Print decoded TCP segments from a capture.
     Parse {
         /// The `.pcap`/`.pcapng` capture file to decode.
@@ -57,18 +70,6 @@ enum Command {
         #[arg(long, default_value_t = 10_000_000)]
         max_samples: usize,
     },
-}
-
-impl Command {
-    fn name(&self) -> &'static str {
-        match self {
-            Command::Replay { .. } => "replay",
-            Command::Live => "live",
-            Command::Parse { .. } => "parse",
-            Command::Conns { .. } => "conns",
-            Command::Metrics { .. } => "metrics",
-        }
-    }
 }
 
 fn main() -> ExitCode {
@@ -105,11 +106,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             reorder_window_ms,
             max_samples,
         ),
-        other @ Command::Live => Err(format!(
-            "`{}` is not implemented yet (see the milestone roadmap)",
-            other.name()
-        )
-        .into()),
+        Command::Live {
+            iface,
+            filter,
+            retention_secs,
+            list_interfaces,
+        } => run_live_command(iface, filter, retention_secs, list_interfaces),
     }
 }
 
@@ -244,7 +246,7 @@ fn replay_engine_config(max_samples: usize) -> EngineConfig {
         collect_inflight_timeline: true,
         collect_rtt_timeline: true,
         collect_throughput_timeline: true,
-        max_samples,
+        retention: RetentionPolicy::FailFast { max_samples },
         ..EngineConfig::default()
     }
 }
@@ -337,7 +339,7 @@ fn run_metrics(
     let base = EngineConfig {
         throughput_window: Nanos(throughput_window_ms.saturating_mul(1_000_000)),
         reorder_window: Nanos(reorder_window_ms.saturating_mul(1_000_000)),
-        max_samples,
+        retention: RetentionPolicy::FailFast { max_samples },
         ..EngineConfig::default()
     };
 
@@ -390,6 +392,314 @@ fn run_metrics(
     serde_json::to_writer_pretty(&mut out, &json)?;
     writeln!(out)?; // trailing newline
     Ok(())
+}
+
+/// The silent-empty grace window: a live capture may see zero packets this long before it hints a
+/// privilege/interface/filter problem (design §7). Non-fatal; the hint clears on the first packet.
+#[cfg(any(feature = "live", test))]
+const LIVE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The advisory shown while a live capture has produced no packets past the grace window. `None`
+/// once any packet arrives, or before the window elapses — a genuinely idle interface is not an
+/// error.
+#[cfg(any(feature = "live", test))]
+fn grace_hint(first_packet_seen: bool, elapsed: std::time::Duration) -> Option<&'static str> {
+    if first_packet_seen || elapsed < LIVE_GRACE {
+        None
+    } else {
+        Some("no packets yet — check privileges, interface, or filter")
+    }
+}
+
+/// Sends `item` on the bounded channel, or counts a drop when it is full — the live path never
+/// blocks the wire or buffers unbounded (design §7).
+#[cfg(any(feature = "live", test))]
+fn try_send_or_count<T>(
+    tx: &std::sync::mpsc::SyncSender<T>,
+    item: T,
+    dropped: &std::sync::atomic::AtomicU64,
+) {
+    if tx.try_send(item).is_err() {
+        dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Rejects a zero retention window (which would age out all history), mirroring the replay
+/// path's `--max-samples >= 1` guard.
+#[cfg(any(feature = "live", test))]
+fn validate_retention_secs(retention_secs: u64) -> Result<(), String> {
+    if retention_secs == 0 {
+        Err("--retention-secs must be at least 1 (got 0)".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+/// The engine config for live capture: all five detail series on, time-horizon eviction over
+/// `retention_secs`, with a modest sample backstop (2M) — live evicts, never fails fast.
+#[cfg(any(feature = "live", test))]
+fn live_engine_config(retention_secs: u64) -> EngineConfig {
+    EngineConfig {
+        collect_state_timeline: true,
+        collect_seq_timeline: true,
+        collect_inflight_timeline: true,
+        collect_rtt_timeline: true,
+        collect_throughput_timeline: true,
+        series_collection: SeriesCollection::All,
+        retention: RetentionPolicy::Evict {
+            window: Nanos(retention_secs.saturating_mul(1_000_000_000)),
+            max_samples: 2_000_000,
+        },
+        ..EngineConfig::default()
+    }
+}
+
+/// Stops and joins the background capture thread on drop, so the device is released on normal exit
+/// (`q`/Ctrl-C) and on a panic/unwind alike — not just when the terminal is restored.
+#[cfg(feature = "live")]
+struct CaptureGuard {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "live")]
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Live capture: opens the interface, spawns the capture thread behind a bounded channel, and
+/// drives the live TUI, folding each frame's items into a bounded tracker and retargeting the app.
+#[cfg(feature = "live")]
+fn run_live_command(
+    iface: Option<String>,
+    filter: Option<String>,
+    retention_secs: u64,
+    list_interfaces: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::mpsc::sync_channel;
+    use std::time::Instant;
+    use tcpvisr_core::{Item, NameTable};
+    use tcpvisr_ingest::{LiveCapture, LiveEvent, LiveOptions};
+    use tcpvisr_tui::{App, LiveStatus};
+
+    if list_interfaces {
+        let mut out = std::io::stdout().lock();
+        for ifc in tcpvisr_ingest::list_interfaces()? {
+            match ifc.description {
+                Some(d) => writeln!(out, "{}  {d}", ifc.name)?,
+                None => writeln!(out, "{}", ifc.name)?,
+            }
+        }
+        return Ok(());
+    }
+
+    let iface = iface.ok_or("live requires -i <iface> (or --list-interfaces)")?;
+    validate_retention_secs(retention_secs)?;
+    let mut opts = LiveOptions::new(&iface);
+    opts.filter = filter;
+    let capture = LiveCapture::open(&opts)?;
+
+    let (tx, rx) = sync_channel::<LiveEvent>(65_536);
+    let stop = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(AtomicU64::new(0));
+    let skips = Arc::new(AtomicU64::new(0));
+
+    let guard = {
+        let thread_stop = Arc::clone(&stop);
+        let thread_dropped = Arc::clone(&dropped);
+        let thread_skips = Arc::clone(&skips);
+        let handle = std::thread::spawn(move || {
+            let _ = capture.run(
+                |ev| try_send_or_count(&tx, ev, &thread_dropped),
+                &thread_stop,
+                &thread_skips,
+            );
+        });
+        CaptureGuard {
+            stop: Arc::clone(&stop),
+            handle: Some(handle),
+        }
+    };
+
+    let mut tracker = Tracker::new(live_engine_config(retention_secs));
+    let base_title = format!("tcp-visr — live {iface}");
+    let app = App::new_live(&NameTable::default(), base_title.clone());
+
+    let start = Instant::now();
+    let mut first_packet = false;
+    let next_frame = |app: &mut App| {
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                LiveEvent::Item(item) => {
+                    if matches!(item, Item::Segment(_)) {
+                        first_packet = true;
+                    }
+                    tracker.observe(&item);
+                }
+                LiveEvent::Name(obs) => app.observe_name(obs),
+            }
+        }
+        let d = dropped.load(Ordering::Relaxed);
+        let sk = skips.load(Ordering::Relaxed);
+        let snap = tracker.snapshot();
+        app.retarget(
+            snap,
+            tracker.retention_horizon(),
+            tracker.now(),
+            LiveStatus {
+                dropped: d,
+                approximate: d > 0,
+                skipped: sk,
+            },
+        );
+        match grace_hint(first_packet, start.elapsed()) {
+            Some(hint) => app.set_title(format!("{base_title}  [{hint}]")),
+            None => app.set_title(base_title.clone()),
+        }
+    };
+
+    let result = tcpvisr_tui::run_live(app, next_frame);
+    drop(guard); // sets stop + joins the capture thread (also on unwind)
+    result.map_err(Into::into)
+}
+
+/// Feature-off stub: the default binary is built without libpcap (ADR-0003), so `live` is
+/// unavailable but still listed in `--help`.
+#[cfg(not(feature = "live"))]
+fn run_live_command(
+    _iface: Option<String>,
+    _filter: Option<String>,
+    _retention_secs: u64,
+    _list_interfaces: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Err(
+        "live capture: this binary was built without live support; rebuild with --features live"
+            .into(),
+    )
+}
+
+#[cfg(test)]
+mod live_cli_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn live_parses_iface_and_retention() {
+        let cli = Cli::try_parse_from(["tcp-visr", "live", "-i", "eth0", "--retention-secs", "60"])
+            .unwrap();
+        match cli.command {
+            Some(Command::Live {
+                iface,
+                retention_secs,
+                ..
+            }) => {
+                assert_eq!(iface.as_deref(), Some("eth0"));
+                assert_eq!(retention_secs, 60);
+            }
+            _ => unreachable!("expected Live subcommand"),
+        }
+    }
+
+    #[test]
+    fn live_defaults_retention_to_120s() {
+        let cli = Cli::try_parse_from(["tcp-visr", "live", "-i", "eth0"]).unwrap();
+        match cli.command {
+            Some(Command::Live {
+                retention_secs,
+                list_interfaces,
+                filter,
+                ..
+            }) => {
+                assert_eq!(retention_secs, 120);
+                assert!(!list_interfaces);
+                assert!(filter.is_none());
+            }
+            _ => unreachable!("expected Live subcommand"),
+        }
+    }
+
+    #[test]
+    fn live_list_interfaces_parses_without_iface() {
+        let cli = Cli::try_parse_from(["tcp-visr", "live", "--list-interfaces"]).unwrap();
+        match cli.command {
+            Some(Command::Live {
+                list_interfaces,
+                iface,
+                ..
+            }) => {
+                assert!(list_interfaces);
+                assert!(iface.is_none());
+            }
+            _ => unreachable!("expected Live subcommand"),
+        }
+    }
+
+    #[test]
+    fn grace_hint_is_advisory_only_while_silent_past_the_window() {
+        use std::time::Duration;
+        assert!(
+            grace_hint(false, Duration::from_secs(1)).is_none(),
+            "quiet but within the grace window is not yet a hint"
+        );
+        assert!(
+            grace_hint(true, Duration::from_secs(30)).is_none(),
+            "a packet was seen -> no hint"
+        );
+        assert!(
+            grace_hint(false, Duration::from_secs(6)).is_some(),
+            "silent past the window -> advisory hint"
+        );
+    }
+
+    #[test]
+    fn retention_secs_zero_is_rejected() {
+        assert!(
+            validate_retention_secs(0).is_err(),
+            "0 window must be rejected"
+        );
+        assert!(validate_retention_secs(1).is_ok());
+        assert!(validate_retention_secs(120).is_ok());
+    }
+
+    #[test]
+    fn live_engine_config_uses_evict_over_the_retention_window() {
+        let cfg = live_engine_config(120);
+        assert_eq!(
+            cfg.retention,
+            RetentionPolicy::Evict {
+                window: Nanos(120_000_000_000),
+                max_samples: 2_000_000,
+            }
+        );
+        assert!(cfg.collect_throughput_timeline && cfg.collect_state_timeline);
+        assert_eq!(cfg.series_collection, SeriesCollection::All);
+    }
+
+    #[test]
+    fn bounded_channel_full_send_is_dropped_and_counted() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::mpsc::sync_channel;
+        let (tx, _rx) = sync_channel::<u8>(1);
+        let dropped = AtomicU64::new(0);
+        try_send_or_count(&tx, 1, &dropped); // fits the 1-slot buffer
+        try_send_or_count(&tx, 2, &dropped); // buffer full (rx idle) -> dropped + counted
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(not(feature = "live"))]
+    #[test]
+    fn live_without_feature_errors_clearly() {
+        let err = run_live_command(Some("eth0".into()), None, 120, false).expect_err("no live");
+        assert!(err.to_string().contains("without live support"), "{err}");
+    }
 }
 
 #[cfg(test)]
@@ -447,7 +757,7 @@ mod build_replay_tests {
     fn sample_ceiling_is_fatal() {
         let cfg = EngineConfig {
             collect_state_timeline: true,
-            max_samples: 1,
+            retention: RetentionPolicy::FailFast { max_samples: 1 },
             ..EngineConfig::default()
         };
         let err = build_replay_app(&fixture(), cfg).expect_err("ceiling");

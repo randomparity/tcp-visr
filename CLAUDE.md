@@ -10,8 +10,8 @@ building toward v0.1 (replay-only). The full design is the source of truth:
 [docs/design/tcp-visr-design.md](docs/design/tcp-visr-design.md); cross-cutting decisions are
 [ADRs](docs/adr/) and are authoritative when they disagree with the design doc.
 
-**Current state:** milestones M0–M10 are implemented. Working CLI subcommands are `parse`,
-`conns`, `metrics`, and `replay` (all replay path only). `replay` opens the interactive TUI
+**Current state:** milestones M0–M11 are implemented. Working CLI subcommands are `parse`,
+`conns`, `metrics`, `replay` (replay path), and `live` (live capture). `replay` opens the interactive TUI
 over a capture with a seekable timeline: play/pause, 0.1–10× speed, seek, and step, with the
 master list resolving each connection's state and bytes "as of" the cursor time via the
 cross-connection interval index (M5). `Enter` opens a per-connection detail pane (`Esc` closes
@@ -34,9 +34,21 @@ engine and the M3 oracle are untouched. A bounded latest-wins `NameTable` (`tcpv
 detail title, and the header shows a resolved-name count (M10). Names are sanitized to printable
 ASCII (attacker-controlled input) and are advisory (the numeric peer stays visible via `conns`/
 `metrics`). The live reverse-DNS-with-caching half of M10 is deferred to the live milestones behind
-the same `NameTable` (ADR-0015). `live` and kernel enrichment are not built yet; `live` returns "not
-implemented yet". Do not assume a feature exists because the design describes it — check the
-roadmap (design §10) and the code.
+the same `NameTable` (ADR-0015). `live -i <iface>` captures TCP off a Linux interface via libpcap
+(interface select, BPF `--filter`, nanosecond timestamps with µs fallback, `--list-interfaces`) and
+drives the *same* engine + TUI (M11, ADR-0016). A background capture thread stamps `Segment`s and
+injects `Item::Tick`s (the only clock read; the engine stays pure), pushing through a bounded channel
+that **drops-and-counts** under load. The engine gains a `RetentionPolicy::Evict{window, max_samples}`:
+per-connection `VecDeque` series age out past `now − window`, whole connections are evicted once
+terminal/idle past the horizon (so the connection *count* stays bounded, not just samples), and `Tick`s
+drive throughput decay-to-zero — while replay keeps `FailFast{max_samples}` byte-for-byte. Each redraw
+rebuilds an immutable `Timeline` **snapshot** the TUI reads; the live transport is **follow/freeze**
+(`space`) with the cursor clamped to the eviction horizon, and the header shows the drop count / an
+approximate flag. `live` is gated behind the `live` Cargo feature (default off, libpcap-free replay
+build); without it the subcommand errors clearly. Live interface capture is verified by a documented
+local hardware run (needs `CAP_NET_RAW` + a NIC), not CI. **Live kernel enrichment** (`sock_diag`/`/proc`,
+M12) and **live reverse-DNS** (the deferred M10 half) are not built yet. Do not assume a feature exists
+because the design describes it — check the roadmap (design §10) and the code.
 
 ## Commands
 

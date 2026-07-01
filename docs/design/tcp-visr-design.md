@@ -379,6 +379,7 @@ and roadmap ordering already encode those, and duplicate state rots.
 | [0013](../adr/0013-detail-rtt.md) | Detail RTT: dedicated `RttSample` series (measured-flow attribution), engine-smoothed SRTT (RFC 6298 EWMA), empty-on-replay kernel-srtt overlay seam | Accepted |
 | [0014](../adr/0014-detail-throughput-goodput.md) | Detail Throughput/goodput: dedicated `ThroughputSample` series (sender-flow attribution), engine-derived goodput over the throughput window, finalized four-view switcher, no kernel overlay | Accepted |
 | [0015](../adr/0015-name-resolution.md) | Name resolution: capture-DNS host labels via a side `NameTable` (engine untouched), sanitized `HostName`, `simple-dns` parser; live reverse-DNS deferred to M11/M12 behind the same table | Accepted |
+| [0016](../adr/0016-live-capture-streaming-timeline.md) | Live capture: background capture thread stamps segments + injects `Tick`s (engine stays pure); `RetentionPolicy::Evict` time-horizon + whole-connection eviction (replay keeps fail-fast); per-redraw immutable `Timeline` snapshot; follow/freeze transport clamped to the eviction horizon; bounded-channel drop-and-count | Accepted |
 
 ## 14. Risks
 
