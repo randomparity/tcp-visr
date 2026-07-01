@@ -12,6 +12,11 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+# Live interface capture (libpcap). Default-off so the replay binary stays libpcap-free
+# (ADR-0003). CI builds `--all-features`, so the live path is compiled and linted.
+live = ["tcpvisr-ingest/live"]
+
 [dependencies]
 clap = { version = "=4.6.1", features = ["derive"] }
 serde = { version = "=1.0.228", features = ["derive"] }

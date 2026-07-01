@@ -466,6 +466,12 @@ impl App {
         &self.title
     }
 
+    /// Replaces the header title. Used by the live path to surface the silent-empty advisory until
+    /// the first packet arrives.
+    pub fn set_title(&mut self, title: String) {
+        self.title = title;
+    }
+
     /// The current sort field.
     #[must_use]
     pub fn sort_field(&self) -> SortField {
