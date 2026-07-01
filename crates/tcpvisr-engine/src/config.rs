@@ -23,6 +23,8 @@ pub struct EngineConfig {
     pub max_samples: usize,
     /// Whether the tracker records a per-segment `StateSample` timeline (M5 replay).
     pub collect_state_timeline: bool,
+    /// Whether the tracker records a per-segment `SeqSample` Time/Sequence series (M6 detail).
+    pub collect_seq_timeline: bool,
 }
 
 impl Default for EngineConfig {
@@ -35,6 +37,7 @@ impl Default for EngineConfig {
             reorder_window: Nanos(3_000_000),
             max_samples: 10_000_000,
             collect_state_timeline: false,
+            collect_seq_timeline: false,
         }
     }
 }
@@ -52,6 +55,7 @@ mod tests {
         assert_eq!(c.reorder_window, Nanos(3_000_000));
         assert_eq!(c.max_samples, 10_000_000);
         assert!(!c.collect_state_timeline);
+        assert!(!c.collect_seq_timeline);
         // M2 defaults unchanged:
         assert_eq!(c.dead_after, Nanos(120_000_000_000));
         assert_eq!(c.reset_threshold, 1 << 30);

@@ -2,18 +2,30 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState};
 use tcpvisr_core::Nanos;
 
 use crate::app::{App, Mode, SortDir, SortField};
+use crate::detail::{self, Mark, SeqPlot};
+
+/// Columns reserved on the left of the detail pane for Y-axis (sequence) labels.
+const GUTTER: u16 = 8;
 
 /// Draws the master list — header, table (or empty state), and footer — into `frame`.
 pub fn render(frame: &mut Frame, app: &App) {
     let [main, footer] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
-    render_main(frame, app, main);
+    if app.is_detail_open() {
+        let [left, right] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .areas(main);
+        render_main(frame, app, left);
+        render_detail(frame, app, right);
+    } else {
+        render_main(frame, app, main);
+    }
     render_footer(frame, app, footer);
 }
 
@@ -81,6 +93,106 @@ fn render_main(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
+/// Draws the Time/Sequence detail pane for the focused connection into `area`.
+fn render_detail(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(focus) = app.focus() else {
+        let block = Block::bordered().title("DETAIL");
+        frame.render_widget(Paragraph::new("no connection selected").block(block), area);
+        return;
+    };
+    let title = format!("DETAIL {} \u{2192} {}", focus.origin, focus.responder);
+    let block = Block::bordered().title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Reserve: legend row (top), time-label row (bottom), Y-label gutter (left).
+    if inner.height < 3 || inner.width <= GUTTER {
+        frame.render_widget(Paragraph::new("widen terminal to view graph"), inner);
+        return;
+    }
+    let plot_w = inner.width - GUTTER;
+    let plot_h = inner.height - 2; // legend + time labels
+
+    let Some(plot) = detail::project(
+        focus.series,
+        focus.focus_dir,
+        focus.x_span,
+        app.cursor(),
+        plot_w,
+        plot_h,
+    ) else {
+        frame.render_widget(Paragraph::new("widen terminal to view graph"), inner);
+        return;
+    };
+
+    draw_legend(frame, inner);
+    draw_plot(frame, inner, GUTTER, &plot);
+    draw_axes(frame, inner, GUTTER, &plot);
+}
+
+fn draw_legend(frame: &mut Frame, inner: Rect) {
+    let legend = format!(
+        "Time/Sequence   {} retrans  {} sack",
+        detail::RETRANS_GLYPH,
+        detail::SACK_GLYPH
+    );
+    let row = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: 1,
+    };
+    frame.render_widget(Paragraph::new(legend), row);
+}
+
+fn draw_plot(frame: &mut Frame, inner: Rect, gutter: u16, plot: &SeqPlot) {
+    let buf = frame.buffer_mut();
+    let x0 = inner.x + gutter;
+    let y_top = inner.y + 1; // below the legend row
+    for &Mark { col, row, glyph } in &plot.marks {
+        let screen_row = plot.height - 1 - row; // bottom-origin row -> screen line
+        let x = x0 + col;
+        let y = y_top + screen_row;
+        let color = match glyph {
+            detail::RETRANS_GLYPH => Color::Red,
+            detail::SACK_GLYPH => Color::Yellow,
+            _ => Color::Reset,
+        };
+        buf.set_string(x, y, glyph.to_string(), Style::default().fg(color));
+    }
+}
+
+fn draw_axes(frame: &mut Frame, inner: Rect, gutter: u16, plot: &SeqPlot) {
+    let buf = frame.buffer_mut();
+    let y_top = inner.y + 1;
+    // Y labels: max_rel at the top of the plot, 0 at the bottom. `fmt_seq` keeps a large
+    // (multi-GB) offset inside the gutter so it never overwrites plot columns.
+    buf.set_string(
+        inner.x,
+        y_top,
+        format!("{:>7}", fmt_seq(plot.max_rel)),
+        Style::default(),
+    );
+    let y_bottom = y_top + plot.height - 1;
+    buf.set_string(inner.x, y_bottom, format!("{:>7}", 0), Style::default());
+    // X labels: start / end seconds on the bottom label row.
+    let label_row = inner.y + inner.height - 1;
+    let start = fmt_seconds(plot.x_span.0);
+    let end = fmt_seconds(plot.x_span.1);
+    buf.set_string(
+        inner.x + gutter,
+        label_row,
+        format!("{start}s"),
+        Style::default(),
+    );
+    let end_label = format!("{end}s");
+    let end_x = inner
+        .x
+        .saturating_add(inner.width)
+        .saturating_sub(u16::try_from(end_label.len()).unwrap_or(0));
+    buf.set_string(end_x, label_row, end_label, Style::default());
+}
+
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let text = match app.mode() {
         Mode::Filter => format!("/{}", app.query()),
@@ -90,7 +202,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 SortDir::Desc => '▼',
             };
             format!(
-                "space play/pause  ←→ seek  +/- speed  ,/. step  / filter  s sort:{}{arrow}  q quit",
+                "space play/pause  ←→ seek  +/- speed  ,/. step  ⏎ open  esc close  / filter  s sort:{}{arrow}  q quit",
                 sort_label(app.sort_field()),
             )
         }
@@ -115,6 +227,27 @@ fn transport_status(app: &App) -> String {
 fn fmt_seconds(t: Nanos) -> String {
     let ms = t.0 / 1_000_000;
     format!("{}.{:03}", ms / 1000, ms % 1000)
+}
+
+/// Formats a Y-axis sequence offset compactly so it fits the detail pane's gutter: raw below
+/// 100 000, else an SI-suffixed `<whole>.<tenth><K|M|G|T>`. Integer-only (deterministic
+/// snapshots). This keeps a multi-GB `max_rel` from overflowing the gutter into the plot.
+fn fmt_seq(n: i64) -> String {
+    const UNITS: [(i64, char); 4] = [
+        (1_000_000_000_000, 'T'),
+        (1_000_000_000, 'G'),
+        (1_000_000, 'M'),
+        (1_000, 'K'),
+    ];
+    if n < 100_000 {
+        return n.to_string();
+    }
+    for (div, suffix) in UNITS {
+        if n >= div {
+            return format!("{}.{}{suffix}", n / div, (n % div) * 10 / div);
+        }
+    }
+    n.to_string()
 }
 
 fn sort_label(field: SortField) -> &'static str {
@@ -307,7 +440,9 @@ mod tests {
             vec![entry(ep(1, 5), ep(2, 443), false)],
             "tcp-visr — c.pcap  (1 connections, skipped 0)",
         );
-        let s = draw(&app, 80, 10);
+        // Width 120: the M6 footer gained `⏎ open  esc close` hints (spec §3.3), so `q quit`
+        // and the sort indicator at the footer tail need a wider viewport than M5's 80.
+        let s = draw(&app, 120, 10);
         assert!(s.contains("tcp-visr — c.pcap"), "{s}");
         assert!(s.contains("PEER"), "{s}");
         assert!(s.contains("SERVICE"), "{s}");
@@ -338,6 +473,110 @@ mod tests {
         let app = app_of(vec![], "t");
         let s = draw(&app, 40, 6);
         assert!(s.contains("no connections in capture"), "{s}");
+    }
+
+    #[test]
+    fn detail_closed_still_renders_full_master() {
+        let app = app_span(2_000_000_000);
+        let s = draw(&app, 100, 10);
+        assert!(
+            s.contains("PEER"),
+            "master header present when detail closed: {s}"
+        );
+        assert!(!s.contains("DETAIL"), "no detail pane when closed");
+    }
+
+    #[test]
+    fn detail_open_shows_title_legend_and_a_mark() {
+        // A connection with one O2R data segment so the focus series is non-empty.
+        let c = conn_span(ep(1, 5), ep(2, 443), 0, 1_000, ConnState::Established);
+        let sq = tcpvisr_engine::SeqSample {
+            t: Nanos(0),
+            dir: tcpvisr_core::SampleDir::OriginToResponder,
+            rel: 0,
+            len: 100,
+            kind: tcpvisr_engine::SeqKind::Data {
+                retransmit: false,
+                out_of_order: false,
+            },
+        };
+        let mut c2 = c;
+        c2.bytes_o2r = 100;
+        let tl = Timeline::with_seq(vec![(c2, vec![ss(0, 100, 0)], vec![sq])]);
+        let mut app = App::new(tl, "t".to_string());
+        app.open_detail();
+        let s = draw(&app, 120, 14);
+        assert!(s.contains("DETAIL"), "detail title: {s}");
+        assert!(
+            s.contains("retrans") && s.contains("sack"),
+            "mark legend: {s}"
+        );
+        assert!(s.contains('#'), "at least one plotted data glyph: {s}");
+    }
+
+    #[test]
+    fn detail_pane_too_narrow_shows_widen_message() {
+        let c = conn_span(ep(1, 5), ep(2, 443), 0, 1_000, ConnState::Established);
+        let mut c2 = c;
+        c2.bytes_o2r = 100;
+        let sq = tcpvisr_engine::SeqSample {
+            t: Nanos(0),
+            dir: tcpvisr_core::SampleDir::OriginToResponder,
+            rel: 0,
+            len: 100,
+            kind: tcpvisr_engine::SeqKind::Data {
+                retransmit: false,
+                out_of_order: false,
+            },
+        };
+        let tl = Timeline::with_seq(vec![(c2, vec![ss(0, 100, 0)], vec![sq])]);
+        let mut app = App::new(tl, "t".to_string());
+        app.open_detail();
+        // Width 34 -> right pane 17, inner 15, plot_w = 15 - 8 gutter = 7 < MIN_W(8) -> the guard
+        // fires, and the 15-wide inner still fits the "widen terminal" message.
+        let s = draw(&app, 34, 12);
+        assert!(s.contains("widen terminal"), "narrow detail guidance: {s}");
+    }
+
+    #[test]
+    fn large_seq_axis_label_is_abbreviated_not_raw() {
+        // Two O2R data points 5 GB apart -> max_rel ~5e9. The Y label must be SI-abbreviated
+        // (e.g. "5.0G") so it fits the gutter, never the raw 10-digit number (which would
+        // overflow into the plot columns).
+        let c = conn_span(ep(1, 5), ep(2, 443), 0, 1_000, ConnState::Established);
+        let mut c2 = c;
+        c2.bytes_o2r = 5_000_000_000;
+        let d = |t: u64, rel: i64| tcpvisr_engine::SeqSample {
+            t: Nanos(t),
+            dir: tcpvisr_core::SampleDir::OriginToResponder,
+            rel,
+            len: 100,
+            kind: tcpvisr_engine::SeqKind::Data {
+                retransmit: false,
+                out_of_order: false,
+            },
+        };
+        let tl = Timeline::with_seq(vec![(
+            c2,
+            vec![ss(0, 5_000_000_000, 0)],
+            vec![d(0, 0), d(1_000, 5_000_000_000)],
+        )]);
+        let mut app = App::new(tl, "t".to_string());
+        app.open_detail();
+        let s = draw(&app, 120, 14);
+        assert!(s.contains('G'), "Y axis label is SI-abbreviated: {s}");
+        assert!(
+            !s.contains("5000000000"),
+            "raw 10-digit seq number must not be printed into the gutter: {s}"
+        );
+    }
+
+    #[test]
+    fn footer_advertises_open_and_close() {
+        let app = app_span(1_000_000_000);
+        let s = draw(&app, 120, 8);
+        assert!(s.contains("open"), "open hint: {s}");
+        assert!(s.contains("close"), "close hint: {s}");
     }
 
     #[test]

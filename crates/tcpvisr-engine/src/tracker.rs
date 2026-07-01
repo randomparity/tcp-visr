@@ -2,13 +2,13 @@
 
 use std::collections::HashMap;
 
-use tcpvisr_core::{Endpoint, Item, MetricSample, Nanos, Segment, TcpFlags, TcpSeq};
+use tcpvisr_core::{Endpoint, Item, MetricSample, Nanos, SampleDir, Segment, TcpFlags, TcpSeq};
 
 use crate::config::EngineConfig;
 use crate::conn::{ConnId, Connection, Direction, EndpointPair};
 use crate::metrics::{ConnectionMetrics, MetricError, MetricState, SeriesCollection};
 use crate::state::ConnState;
-use crate::timeline::{StateSample, Timeline};
+use crate::timeline::{SeqKind, SeqSample, StateSample, Timeline};
 
 /// `true` when `seq` sits backward of `baseline` in RFC 1982 serial space by more than
 /// `threshold` — a drop to a fresh ISN, not a retransmit/reorder or a forward `u32` wrap.
@@ -32,6 +32,57 @@ fn advance_baseline(current: Option<TcpSeq>, seq: TcpSeq) -> TcpSeq {
     }
 }
 
+fn dir_index(d: Direction) -> usize {
+    match d {
+        Direction::OriginToResponder => 0,
+        Direction::ResponderToOrigin => 1,
+    }
+}
+
+fn dir_sample(d: Direction) -> SampleDir {
+    match d {
+        Direction::OriginToResponder => SampleDir::OriginToResponder,
+        Direction::ResponderToOrigin => SampleDir::ResponderToOrigin,
+    }
+}
+
+fn dir_opposite(d: Direction) -> Direction {
+    match d {
+        Direction::OriginToResponder => Direction::ResponderToOrigin,
+        Direction::ResponderToOrigin => Direction::OriginToResponder,
+    }
+}
+
+/// Per-direction sequence-unwrap state (ADR-0011 §1): anchors the first-seen seq at `rel = 0`
+/// and accumulates the bounded signed serial distance from a running frontier into an `i64`, so
+/// a stream that wraps the 32-bit space many times rises monotonically instead of folding.
+#[derive(Default, Clone, Copy)]
+struct SeqUnwrap {
+    frontier: Option<(TcpSeq, i64)>,
+}
+
+impl SeqUnwrap {
+    fn offset(&mut self, seq: TcpSeq) -> i64 {
+        match self.frontier {
+            None => {
+                self.frontier = Some((seq, 0));
+                0
+            }
+            Some((fseq, frel)) => {
+                if seq == fseq {
+                    frel
+                } else if seq.serial_gt(fseq) {
+                    let rel = frel + i64::from(seq.serial_diff(fseq));
+                    self.frontier = Some((seq, rel));
+                    rel
+                } else {
+                    frel - i64::from(fseq.serial_diff(seq))
+                }
+            }
+        }
+    }
+}
+
 /// Full per-instance tracking state (internal). The public view is [`Connection`].
 struct ConnTrack {
     id: ConnId,
@@ -51,6 +102,8 @@ struct ConnTrack {
     metrics: MetricState,
     series: Vec<MetricSample>,
     states: Vec<StateSample>,
+    seq: Vec<SeqSample>,
+    unwrap: [SeqUnwrap; 2],
 }
 
 impl ConnTrack {
@@ -130,6 +183,45 @@ impl ConnTrack {
         }
     }
 
+    /// Appends this segment's Time/Sequence points to `out`: one `Data` point (its own
+    /// direction) when the segment carries payload, and one `Sack` point (the acked/opposite
+    /// direction) per SACK block. Mutates the per-direction unwrap frontiers.
+    fn push_seq_points(
+        &mut self,
+        seg: &Segment,
+        dir: Direction,
+        sample: &MetricSample,
+        out: &mut Vec<SeqSample>,
+    ) {
+        if seg.payload_len > 0 {
+            let rel = self.unwrap[dir_index(dir)].offset(seg.seq);
+            out.push(SeqSample {
+                t: seg.ts,
+                dir: dir_sample(dir),
+                rel,
+                len: seg.payload_len,
+                kind: SeqKind::Data {
+                    retransmit: sample.retransmit,
+                    out_of_order: sample.out_of_order,
+                },
+            });
+        }
+        if !seg.options.sack_blocks.is_empty() {
+            let acked = dir_opposite(dir);
+            let ai = dir_index(acked);
+            for &(left, _right) in &seg.options.sack_blocks {
+                let rel = self.unwrap[ai].offset(left);
+                out.push(SeqSample {
+                    t: seg.ts,
+                    dir: dir_sample(acked),
+                    rel,
+                    len: 0,
+                    kind: SeqKind::Sack,
+                });
+            }
+        }
+    }
+
     fn view(&self) -> Connection {
         Connection {
             id: self.id,
@@ -206,6 +298,37 @@ impl Tracker {
         self.conns[idx].states.push(sample);
     }
 
+    /// Stores one `SeqSample` on the instance at `idx`, enforcing `max_samples`.
+    fn record_seq(&mut self, idx: usize, sample: SeqSample) {
+        if self.overflowed {
+            return;
+        }
+        if self.collected_samples >= self.config.max_samples {
+            self.overflowed = true;
+            return;
+        }
+        self.collected_samples += 1;
+        self.conns[idx].seq.push(sample);
+    }
+
+    /// Builds and records this segment's seq points when seq collection is on and not overflowed.
+    fn collect_seq_points(
+        &mut self,
+        idx: usize,
+        seg: &Segment,
+        dir: Direction,
+        sample: &MetricSample,
+    ) {
+        if self.overflowed || !self.config.collect_seq_timeline {
+            return;
+        }
+        let mut points = Vec::new();
+        self.conns[idx].push_seq_points(seg, dir, sample, &mut points);
+        for p in points {
+            self.record_seq(idx, p);
+        }
+    }
+
     /// Folds one `Item` into tracker state. `Tick`s are inert in replay (idle is evaluated
     /// per-segment from each segment's own ts); they never create a connection.
     pub fn observe(&mut self, item: &Item) {
@@ -231,9 +354,13 @@ impl Tracker {
                 // the per-direction RTT/throughput state cannot grow for unrelated flows. Once
                 // the ceiling has tripped the result is already doomed, so stop deriving entirely
                 // rather than keep growing per-connection state on a discarded series.
-                if !self.overflowed && self.should_collect(self.conns[idx].id) {
+                let want_metric = self.should_collect(self.conns[idx].id);
+                if !self.overflowed && (want_metric || self.config.collect_seq_timeline) {
                     let sample = self.conns[idx].metrics.observe(seg, dir, &self.config);
-                    self.record_sample(idx, sample);
+                    if want_metric {
+                        self.record_sample(idx, sample);
+                    }
+                    self.collect_seq_points(idx, seg, dir, &sample);
                 }
                 return;
             }
@@ -295,6 +422,8 @@ impl Tracker {
             metrics: MetricState::new(),
             series: Vec::new(),
             states: Vec::new(),
+            seq: Vec::new(),
+            unwrap: [SeqUnwrap::default(); 2],
         };
         let dir = track.direction_of(src);
         track.account(seg, dir);
@@ -306,13 +435,17 @@ impl Tracker {
         }
         // Derive the first sample only for collected instances, and not past the ceiling
         // (see `observe_segment`).
-        let sample = (!self.overflowed && self.should_collect(track.id))
+        let want_metric = self.should_collect(track.id);
+        let sample = (!self.overflowed && (want_metric || self.config.collect_seq_timeline))
             .then(|| track.metrics.observe(seg, dir, &self.config));
         let idx = self.conns.len();
         self.conns.push(track);
         self.live.insert(pair, idx);
         if let Some(sample) = sample {
-            self.record_sample(idx, sample);
+            if want_metric {
+                self.record_sample(idx, sample);
+            }
+            self.collect_seq_points(idx, seg, dir, &sample);
         }
         if self.config.collect_state_timeline {
             let s = self.conns[idx].snapshot(seg.ts);
@@ -362,12 +495,12 @@ impl Tracker {
                 limit: self.config.max_samples,
             });
         }
-        let pairs: Vec<(Connection, Vec<StateSample>)> = self
+        let triples: Vec<(Connection, Vec<StateSample>, Vec<SeqSample>)> = self
             .conns
             .iter()
-            .map(|c| (c.view(), c.states.clone()))
+            .map(|c| (c.view(), c.states.clone(), c.seq.clone()))
             .collect();
-        Ok(Timeline::new(pairs))
+        Ok(Timeline::with_seq(triples))
     }
 }
 
@@ -922,5 +1055,195 @@ mod metric_wire_tests {
         // opened_at 1_000 (c1) sorts before 2_000 (c2).
         assert_eq!(m[0].conn.opened_at, tcpvisr_core::Nanos(1_000));
         assert_eq!(m[1].conn.opened_at, tcpvisr_core::Nanos(2_000));
+    }
+}
+
+#[cfg(test)]
+mod seq_tests {
+    use super::test_support::{ep, seg};
+    use super::*;
+    use tcpvisr_core::{FlowKey, Item, Nanos, SampleDir, Segment, TcpFlags, TcpOptions, TcpSeq};
+
+    fn seq_cfg() -> EngineConfig {
+        EngineConfig {
+            collect_state_timeline: true,
+            collect_seq_timeline: true,
+            ..EngineConfig::default()
+        }
+    }
+
+    fn only_id(tl: &crate::timeline::Timeline) -> ConnId {
+        tl.connections().next().expect("one connection").id
+    }
+
+    // A segment carrying a single SACK block (L, R), in src->dst direction.
+    fn seg_sack(
+        src: (core::net::IpAddr, u16),
+        dst: (core::net::IpAddr, u16),
+        flags: u16,
+        seq: u32,
+        ack: u32,
+        ts: u64,
+        block: (u32, u32),
+    ) -> Item {
+        let mut options = TcpOptions::default();
+        options.sack_blocks.push((TcpSeq(block.0), TcpSeq(block.1)));
+        Item::Segment(Segment {
+            ts: Nanos(ts),
+            flow: FlowKey {
+                src_ip: src.0,
+                src_port: src.1,
+                dst_ip: dst.0,
+                dst_port: dst.1,
+            },
+            seq: TcpSeq(seq),
+            ack: TcpSeq(ack),
+            flags: TcpFlags(flags),
+            window: 0,
+            options,
+            payload_len: 0,
+        })
+    }
+
+    #[test]
+    fn data_points_carry_unwrapped_rel_and_len() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(seq_cfg());
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 1_000));
+        t.observe(&seg(c, s, TcpFlags::ACK, 110, 1, 20, 2_000));
+        let tl = t.into_timeline().expect("timeline");
+        let series: Vec<_> = tl
+            .seq_series(only_id(&tl))
+            .iter()
+            .filter(|p| p.dir == SampleDir::OriginToResponder)
+            .copied()
+            .collect();
+        assert_eq!(series.len(), 2);
+        assert_eq!((series[0].rel, series[0].len), (0, 10));
+        assert_eq!((series[1].rel, series[1].len), (10, 20));
+        assert_eq!(
+            series[1].kind,
+            SeqKind::Data {
+                retransmit: false,
+                out_of_order: false
+            }
+        );
+    }
+
+    #[test]
+    fn rel_unwraps_across_a_u32_wrap() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(seq_cfg());
+        t.observe(&seg(c, s, TcpFlags::ACK, u32::MAX - 100, 1, 50, 1_000));
+        t.observe(&seg(c, s, TcpFlags::ACK, 200, 1, 50, 2_000));
+        let tl = t.into_timeline().expect("timeline");
+        let rels: Vec<i64> = tl
+            .seq_series(only_id(&tl))
+            .iter()
+            .filter(|p| p.dir == SampleDir::OriginToResponder)
+            .map(|p| p.rel)
+            .collect();
+        // 200.serial_diff(u32::MAX-100) == 301 — a forward advance, not a fold.
+        assert_eq!(rels, vec![0, 301]);
+    }
+
+    #[test]
+    fn rel_rises_monotonically_across_multiple_wraps() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(seq_cfg());
+        let step: u32 = 1_200_000_000; // ~1.2 GB per segment; 4 segments wrap u32 twice
+        let mut seq: u32 = 0;
+        let mut ts = 0u64;
+        for _ in 0..4 {
+            ts += 1_000;
+            t.observe(&seg(c, s, TcpFlags::ACK, seq, 1, step, ts));
+            seq = seq.wrapping_add(step);
+        }
+        let tl = t.into_timeline().expect("timeline");
+        let rels: Vec<i64> = tl
+            .seq_series(only_id(&tl))
+            .iter()
+            .filter(|p| p.dir == SampleDir::OriginToResponder)
+            .map(|p| p.rel)
+            .collect();
+        assert_eq!(rels.len(), 4);
+        assert!(
+            rels.windows(2).all(|w| w[1] > w[0]),
+            "rel strictly increases across wraps: {rels:?}"
+        );
+        assert_eq!(rels[3], 3 * i64::from(step), "no fold: 3 steps forward");
+    }
+
+    #[test]
+    fn sack_point_lands_in_the_acked_direction_frame() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(seq_cfg());
+        // O2R data anchors the O2R frame at seq 1000 (rel 0).
+        t.observe(&seg(c, s, TcpFlags::ACK, 1000, 1, 100, 1_000));
+        // R2O ack carrying a SACK block for O2R bytes [1200, 1300).
+        t.observe(&seg_sack(s, c, TcpFlags::ACK, 1, 1101, 2_000, (1200, 1300)));
+        let tl = t.into_timeline().expect("timeline");
+        let sacks: Vec<_> = tl
+            .seq_series(only_id(&tl))
+            .iter()
+            .filter(|p| p.kind == SeqKind::Sack)
+            .copied()
+            .collect();
+        assert_eq!(sacks.len(), 1);
+        assert_eq!(
+            sacks[0].dir,
+            SampleDir::OriginToResponder,
+            "acked direction"
+        );
+        assert_eq!(sacks[0].rel, 200, "1200 - 1000 in the O2R frame");
+        assert_eq!(sacks[0].len, 0);
+    }
+
+    #[test]
+    fn seq_collection_counts_against_the_ceiling() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut cfg = seq_cfg();
+        cfg.max_samples = 1; // first segment already produces state + seq samples
+        let mut t = Tracker::new(cfg);
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 1_000));
+        t.observe(&seg(c, s, TcpFlags::ACK, 110, 1, 20, 2_000));
+        let err = t.into_timeline().expect_err("ceiling");
+        assert!(matches!(err, MetricError::SampleCeiling { .. }));
+    }
+
+    #[test]
+    fn retransmit_and_ooo_classified_on_seq_points() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        // Retransmit: behind-frontier re-send after a gap >= reorder_window (3ms default).
+        let mut t = Tracker::new(seq_cfg());
+        t.observe(&seg(c, s, TcpFlags::ACK, 200, 1, 100, 1_000_000));
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 100, 4_000_000)); // 3ms gap -> retransmit
+        let tl = t.into_timeline().expect("timeline");
+        let kinds: Vec<_> = tl.seq_series(only_id(&tl)).iter().map(|p| p.kind).collect();
+        assert_eq!(
+            kinds[1],
+            SeqKind::Data {
+                retransmit: true,
+                out_of_order: false
+            }
+        );
+
+        // Out-of-order: behind-frontier within the reorder window.
+        let mut t2 = Tracker::new(seq_cfg());
+        t2.observe(&seg(c, s, TcpFlags::ACK, 200, 1, 100, 1_000));
+        t2.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 100, 1_001)); // 1us gap -> out-of-order
+        let tl2 = t2.into_timeline().expect("timeline");
+        let kinds2: Vec<_> = tl2
+            .seq_series(only_id(&tl2))
+            .iter()
+            .map(|p| p.kind)
+            .collect();
+        assert_eq!(
+            kinds2[1],
+            SeqKind::Data {
+                retransmit: false,
+                out_of_order: true
+            }
+        );
     }
 }
