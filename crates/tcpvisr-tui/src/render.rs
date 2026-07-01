@@ -5,7 +5,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState};
-use tcpvisr_core::Nanos;
+use tcpvisr_core::{Endpoint, HostName, Nanos};
 
 use crate::app::{App, DetailView, FocusConn, Mode, SortDir, SortField};
 use crate::detail::{self, Mark, SeqPlot};
@@ -15,6 +15,16 @@ use crate::throughput::{self, Mark as ThroughputMark, Series as ThroughputSeries
 
 /// Columns reserved on the left of the detail pane for Y-axis (sequence) labels.
 const GUTTER: u16 = 8;
+
+/// Renders a peer as `host:port` when a DNS name resolved, else the numeric `ip:port` (design §6).
+/// The result is clipped to the surrounding cell/column width by ratatui, so a long name cannot
+/// overflow the pane (spec §3.2).
+fn peer_label(peer: Endpoint, host: Option<&HostName>) -> String {
+    match host {
+        Some(name) => format!("{name}:{}", peer.port),
+        None => peer.to_string(),
+    }
+}
 
 /// Draws the master list — header, table (or empty state), and footer — into `frame`.
 pub fn render(frame: &mut Frame, app: &App) {
@@ -70,7 +80,7 @@ fn render_main(frame: &mut Frame, app: &App, area: Rect) {
                 format!("{:?}", r.state)
             };
             Row::new([
-                Cell::from(r.peer.to_string()),
+                Cell::from(peer_label(r.peer, r.host.as_ref())),
                 Cell::from(r.service.unwrap_or("")),
                 Cell::from(state),
                 Cell::from(Text::from(r.bytes_up.to_string()).right_aligned()),
@@ -103,7 +113,8 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new("no connection selected").block(block), area);
         return;
     };
-    let title = format!("DETAIL {} \u{2192} {}", focus.origin, focus.responder);
+    let responder = peer_label(focus.responder, focus.responder_host.as_ref());
+    let title = format!("DETAIL {} \u{2192} {responder}", focus.origin);
     let block = Block::bordered().title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -706,6 +717,53 @@ mod tests {
         let b = conn_span(ep(1, 2), ep(3, 80), 200, 300, ConnState::Established);
         let b_s = vec![ss(200, 0, 0), ss(300, 0, 0)];
         App::new(Timeline::new(vec![(a, a_s), (b, b_s)]), "t".to_string())
+    }
+
+    fn app_with_host(name: &str) -> App {
+        let c = conn_span(ep(1, 5), ep(2, 443), 0, 1_000, ConnState::Established);
+        let mut names = tcpvisr_core::NameTable::default();
+        names.observe(tcpvisr_core::NameObservation {
+            ts: Nanos(1),
+            ip: ep(2, 443).ip,
+            name: tcpvisr_core::HostName::new(name).unwrap(),
+        });
+        App::new_with_names(
+            Timeline::new(vec![(c, vec![ss(0, 10, 20)])]),
+            &names,
+            "t".to_string(),
+        )
+    }
+
+    #[test]
+    fn peer_row_shows_resolved_host() {
+        let app = app_with_host("github.com");
+        let s = draw(&app, 100, 8);
+        assert!(s.contains("github.com:443"), "peer row host: {s}");
+    }
+
+    #[test]
+    fn detail_title_shows_resolved_responder_host() {
+        let mut app = app_with_host("github.com");
+        app.open_detail();
+        let s = draw(&app, 120, 12);
+        assert!(s.contains("github.com:443"), "detail title host: {s}");
+    }
+
+    #[test]
+    fn long_host_name_is_truncated_not_rendered_whole() {
+        // The peer column is far narrower than 253 chars; ratatui clips the Table cell, so the
+        // full name never renders contiguously (spec criterion 18). A prefix of 'a's does render.
+        let long = "a".repeat(253);
+        let app = app_with_host(&long);
+        let s = draw(&app, 80, 8);
+        assert!(
+            !s.contains(&long),
+            "the 253-char name must be clipped to the column, not shown whole"
+        );
+        assert!(
+            s.contains("aaaa"),
+            "a prefix of the resolved name renders in the peer column"
+        );
     }
 
     #[test]
