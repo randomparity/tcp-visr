@@ -96,9 +96,11 @@ change: the tracker now also collects the seq timeline, so the built `Timeline` 
 - The detail body shows the **Time/Sequence** graph: a Y axis labeled with the sequence range
   (relative, starting at 0), an X axis labeled with the time range in seconds, the plotted
   marks, and a one-line **legend** naming the retransmit and SACK glyphs.
-- **Narrow terminals.** If the detail pane is too narrow to draw axes and a plot area (fewer
-  than a minimum inner width/height), the pane shows `widen terminal to view graph` instead
-  of a truncated plot. The master pane keeps rendering.
+- **Narrow terminals.** `render.rs` carves the axis-label gutter, X-axis label row, and
+  legend row off the pane interior before handing the projection the inner plot rectangle
+  (§3.4). If what remains is smaller than the minimum plot rectangle (a fixed minimum `W`×`H`
+  in cells, defined in `detail.rs`), the pane shows `widen terminal to view graph` instead of
+  a truncated plot. The master pane keeps rendering.
 - **Footer** advertises `⏎ open` and `esc close` alongside the M5 transport/sort/filter hints.
 
 ### 3.4 The Stevens graph (semantics)
@@ -116,15 +118,23 @@ For the focus connection (§3.5) and its focus direction (§3.6):
   subtraction). The axis top `max_rel` is `max(rel(s) + s.len)` over those samples — i.e. the
   furthest byte the stream reached, so a point is never plotted above the axis (a `Sack`
   sample has `len = 0`, so it contributes only its own row). Fixed; scrubbing does not rescale.
-- **Degenerate spans.** If the time span is zero (`opened_at == effective_end`, a
-  single-timestamp connection) every revealed mark and the cursor column go in **column 0**.
-  If `max_rel == 0` (the focus direction has no byte extent — e.g. only `Sack` marks at the
-  baseline) every mark goes on the **bottom row**. Neither case is an error; the mapping
-  divides only when the span is non-zero.
-- **Marks.** Each `SeqSample` of the focus direction with `t ≤ T` maps to a cell
-  `(col, row)`: `col` from `t` linearly across the X span, `row` from `rel(s)` linearly across
-  `[0, max_rel]` (row 0 at the bottom = sequence 0; the point plots at the segment **start**
-  seq, so a retransmit dips back to its earlier row). The glyph is by kind:
+- **Plot rectangle.** The projection operates on the inner **plot rectangle** only: `W`
+  columns × `H` rows of *cells*, excluding the pane border, the Y-axis label gutter, the
+  X-axis label row, and the legend row — `render.rs` (§4) carves those off the pane and hands
+  the projection the reduced `(W, H)`. Columns are indexed `0..W` (0 = left/earliest time);
+  rows are indexed `0..H` with **row 0 at the bottom** (sequence 0) and row `H-1` at the top.
+- **Coordinate mapping (exact, clamped).** With `span_t = effective_end.0 - opened_at.0`:
+  - `col(t) = if span_t == 0 { 0 } else { ((t.0 - opened_at.0) * (W-1)) / span_t }`, then
+    clamped to `0..=W-1` (integer division; `t` is already in `[opened_at, effective_end]`).
+  - `row(s) = if max_rel == 0 { 0 } else { (rel(s) * (H-1)) / max_rel }`, then clamped to
+    `0..=H-1`. Row 0 is the bottom; a renderer drawing top-down writes screen line
+    `(H-1) - row`. Because the multiplier is `H-1` (not `H`), `rel(s) == max_rel` maps to row
+    `H-1` — the top cell — never `H` (out of bounds). The degenerate `span_t == 0` and
+    `max_rel == 0` cases collapse to column 0 / bottom row via the guards above, with no
+    division.
+- **Marks.** Each `SeqSample` of the focus direction with `t ≤ T` maps to cell
+  `(col(t), row(s))` (the point plots at the segment **start** seq, so a retransmit dips back
+  to its earlier row). The glyph is by kind:
   - `Data { retransmit: false, out_of_order: false }` → the plain data glyph,
   - `Data { out_of_order: true, retransmit: false }` → the out-of-order glyph,
   - `Data { retransmit: true, .. }` → the retransmit glyph,
@@ -170,8 +180,15 @@ tests are deterministic. Axis time labels reuse the M5 fixed-3-decimal-seconds f
   (empty slice for an unknown/uncollected id) and `x_span(&self, id) -> Option<(Nanos, Nanos)>`
   returning the connection's `[opened_at, effective_end]` (the private `effective_end` is not
   otherwise reachable, and `Connection.last_at` is the wrong right edge for a still-open
-  connection). `Timeline::new` takes the seq series per connection (extend its input tuple)
-  and sorts each by `t` (stable), like `StateSample`.
+  connection).
+- **`Timeline` construction — preserve the M5 signature.** `Timeline::new(Vec<(Connection,
+  Vec<StateSample>)>)` is **kept as-is** (it constructs an empty `seq` per connection) so the
+  15 existing M5/M4 `Timeline::new` call sites — the fixtures in `timeline.rs`, `app.rs`,
+  `render.rs`, `keys.rs` — need **no** edits. A new `Timeline::with_seq(Vec<(Connection,
+  Vec<StateSample>, Vec<SeqSample>)>)` carries the seq series; `new` delegates to it with
+  empty seq vectors. Both stable-sort each `StateSample` **and** `SeqSample` series by `t`
+  (like M5). Only `Tracker::into_timeline` and the new M6 tests call `with_seq`. (This confines
+  the churn to M6 code; do not rewrite the M5 fixtures.)
 - `config.rs`: add `collect_seq_timeline: bool` (default `false`).
 - `tracker.rs`: when the flag is set, for every connection and every processed segment, run
   the existing metric derivation and, from its result + the segment, push `SeqSample`s: one
@@ -241,13 +258,15 @@ Dependency direction is unchanged (TUI → engine → core).
    point that fall in the same cell render the retransmit glyph; a data point and a SACK in
    one cell render the SACK glyph (priority `retransmit > sack > out_of_order > data`).
    (Projection unit test.)
-10. **Point placement.** A data point whose `rel(s)` equals `max_rel` at `t = midpoint` lands
-    in the middle column and the top row of the plot area; a point at `(opened_at, rel 0)`
-    lands at the bottom-left. (Projection unit test.)
+10. **Point placement (exact indices).** In a plot rectangle of width `W`, height `H`: a point
+    at `(effective_end, rel = max_rel)` lands at `(col W-1, row H-1)` (top-right); a point at
+    `(opened_at, rel 0)` lands at `(col 0, row 0)` (bottom-left); a point at
+    `t = opened_at + span_t/2` lands at `col (W-1)/2` (integer division). No index reaches `W`
+    or `H`. (Projection unit test.)
 10a. **Degenerate spans.** A focus connection with a single data segment (`opened_at ==
-    effective_end`, one sample) projects that mark to column 0 and the bottom row without a
+    effective_end`, one sample) projects that mark to `(col 0, row 0)` without a
     divide-by-zero; a focus direction with only a `Sack` mark at the baseline (`max_rel == 0`)
-    projects it to the bottom row. (Projection unit test.)
+    projects it to row 0. (Projection unit test.)
 11. **Cursor column.** The projection marks the column corresponding to `T` with the cursor
     glyph where no data mark occupies that cell. (Projection unit test.)
 12. **Narrow-terminal guard.** Projecting into a viewport below the minimum inner
@@ -259,8 +278,10 @@ Dependency direction is unchanged (TUI → engine → core).
     (App/keys unit tests.)
 14. **Detail follows selection.** With the detail open, `move_down` changes `focus()` to the
     newly selected connection's id/series. (App unit test.)
-15. **Render — closed is unchanged.** With the detail closed, `render` into a `TestBackend`
-    is the M5 full-width master (existing M5 render assertions still hold). (TestBackend test.)
+15. **Render — closed is byte-identical to M5.** With the detail closed, `render` into a
+    `TestBackend` produces the same buffer as M5 (the existing M5 render assertions still
+    pass unchanged; because `Timeline::new` is preserved (§4), the M5 test *fixtures* are
+    untouched too). (TestBackend test.)
 16. **Render — open shows the graph.** With the detail open over a connection that has data,
     `render` shows the `DETAIL <origin> → <responder>` title, the mark legend, an axis time
     label, and at least one plotted mark glyph. (TestBackend test.)
