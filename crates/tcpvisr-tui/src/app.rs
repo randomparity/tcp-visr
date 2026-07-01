@@ -93,11 +93,14 @@ pub enum Outcome {
 }
 
 /// Live-capture status shown in the header: how many segments the bounded channel dropped under
-/// load, and whether that makes the derived metrics approximate (design §7).
+/// load (which flags metrics approximate; design §7), and how many packets the decoder skipped for
+/// an *unexpected* reason (malformed/truncated/unsupported link; ordinary non-TCP traffic is not
+/// counted here).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LiveStatus {
     pub dropped: u64,
     pub approximate: bool,
+    pub skipped: u64,
 }
 
 /// Pure interactive state for the timeline master list. No I/O, no clock.
@@ -1189,6 +1192,7 @@ mod tests {
             LiveStatus {
                 dropped: 7,
                 approximate: true,
+                skipped: 0,
             },
         );
         let rows = app.visible();

@@ -536,7 +536,15 @@ fn transport_status(app: &App) -> String {
         } else {
             String::new()
         };
-        return format!("[ {state}  t={}s{drops} ]", fmt_seconds(app.cursor()));
+        let skips = if ls.skipped > 0 {
+            format!("  skipped {}", ls.skipped)
+        } else {
+            String::new()
+        };
+        return format!(
+            "[ {state}  t={}s{drops}{skips} ]",
+            fmt_seconds(app.cursor())
+        );
     }
     let glyph = if app.is_playing() { "▶" } else { "⏸" };
     let (_, end) = app.bounds();
@@ -813,6 +821,7 @@ mod tests {
             LiveStatus {
                 dropped: 3,
                 approximate: true,
+                skipped: 4,
             },
         );
         app.toggle_follow(); // frozen
@@ -820,6 +829,7 @@ mod tests {
         assert!(s.contains("FROZEN"), "frozen state: {s}");
         assert!(s.contains("dropped 3"), "drop count: {s}");
         assert!(s.contains("approx"), "approximate flag: {s}");
+        assert!(s.contains("skipped 4"), "diagnostic skip count: {s}");
     }
 
     #[test]

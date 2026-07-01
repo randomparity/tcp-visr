@@ -424,6 +424,17 @@ fn try_send_or_count<T>(
     }
 }
 
+/// Rejects a zero retention window (which would age out all history), mirroring the replay
+/// path's `--max-samples >= 1` guard.
+#[cfg(any(feature = "live", test))]
+fn validate_retention_secs(retention_secs: u64) -> Result<(), String> {
+    if retention_secs == 0 {
+        Err("--retention-secs must be at least 1 (got 0)".to_string())
+    } else {
+        Ok(())
+    }
+}
+
 /// The engine config for live capture: all five detail series on, time-horizon eviction over
 /// `retention_secs`, with a modest sample backstop (2M) — live evicts, never fails fast.
 #[cfg(any(feature = "live", test))]
@@ -490,6 +501,7 @@ fn run_live_command(
     }
 
     let iface = iface.ok_or("live requires -i <iface> (or --list-interfaces)")?;
+    validate_retention_secs(retention_secs)?;
     let mut opts = LiveOptions::new(&iface);
     opts.filter = filter;
     let capture = LiveCapture::open(&opts)?;
@@ -497,14 +509,17 @@ fn run_live_command(
     let (tx, rx) = sync_channel::<LiveEvent>(65_536);
     let stop = Arc::new(AtomicBool::new(false));
     let dropped = Arc::new(AtomicU64::new(0));
+    let skips = Arc::new(AtomicU64::new(0));
 
     let guard = {
         let thread_stop = Arc::clone(&stop);
         let thread_dropped = Arc::clone(&dropped);
+        let thread_skips = Arc::clone(&skips);
         let handle = std::thread::spawn(move || {
             let _ = capture.run(
                 |ev| try_send_or_count(&tx, ev, &thread_dropped),
                 &thread_stop,
+                &thread_skips,
             );
         });
         CaptureGuard {
@@ -532,6 +547,7 @@ fn run_live_command(
             }
         }
         let d = dropped.load(Ordering::Relaxed);
+        let sk = skips.load(Ordering::Relaxed);
         let snap = tracker.snapshot();
         app.retarget(
             snap,
@@ -540,6 +556,7 @@ fn run_live_command(
             LiveStatus {
                 dropped: d,
                 approximate: d > 0,
+                skipped: sk,
             },
         );
         match grace_hint(first_packet, start.elapsed()) {
@@ -640,6 +657,16 @@ mod live_cli_tests {
             grace_hint(false, Duration::from_secs(6)).is_some(),
             "silent past the window -> advisory hint"
         );
+    }
+
+    #[test]
+    fn retention_secs_zero_is_rejected() {
+        assert!(
+            validate_retention_secs(0).is_err(),
+            "0 window must be rejected"
+        );
+        assert!(validate_retention_secs(1).is_ok());
+        assert!(validate_retention_secs(120).is_ok());
     }
 
     #[test]

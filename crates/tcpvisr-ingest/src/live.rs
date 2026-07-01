@@ -6,14 +6,14 @@
 //! packet timestamps and injects `Item::Tick` from the host wall clock on read-timeout, so the pure
 //! engine advances idle/decay from data alone.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pcap::{Active, Capture, Device, Precision};
 use tcpvisr_core::{Item, NameObservation, Nanos};
 
 use crate::SkipCounts;
-use crate::decode::{DecodeOutcome, decode_frame};
+use crate::decode::{DecodeOutcome, SkipReason, decode_frame};
 use crate::link::LinkType;
 
 /// Read-timeout for the capture handle, in milliseconds. A timeout with no packet drives a `Tick`.
@@ -182,8 +182,17 @@ impl LiveCapture {
     /// Runs the capture loop until `stop` is set or the handle ends, calling `on_event` for each
     /// decoded `Segment`/`NameObservation` and injecting an `Item::Tick` on each read-timeout so
     /// idle/decay advance during silence. Per-packet decode problems are counted, never fatal
-    /// (design §7). Returns the accumulated skip counts.
-    pub fn run(mut self, mut on_event: impl FnMut(LiveEvent), stop: &AtomicBool) -> SkipCounts {
+    /// (design §7). `diagnostic_skips` accumulates the *unexpected* skips (malformed, truncated,
+    /// unsupported link/ext-chain, fragments) so the live UI can surface them; ordinary non-TCP
+    /// traffic (ARP, UDP, ICMP) is expected on an unfiltered interface and is left out of that
+    /// running total (though still tallied in the returned [`SkipCounts`]). Returns the full skip
+    /// counts on exit.
+    pub fn run(
+        mut self,
+        mut on_event: impl FnMut(LiveEvent),
+        stop: &AtomicBool,
+        diagnostic_skips: &AtomicU64,
+    ) -> SkipCounts {
         let mut baseline: Option<u64> = None;
         let mut skipped = SkipCounts::default();
         while !stop.load(Ordering::Relaxed) {
@@ -203,7 +212,12 @@ impl LiveCapture {
                                 on_event(LiveEvent::Name(o));
                             }
                         }
-                        DecodeOutcome::Skipped(reason) => skipped.record(reason),
+                        DecodeOutcome::Skipped(reason) => {
+                            skipped.record(reason);
+                            if reason != SkipReason::NonTcp {
+                                diagnostic_skips.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                     }
                 }
                 Err(pcap::Error::TimeoutExpired) => {
