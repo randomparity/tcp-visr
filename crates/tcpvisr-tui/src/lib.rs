@@ -1,6 +1,7 @@
 //! ratatui master/detail UI, timeline cursor, and graph views.
 
 pub mod app;
+pub mod detail;
 pub mod keys;
 pub mod render;
 pub mod run;
