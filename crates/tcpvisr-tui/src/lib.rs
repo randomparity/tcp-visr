@@ -16,7 +16,7 @@ pub use inflight::{InFlightPlot, Series};
 pub use keys::handle_key;
 pub use render::render;
 pub use rtt::{RttPlot, Series as RttSeries};
-pub use run::run;
+pub use run::{run, run_live};
 pub use service::service_name;
 pub use throughput::{Series as ThroughputSeries, ThroughputPlot};
 pub use transport::Transport;

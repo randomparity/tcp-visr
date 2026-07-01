@@ -506,8 +506,13 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 SortDir::Asc => '▲',
                 SortDir::Desc => '▼',
             };
+            let transport = if app.is_live() {
+                "space follow/freeze  ←→ seek  ,/. step"
+            } else {
+                "space play/pause  ←→ seek  +/- speed  ,/. step"
+            };
             format!(
-                "space play/pause  ←→ seek  +/- speed  ,/. step  ⏎ open  esc close  ⇥ view  / filter  s sort:{}{arrow}  q quit",
+                "{transport}  ⏎ open  esc close  ⇥ view  / filter  s sort:{}{arrow}  q quit",
                 sort_label(app.sort_field()),
             )
         }
@@ -515,8 +520,24 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(text), area);
 }
 
-/// The right-aligned header segment: play state, speed, and `t=cursor / total` in seconds.
+/// The right-aligned header segment. Replay: play state, speed, and `t=cursor / total`. Live:
+/// follow/freeze state, `t=cursor`, and the dropped-segment count when the bounded channel has
+/// dropped under load (which flags metrics approximate; design §7).
 fn transport_status(app: &App) -> String {
+    if app.is_live() {
+        let state = if app.is_following() {
+            "\u{25b6} LIVE"
+        } else {
+            "\u{23f8} FROZEN"
+        };
+        let ls = app.live_status();
+        let drops = if ls.dropped > 0 {
+            format!("  dropped {} (metrics approximate)", ls.dropped)
+        } else {
+            String::new()
+        };
+        return format!("[ {state}  t={}s{drops} ]", fmt_seconds(app.cursor()));
+    }
     let glyph = if app.is_playing() { "▶" } else { "⏸" };
     let (_, end) = app.bounds();
     format!(
@@ -773,6 +794,48 @@ mod tests {
         assert!(s.contains("⏸"), "paused glyph: {s}");
         assert!(s.contains("1.0x"), "speed: {s}");
         assert!(s.contains("t=0.000s / 2.000s"), "cursor readout: {s}");
+    }
+
+    #[test]
+    fn live_status_line_shows_dropped_and_frozen() {
+        use crate::app::LiveStatus;
+        use tcpvisr_core::NameTable;
+        let mut app = App::new_live(&NameTable::default(), "live".to_string());
+        let a = conn_span(ep(1, 1), ep(2, 443), 0, 1_000, ConnState::Established);
+        let tl = Timeline::with_seq_ending(
+            vec![(a, vec![ss(0, 10, 0)], vec![], vec![], vec![], vec![])],
+            Nanos(1_000),
+        );
+        app.retarget(
+            tl,
+            Nanos(0),
+            Nanos(1_000),
+            LiveStatus {
+                dropped: 3,
+                approximate: true,
+            },
+        );
+        app.toggle_follow(); // frozen
+        let s = draw(&app, 120, 10);
+        assert!(s.contains("FROZEN"), "frozen state: {s}");
+        assert!(s.contains("dropped 3"), "drop count: {s}");
+        assert!(s.contains("approx"), "approximate flag: {s}");
+    }
+
+    #[test]
+    fn live_status_line_shows_following_and_no_drops() {
+        use crate::app::LiveStatus;
+        use tcpvisr_core::NameTable;
+        let mut app = App::new_live(&NameTable::default(), "live".to_string());
+        let a = conn_span(ep(1, 1), ep(2, 443), 0, 1_000, ConnState::Established);
+        let tl = Timeline::with_seq_ending(
+            vec![(a, vec![ss(0, 10, 0)], vec![], vec![], vec![], vec![])],
+            Nanos(1_000),
+        );
+        app.retarget(tl, Nanos(0), Nanos(1_000), LiveStatus::default());
+        let s = draw(&app, 120, 10);
+        assert!(s.contains("LIVE"), "live/following state: {s}");
+        assert!(!s.contains("dropped"), "no drop text with zero drops: {s}");
     }
 
     #[test]
