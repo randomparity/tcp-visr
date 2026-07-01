@@ -17,7 +17,9 @@ browse them in a table, **sort**, filter with `/`, move a **selection**, and see
 - A master-list table of the capture's connections (one row per `Connection` instance
   as returned by `Tracker::into_connections()`).
 - Columns: peer (responder `ip:port`), service label, state, bytes ↑ (origin→responder),
-  bytes ↓ (responder→origin). A mid-stream marker for `origin_inferred` connections.
+  bytes ↓ (responder→origin). The STATE cell carries a trailing `~` for
+  `origin_inferred` (mid-stream) connections. Byte counts are shown as raw integers
+  (see §3.7).
 - **Sort**: cycle the sort field with `s`; toggle ascending/descending with `S`.
 - **Filter**: `/` enters a filter-input line; typing narrows the list by a
   case-insensitive subsequence match; `Enter` keeps the filter and returns to
@@ -56,19 +58,25 @@ browse them in a table, **sort**, filter with `/`, move a **selection**, and see
 
 ### 3.2 Layout
 ```
-┌ tcp-visr — <file>  (<N> connections, skipped <S>) ───────────────────────────┐
-│ PEER                       SERVICE   STATE        ↑BYTES     ↓BYTES           │
-│▸10.0.0.5:51324→github…:443 https     ESTABLISHED   1.2 KB     34.0 KB         │
-│ 10.0.0.9:22                ssh       ESTABLISHED     840 B      2.1 KB        │
+┌ tcp-visr — capture.pcap  (2 connections, skipped 0) ─────────────────────────┐
+│ PEER                    SERVICE   STATE          ↑BYTES     ↓BYTES            │
+│▸140.82.121.3:443        https     ESTABLISHED      1234      34000            │
+│ 10.0.0.9:22             ssh       ESTABLISHED~       840       2100           │
 │ …                                                                            │
 ├──────────────────────────────────────────────────────────────────────────────┤
 │ / filter   s sort:peer▲   S reverse   ↑↓ select   q quit                      │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
+- The peer cell is the **responder** `ip:port` only — no origin endpoint, no DNS name
+  (DNS is M10). The second row above (`ESTABLISHED~`) is a mid-stream/`origin_inferred`
+  connection.
 - The header names the file and the connection / skip counts.
 - The footer shows the working key bindings and the current sort field + direction.
 - In filter mode the footer is replaced by the filter input line: `/‹query›`.
 - Empty capture: the table area shows `no connections in capture`; `q` still quits.
+- **Scrolling:** when there are more connections than table rows, `render` scrolls the
+  table so the selected row is always visible (the offset is derived from the selected
+  row index and the viewport height at render time; `App` stores no offset).
 
 ### 3.3 Service labels
 `service_name(port) -> Option<&'static str>` maps a small built-in table of well-known
@@ -79,27 +87,48 @@ reviewable constant: no `/etc/services` read, no I/O, no new dependency
 (design philosophy: no I/O in testable units, deterministic output).
 
 ### 3.4 Sort
-Sort field is one of: `Peer`, `State`, `BytesUp`, `BytesDown`. `s` cycles the field
-forward (wrapping). `S` toggles ascending/descending. Each field has a natural default
-direction on first selection (peer/state ascending; byte fields descending). Sort is a
-total order — ties break by `ConnId` (pair then instance) so the order is deterministic
-and stable across identical inputs.
+Sort field is one of: `Peer`, `State`, `BytesUp`, `BytesDown`. Each field has a natural
+default direction: peer/state ascending; byte fields descending.
+- `s` cycles the field forward (wrapping) and **resets** the new field to its natural
+  default direction.
+- `S` toggles ascending/descending for the current field only (it does not change the
+  field).
 
-### 3.5 Filter
-`/` enters filter-input mode and starts an empty query (or resumes editing the current
-one). Printable characters append; `Backspace` deletes the last character. The visible
-set is every connection whose composite searchable string —
-`"{origin} {responder} {service} {state}"`, lowercased — contains the lowercased query
-as a **subsequence** (characters appear in order, not necessarily adjacent). `Enter`
-leaves input mode keeping the filter applied; `Esc` clears the query and leaves input
-mode. An empty query matches everything.
+Sort is a total order — ties break by `ConnId` (pair then instance) so the order is
+deterministic and stable across identical inputs. The initial field is `Peer` ascending.
+The footer shows the current field and direction (`▲` ascending, `▼` descending), e.g.
+`sort:peer▲`.
+
+### 3.7 Byte counts
+The ↑BYTES / ↓BYTES cells show the raw integer byte counts (`bytes_o2r` and `bytes_r2o`),
+right-aligned, with no unit suffix, scaling, or thousands separators. This keeps the
+rendered output deterministic and locale-independent for snapshot tests; human-readable
+scaling is deferred (not needed for M4).
+
+### 3.5 Filter and key modality
+`handle_key` is **modal** — the same key means different things in the two modes:
+
+- **Navigation mode** (default): `s`/`S` sort, `j`/`↓` and `k`/`↑` move the selection,
+  `/` enters filter-input mode, `q` quits. `Ctrl-C` quits.
+- **Filter-input mode**: every printable character (including `q`, `s`, `/`, space, …)
+  **appends to the query** — none of them fire their navigation-mode command.
+  `Backspace` deletes the last character; `Enter` leaves input mode keeping the filter
+  applied; `Esc` clears the query and leaves input mode. `Ctrl-C` still quits (the one
+  command key that works in both modes). `↑`/`↓`/`j`/`k` are inert in filter-input mode
+  in M4 (no selection movement while typing).
+
+The visible set is every connection whose composite searchable string —
+`"{origin} {responder} {service} {state}"`, lowercased — contains the lowercased query as
+a **subsequence** (characters appear in order, not necessarily adjacent). An empty query
+matches everything.
 
 ### 3.6 Selection
-Selection is tracked by `ConnId`, not row index, so the highlighted connection stays put
-when a re-sort or filter reorders rows. Movement selects the previous/next row in the
-current visible order. When the visible set changes (filter edit) and the selected
-connection is no longer visible, selection falls back to the first visible row (or none
-if the visible set is empty). Movement past an end clamps (no wrap).
+The initial selection is the first row in the initial (Peer-ascending) order, or none if
+the capture is empty. Selection is tracked by `ConnId`, not row index, so the highlighted
+connection stays put when a re-sort or filter reorders rows. Movement selects the
+previous/next row in the current visible order. When the visible set changes (filter
+edit) and the selected connection is no longer visible, selection falls back to the first
+visible row (or none if the visible set is empty). Movement past an end clamps (no wrap).
 
 ## 4. Architecture (see ADR-0009)
 
@@ -130,21 +159,29 @@ if the visible set is empty). Movement past an end clamps (no wrap).
 2. `App::new` over a fixture's connections produces one row per connection, each with the
    correct peer string, and the correct service label for known responder ports and a
    blank label for an unknown port. (Unit test.)
-3. Cycling sort with `s` visits `Peer → State → BytesUp → BytesDown → Peer`; the visible
-   order matches the field + direction; ties are ordered by `ConnId`. (Unit test.)
-4. `S` reverses the visible order. (Unit test.)
+3. Cycling sort with `s` visits `Peer → State → BytesUp → BytesDown → Peer`; each `s`
+   resets the new field to its natural default direction (peer/state ascending, byte
+   fields descending); the visible order matches the field + direction; ties are ordered
+   by `ConnId`. (Unit test.)
+4. `S` toggles the current field's direction and reverses the visible order without
+   changing the field. (Unit test.)
 5. Entering `/`, typing a subsequence present in exactly one connection's searchable
    string, narrows `visible()` to that one connection; `Backspace` widens it again;
-   `Esc` clears; `Enter` keeps. (Unit tests.)
+   `Esc` clears; `Enter` keeps. A command character typed in filter-input mode (e.g. `q`,
+   `s`) appends to the query and does **not** fire its navigation command. (Unit tests.)
 6. Selecting a connection, then re-sorting, keeps the same `ConnId` selected. Filtering
    it out falls back to the first visible row. Moving past either end clamps. (Unit
    tests.)
 7. `render` into a `TestBackend` shows the header counts, the column titles, a `▸` on the
-   selected row, the mid-stream marker for an inferred connection, and the footer key
-   hints; in filter mode it shows the `/query` line. (TestBackend snapshot tests.)
+   selected row, the trailing-`~` mid-stream marker for an inferred connection, and the
+   footer key hints; in filter mode it shows the `/query` line. A `TestBackend` shorter
+   than the row count still renders the selected row (scroll-to-selection). (TestBackend
+   snapshot tests.)
 8. Empty capture: `App::new(vec![])` has no rows, `visible()` is empty, `render` shows
    `no connections`, and `handle_key` still quits on `q`. (Unit + render test.)
-9. `q` and `Ctrl-C` both return `Outcome::Quit`. (Unit test.)
+9. In navigation mode, `q` and `Ctrl-C` both return `Outcome::Quit`; in filter-input mode
+   `q` returns `Outcome::Continue` (appended to the query) while `Ctrl-C` still quits.
+   (Unit test.)
 
 ## 6. Failure modes handled
 
