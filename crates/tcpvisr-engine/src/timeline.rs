@@ -4,10 +4,34 @@
 //! `(state, bytes)` as of `T`, via a cross-connection interval index over
 //! `[opened_at, effective_end]` plus a per-connection binary search.
 
-use tcpvisr_core::Nanos;
+use tcpvisr_core::{Nanos, SampleDir};
 
 use crate::conn::{ConnId, Connection};
 use crate::state::ConnState;
+
+/// The kind of a Time/Sequence mark (design §6, ADR-0011 §1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeqKind {
+    /// A data-carrying segment; `retransmit`/`out_of_order` are the M3 classification.
+    Data {
+        retransmit: bool,
+        out_of_order: bool,
+    },
+    /// A SACK block, plotted in the acknowledged direction's sequence space.
+    Sack,
+}
+
+/// One point on a connection's Time/Sequence graph (ADR-0011 §1). `rel` is the wrap-unwrapped
+/// cumulative sequence offset from `dir`'s first-seen data seq (so a multi-GB transfer rises
+/// monotonically instead of folding); `len` is the payload length (0 for a `Sack` mark).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeqSample {
+    pub t: Nanos,
+    pub dir: SampleDir,
+    pub rel: i64,
+    pub len: u32,
+    pub kind: SeqKind,
+}
 
 /// A per-segment lifecycle snapshot: the connection's `(state, cumulative bytes)` at time `t`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,5 +364,23 @@ mod tests {
         assert_eq!(tl.connection_count(), 0);
         assert!(tl.resolve_at(Nanos(0)).is_empty());
         assert_eq!(tl.next_event(Nanos(0)), None);
+    }
+
+    #[test]
+    fn seq_sample_is_copy_and_holds_fields() {
+        let s = SeqSample {
+            t: Nanos(5),
+            dir: SampleDir::OriginToResponder,
+            rel: 42,
+            len: 10,
+            kind: SeqKind::Data {
+                retransmit: true,
+                out_of_order: false,
+            },
+        };
+        let copy = s; // Copy, not move
+        assert_eq!(copy, s);
+        assert_eq!(copy.rel, 42);
+        assert_ne!(SeqKind::Sack, s.kind);
     }
 }
