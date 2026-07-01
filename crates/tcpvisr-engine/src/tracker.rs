@@ -876,6 +876,43 @@ impl Tracker {
             .collect();
         Ok(Timeline::with_seq(series))
     }
+
+    /// The latest observed time (`now`): the max of any segment/tick timestamp seen so far.
+    #[must_use]
+    pub fn now(&self) -> Nanos {
+        self.now
+    }
+
+    /// The live eviction horizon (`now − window`, saturated at 0), or `now` under `FailFast` where
+    /// nothing is evicted.
+    #[must_use]
+    pub fn retention_horizon(&self) -> Nanos {
+        match self.config.retention.window() {
+            Some(w) => Nanos(self.now.0.saturating_sub(w.0)),
+            None => self.now,
+        }
+    }
+
+    /// A non-consuming build of the current live [`Timeline`] from the retained series. Infallible
+    /// under `Evict` (no ceiling); open connections extend to `now`.
+    #[must_use]
+    pub fn snapshot(&self) -> Timeline {
+        let series: Vec<ConnSeries> = self
+            .conns
+            .iter()
+            .map(|c| {
+                (
+                    c.view(),
+                    c.states.iter().copied().collect(),
+                    c.seq.iter().copied().collect(),
+                    c.inflight.iter().copied().collect(),
+                    c.rtt.iter().copied().collect(),
+                    c.throughput.iter().copied().collect(),
+                )
+            })
+            .collect();
+        Timeline::with_seq_ending(series, self.now)
+    }
 }
 
 /// Tracks every connection in `items` and returns the reported connections (test convenience).
@@ -2100,5 +2137,24 @@ mod evict_tests {
             t.next_instance.is_empty(),
             "next_instance pruned too (no unbounded map growth)"
         );
+    }
+
+    #[test]
+    fn snapshot_is_non_consuming_and_open_extends_to_now() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(evict_cfg(10_000_000_000));
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 1_000));
+        t.observe(&tcpvisr_core::Item::Tick(Nanos(9_000)));
+        let snap = t.snapshot();
+        assert_eq!(t.now(), Nanos(9_000));
+        assert_eq!(
+            snap.bounds().1,
+            Nanos(9_000),
+            "open conn interval extends to now"
+        );
+        assert_eq!(t.retention_horizon(), Nanos(0), "now(9_000) - window >= 0");
+        // non-consuming: a second snapshot still works and the tracker keeps ingesting.
+        let _snap2 = t.snapshot();
+        t.observe(&seg(c, s, TcpFlags::ACK, 110, 1, 10, 10_000));
     }
 }
