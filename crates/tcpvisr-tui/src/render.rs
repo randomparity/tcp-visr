@@ -111,7 +111,7 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use tcpvisr_core::{Endpoint, Nanos};
-    use tcpvisr_engine::{ConnId, ConnState, Connection, EndpointPair};
+    use tcpvisr_engine::{ConnId, ConnState, Connection, EndpointPair, StateSample, Timeline};
 
     fn ep(a: u8, port: u16) -> Endpoint {
         Endpoint {
@@ -120,8 +120,12 @@ mod tests {
         }
     }
 
-    fn conn(origin: Endpoint, responder: Endpoint, inferred: bool) -> Connection {
-        Connection {
+    fn entry(
+        origin: Endpoint,
+        responder: Endpoint,
+        inferred: bool,
+    ) -> (Connection, Vec<StateSample>) {
+        let c = Connection {
             id: ConnId {
                 pair: EndpointPair::new(origin, responder),
                 instance: 0,
@@ -135,7 +139,18 @@ mod tests {
             bytes_o2r: 10,
             bytes_r2o: 20,
             segments: 1,
-        }
+        };
+        let s = StateSample {
+            t: Nanos(0),
+            state: ConnState::Established,
+            bytes_o2r: 10,
+            bytes_r2o: 20,
+        };
+        (c, vec![s])
+    }
+
+    fn app_of(entries: Vec<(Connection, Vec<StateSample>)>, title: &str) -> App {
+        App::new(Timeline::new(entries), title.to_string())
     }
 
     fn buffer_string(buf: &Buffer) -> String {
@@ -164,9 +179,9 @@ mod tests {
 
     #[test]
     fn renders_header_columns_selection_and_footer() {
-        let app = App::new(
-            &[conn(ep(1, 5), ep(2, 443), false)],
-            "tcp-visr — c.pcap  (1 connections, skipped 0)".to_string(),
+        let app = app_of(
+            vec![entry(ep(1, 5), ep(2, 443), false)],
+            "tcp-visr — c.pcap  (1 connections, skipped 0)",
         );
         let s = draw(&app, 80, 10);
         assert!(s.contains("tcp-visr — c.pcap"), "{s}");
@@ -180,14 +195,14 @@ mod tests {
 
     #[test]
     fn renders_mid_stream_marker() {
-        let app = App::new(&[conn(ep(1, 5), ep(2, 443), true)], "t".to_string());
+        let app = app_of(vec![entry(ep(1, 5), ep(2, 443), true)], "t");
         let s = draw(&app, 80, 6);
         assert!(s.contains("Established~"), "{s}");
     }
 
     #[test]
     fn filter_mode_shows_query_line() {
-        let mut app = App::new(&[conn(ep(1, 5), ep(2, 443), false)], "t".to_string());
+        let mut app = app_of(vec![entry(ep(1, 5), ep(2, 443), false)], "t");
         handle_key(&mut app, key(KeyCode::Char('/')));
         handle_key(&mut app, key(KeyCode::Char('h')));
         let s = draw(&app, 80, 6);
@@ -196,7 +211,7 @@ mod tests {
 
     #[test]
     fn empty_capture_shows_placeholder() {
-        let app = App::new(&[], "t".to_string());
+        let app = app_of(vec![], "t");
         let s = draw(&app, 40, 6);
         assert!(s.contains("no connections in capture"), "{s}");
     }
@@ -205,10 +220,10 @@ mod tests {
     fn selected_row_visible_when_viewport_shorter_than_list() {
         // 5 connections, height only fits ~1 body row; move to the last and
         // assert its peer still renders (scroll-to-selection).
-        let conns: Vec<_> = (1..=5)
-            .map(|i| conn(ep(1, i), ep(2, 100 + i), false))
+        let entries: Vec<_> = (1..=5)
+            .map(|i| entry(ep(1, i), ep(2, 100 + i), false))
             .collect();
-        let mut app = App::new(&conns, "t".to_string());
+        let mut app = app_of(entries, "t");
         for _ in 0..4 {
             handle_key(&mut app, key(KeyCode::Down));
         }

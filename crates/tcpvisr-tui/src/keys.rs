@@ -53,7 +53,7 @@ mod tests {
     use core::net::{IpAddr, Ipv4Addr};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use tcpvisr_core::{Endpoint, Nanos};
-    use tcpvisr_engine::{ConnId, ConnState, Connection, EndpointPair};
+    use tcpvisr_engine::{ConnId, ConnState, Connection, EndpointPair, StateSample, Timeline};
 
     fn ep(a: u8, port: u16) -> Endpoint {
         Endpoint {
@@ -62,8 +62,8 @@ mod tests {
         }
     }
 
-    fn conn(origin: Endpoint, responder: Endpoint) -> Connection {
-        Connection {
+    fn entry(origin: Endpoint, responder: Endpoint) -> (Connection, Vec<StateSample>) {
+        let c = Connection {
             id: ConnId {
                 pair: EndpointPair::new(origin, responder),
                 instance: 0,
@@ -77,12 +77,22 @@ mod tests {
             bytes_o2r: 0,
             bytes_r2o: 0,
             segments: 1,
-        }
+        };
+        let s = StateSample {
+            t: Nanos(0),
+            state: ConnState::Established,
+            bytes_o2r: 0,
+            bytes_r2o: 0,
+        };
+        (c, vec![s])
     }
 
     fn app() -> App {
         App::new(
-            &[conn(ep(1, 1), ep(2, 22)), conn(ep(1, 2), ep(3, 443))],
+            Timeline::new(vec![
+                entry(ep(1, 1), ep(2, 22)),
+                entry(ep(1, 2), ep(3, 443)),
+            ]),
             "t".to_string(),
         )
     }

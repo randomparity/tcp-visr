@@ -201,25 +201,39 @@ fn run_conns(file: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Streams `file` into the engine (same path as `conns`), then browses the
-/// resulting connections in the interactive TUI. Requires an interactive
-/// terminal; refuses to run when stdout is redirected so it never blocks a pipe.
+/// Parses `file` into a seekable [`tcpvisr_engine::Timeline`] and builds the replay TUI
+/// [`tcpvisr_tui::App`]. No TTY guard, no event loop — this is the testable seam behind
+/// `run_replay` (spec §4, criteria 13–14).
+fn build_replay_app(
+    file: &Path,
+    cfg: EngineConfig,
+) -> Result<tcpvisr_tui::App, Box<dyn std::error::Error>> {
+    let mut tracker = Tracker::new(cfg);
+    let (_link, skipped) =
+        tcpvisr_ingest::parse_file_visit(file, &mut |item| tracker.observe(item))?;
+    let timeline = tracker.into_timeline()?;
+    let title = format!(
+        "tcp-visr — {}  ({} connections, skipped {})",
+        file.display(),
+        timeline.connection_count(),
+        skipped.total(),
+    );
+    Ok(tcpvisr_tui::App::new(timeline, title))
+}
+
+/// Streams `file` into the engine, then browses the resulting connections in the interactive
+/// timeline TUI. Requires an interactive terminal; refuses to run when stdout is redirected so
+/// it never blocks a pipe.
 fn run_replay(file: &Path) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::IsTerminal;
     if !std::io::stdout().is_terminal() {
         return Err("replay requires an interactive terminal (stdout is not a tty)".into());
     }
-    let mut tracker = Tracker::new(EngineConfig::default());
-    let (_link, skipped) =
-        tcpvisr_ingest::parse_file_visit(file, &mut |item| tracker.observe(item))?;
-    let conns = tracker.into_connections();
-    let title = format!(
-        "tcp-visr — {}  ({} connections, skipped {})",
-        file.display(),
-        conns.len(),
-        skipped.total(),
-    );
-    let app = tcpvisr_tui::App::new(&conns, title);
+    let cfg = EngineConfig {
+        collect_state_timeline: true,
+        ..EngineConfig::default()
+    };
+    let app = build_replay_app(file, cfg)?;
     tcpvisr_tui::run(app)?;
     Ok(())
 }

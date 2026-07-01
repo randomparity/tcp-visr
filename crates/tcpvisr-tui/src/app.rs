@@ -1,11 +1,16 @@
-//! Pure master-list state: rows, sort, filter, selection (spec §3, §4; ADR-0009).
+//! Master-list state resolved as of cursor time `T` (spec §3.5; ADR-0009, ADR-0010). Pure: the
+//! row set, each row's state/bytes, sort, filter, and selection are all a function of the
+//! `Timeline` and the `Transport` cursor. No I/O, no clock.
 
-use tcpvisr_core::Endpoint;
-use tcpvisr_engine::{ConnId, ConnState, Connection};
+use std::collections::HashMap;
+
+use tcpvisr_core::{Endpoint, Nanos};
+use tcpvisr_engine::{AsOf, ConnId, ConnState, Timeline};
 
 use crate::service::service_name;
+use crate::transport::Transport;
 
-/// One master-list row: a display projection of a tracked [`Connection`].
+/// One master-list row: a connection projected as of the cursor time.
 #[derive(Debug, Clone)]
 pub struct ConnRow {
     pub id: ConnId,
@@ -15,7 +20,16 @@ pub struct ConnRow {
     pub origin_inferred: bool,
     pub bytes_up: u64,
     pub bytes_down: u64,
-    pub search: String,
+}
+
+/// Time-invariant projection of a connection: everything a row needs that does not depend on
+/// the cursor, plus the lowercased search prefix (origin/responder/service). The state portion
+/// of the searchable text varies with `T` and is appended per frame.
+struct ConnMeta {
+    peer: Endpoint,
+    service: Option<&'static str>,
+    origin_inferred: bool,
+    search_prefix: String,
 }
 
 /// The column the list is ordered by.
@@ -48,10 +62,11 @@ pub enum Outcome {
     Quit,
 }
 
-/// Pure interactive state for the master list. No I/O, no clock.
-#[derive(Debug, Clone)]
+/// Pure interactive state for the timeline master list. No I/O, no clock.
 pub struct App {
-    rows: Vec<ConnRow>,
+    timeline: Timeline,
+    transport: Transport,
+    metas: HashMap<ConnId, ConnMeta>,
     sort_field: SortField,
     sort_dir: SortDir,
     mode: Mode,
@@ -61,12 +76,32 @@ pub struct App {
 }
 
 impl App {
-    /// Builds the app from a capture's connections and a header title string.
+    /// Builds the app from a capture's [`Timeline`] and a header title string.
     #[must_use]
-    pub fn new(conns: &[Connection], title: String) -> Self {
-        let rows: Vec<ConnRow> = conns.iter().map(ConnRow::from_connection).collect();
+    pub fn new(timeline: Timeline, title: String) -> Self {
+        let metas: HashMap<ConnId, ConnMeta> = timeline
+            .connections()
+            .map(|c| {
+                let service = service_name(c.responder.port);
+                let search_prefix =
+                    format!("{} {} {}", c.origin, c.responder, service.unwrap_or(""))
+                        .to_lowercase();
+                (
+                    c.id,
+                    ConnMeta {
+                        peer: c.responder,
+                        service,
+                        origin_inferred: c.origin_inferred,
+                        search_prefix,
+                    },
+                )
+            })
+            .collect();
+        let (start, end) = timeline.bounds();
         let mut app = Self {
-            rows,
+            timeline,
+            transport: Transport::new(start, end),
+            metas,
             sort_field: SortField::Peer,
             sort_dir: SortDir::Asc,
             mode: Mode::Nav,
@@ -78,17 +113,88 @@ impl App {
         app
     }
 
-    /// The filtered + sorted rows, in display order.
+    /// The filtered + sorted rows active at the cursor, in display order.
     #[must_use]
-    pub fn visible(&self) -> Vec<&ConnRow> {
+    pub fn visible(&self) -> Vec<ConnRow> {
+        let t = self.transport.cursor();
         let q = self.query.to_lowercase();
-        let mut rows: Vec<&ConnRow> = self
-            .rows
-            .iter()
-            .filter(|r| is_subsequence(&q, &r.search))
+        let mut rows: Vec<ConnRow> = self
+            .timeline
+            .resolve_at(t)
+            .into_iter()
+            .filter_map(|a| self.row(a, &q))
             .collect();
-        rows.sort_by(|a, b| self.order(a, b));
+        rows.sort_by(|x, y| self.order(x, y));
         rows
+    }
+
+    /// Projects one resolved connection into a row, or `None` if it fails the filter.
+    fn row(&self, a: AsOf, q: &str) -> Option<ConnRow> {
+        let m = self.metas.get(&a.id)?;
+        let search = format!(
+            "{} {}",
+            m.search_prefix,
+            format!("{:?}", a.state).to_lowercase()
+        );
+        if !is_subsequence(q, &search) {
+            return None;
+        }
+        Some(ConnRow {
+            id: a.id,
+            peer: m.peer,
+            service: m.service,
+            state: a.state,
+            origin_inferred: m.origin_inferred,
+            bytes_up: a.bytes_o2r,
+            bytes_down: a.bytes_r2o,
+        })
+    }
+
+    /// Toggles play/pause; reconciles the selection because rewinding can change the row set.
+    pub fn toggle_play(&mut self) {
+        self.transport.toggle_play();
+        self.reconcile_selection();
+    }
+
+    /// Seeks the cursor (forward/back) by a fixed step and reconciles the selection.
+    pub fn seek(&mut self, forward: bool) {
+        self.transport.seek(forward);
+        self.reconcile_selection();
+    }
+
+    /// Steps up the speed ladder (no cursor move).
+    pub fn faster(&mut self) {
+        self.transport.faster();
+    }
+
+    /// Steps down the speed ladder (no cursor move).
+    pub fn slower(&mut self) {
+        self.transport.slower();
+    }
+
+    /// Moves the cursor to the next event time (if any) and reconciles the selection.
+    pub fn step_forward(&mut self) {
+        if let Some(t) = self.timeline.next_event(self.transport.cursor()) {
+            self.transport.set_cursor(t);
+            self.reconcile_selection();
+        }
+    }
+
+    /// Moves the cursor to the previous event time (if any) and reconciles the selection.
+    pub fn step_back(&mut self) {
+        if let Some(t) = self.timeline.prev_event(self.transport.cursor()) {
+            self.transport.set_cursor(t);
+            self.reconcile_selection();
+        }
+    }
+
+    /// Advances playback by a wall-clock delta; reconciles the selection if the cursor moved.
+    pub fn tick(&mut self, dt: Nanos) {
+        let before = self.transport.cursor();
+        self.transport.tick(dt);
+        if self.transport.cursor() != before {
+            self.reconcile_selection();
+        }
     }
 
     /// Advances the sort field (wrapping) and resets it to its natural direction.
@@ -166,8 +272,8 @@ impl App {
         self.selected = Some(visible[next].id);
     }
 
-    /// Ensures the selected id is still visible; otherwise selects the first
-    /// visible row (or `None` if nothing is visible).
+    /// Ensures the selected id is still visible; otherwise selects the first visible row (or
+    /// `None` if nothing is visible).
     fn reconcile_selection(&mut self) {
         let visible = self.visible();
         let still_visible = self
@@ -212,6 +318,36 @@ impl App {
     #[must_use]
     pub fn selected(&self) -> Option<ConnId> {
         self.selected
+    }
+
+    /// The current cursor time.
+    #[must_use]
+    pub fn cursor(&self) -> Nanos {
+        self.transport.cursor()
+    }
+
+    /// The current playback speed multiplier.
+    #[must_use]
+    pub fn speed(&self) -> f64 {
+        self.transport.speed()
+    }
+
+    /// Whether playback is running.
+    #[must_use]
+    pub fn is_playing(&self) -> bool {
+        self.transport.is_playing()
+    }
+
+    /// The capture's `[start, end]` time bounds.
+    #[must_use]
+    pub fn bounds(&self) -> (Nanos, Nanos) {
+        self.transport.bounds()
+    }
+
+    /// Whether the capture has no connections at all (distinct from none active at `T`).
+    #[must_use]
+    pub fn is_capture_empty(&self) -> bool {
+        self.metas.is_empty()
     }
 
     fn order(&self, a: &ConnRow, b: &ConnRow) -> std::cmp::Ordering {
@@ -274,38 +410,12 @@ fn rank(s: ConnState) -> u8 {
     }
 }
 
-impl ConnRow {
-    fn from_connection(c: &Connection) -> Self {
-        let service = service_name(c.responder.port);
-        let search = format!(
-            "{} {} {} {:?}",
-            c.origin,
-            c.responder,
-            service.unwrap_or(""),
-            c.state,
-        )
-        .to_lowercase();
-        Self {
-            id: c.id,
-            peer: c.responder,
-            service,
-            state: c.state,
-            origin_inferred: c.origin_inferred,
-            bytes_up: c.bytes_o2r,
-            bytes_down: c.bytes_r2o,
-            search,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    // Test helpers take `Vec<Connection>` by value for call-site ergonomics.
-    #![allow(clippy::unwrap_used, clippy::needless_pass_by_value)]
+    #![allow(clippy::unwrap_used)]
     use super::*;
     use core::net::{IpAddr, Ipv4Addr};
-    use tcpvisr_core::{Endpoint, Nanos};
-    use tcpvisr_engine::EndpointPair;
+    use tcpvisr_engine::{Connection, EndpointPair, StateSample};
 
     fn ep(a: u8, port: u16) -> Endpoint {
         Endpoint {
@@ -314,33 +424,67 @@ mod tests {
         }
     }
 
-    /// Builds a Connection with the given endpoints/bytes/instance for tests.
-    fn conn(origin: Endpoint, responder: Endpoint, up: u64, down: u64, inst: u32) -> Connection {
+    fn ss(t: u64, state: ConnState, up: u64, down: u64) -> StateSample {
+        StateSample {
+            t: Nanos(t),
+            state,
+            bytes_o2r: up,
+            bytes_r2o: down,
+        }
+    }
+
+    fn full_conn(
+        origin: Endpoint,
+        responder: Endpoint,
+        inst: u32,
+        opened: u64,
+        last: u64,
+        state: ConnState,
+    ) -> Connection {
         Connection {
             id: ConnId {
                 pair: EndpointPair::new(origin, responder),
                 instance: inst,
             },
-            state: ConnState::Established,
+            state,
             origin,
             responder,
             origin_inferred: false,
-            opened_at: Nanos(0),
-            last_at: Nanos(1),
-            bytes_o2r: up,
-            bytes_r2o: down,
+            opened_at: Nanos(opened),
+            last_at: Nanos(last),
+            bytes_o2r: 0,
+            bytes_r2o: 0,
             segments: 1,
         }
     }
 
-    fn app_of(conns: Vec<Connection>) -> App {
-        App::new(&conns, "t".to_string())
+    /// A connection open on `[0, 1]` (Established) with a single sample at `t=0` carrying the
+    /// given up/down bytes — so every such connection is active at the initial cursor (0).
+    fn entry(
+        origin: Endpoint,
+        responder: Endpoint,
+        up: u64,
+        down: u64,
+        inst: u32,
+    ) -> (Connection, Vec<StateSample>) {
+        let c = full_conn(origin, responder, inst, 0, 1, ConnState::Established);
+        (c, vec![ss(0, ConnState::Established, up, down)])
+    }
+
+    fn app_of(entries: Vec<(Connection, Vec<StateSample>)>) -> App {
+        App::new(Timeline::new(entries), "t".to_string())
+    }
+
+    fn id_of(origin: Endpoint, responder: Endpoint, inst: u32) -> ConnId {
+        ConnId {
+            pair: EndpointPair::new(origin, responder),
+            instance: inst,
+        }
     }
 
     #[test]
     fn new_builds_one_row_per_connection_with_service_label() {
-        let c = conn(ep(1, 51324), ep(2, 443), 10, 20, 0);
-        let app = app_of(vec![c]);
+        let app = app_of(vec![entry(ep(1, 51324), ep(2, 443), 10, 20, 0)]);
         let rows = app.visible();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].peer, ep(2, 443));
@@ -351,18 +495,18 @@ mod tests {
 
     #[test]
     fn unknown_responder_port_has_no_service() {
-        let app = app_of(vec![conn(ep(1, 40000), ep(2, 40001), 0, 0, 0)]);
+        let app = app_of(vec![entry(ep(1, 40000), ep(2, 40001), 0, 0, 0)]);
         assert_eq!(app.visible()[0].service, None);
     }
 
     #[test]
     fn initial_selection_is_first_visible_row() {
-        let c1 = conn(ep(1, 1), ep(2, 22), 0, 0, 0); // peer 10.0.0.2:22
-        let c2 = conn(ep(1, 2), ep(3, 22), 0, 0, 0); // peer 10.0.0.3:22
+        let c1 = entry(ep(1, 1), ep(2, 22), 0, 0, 0); // peer 10.0.0.2:22
+        let c2 = entry(ep(1, 2), ep(3, 22), 0, 0, 0); // peer 10.0.0.3:22
         let app = app_of(vec![c2, c1]);
-        // Peer-ascending → 10.0.0.2:22 first.
-        assert_eq!(app.selected(), Some(c1.id));
-        assert_eq!(app.visible()[0].id, c1.id);
+        // Peer-ascending -> 10.0.0.2:22 first.
+        assert_eq!(app.selected(), Some(id_of(ep(1, 1), ep(2, 22), 0)));
+        assert_eq!(app.visible()[0].id, id_of(ep(1, 1), ep(2, 22), 0));
     }
 
     #[test]
@@ -370,11 +514,12 @@ mod tests {
         let app = app_of(vec![]);
         assert!(app.visible().is_empty());
         assert_eq!(app.selected(), None);
+        assert!(app.is_capture_empty());
     }
 
     #[test]
     fn cycle_sort_visits_fields_and_resets_natural_direction() {
-        let mut app = app_of(vec![conn(ep(1, 1), ep(2, 80), 0, 0, 0)]);
+        let mut app = app_of(vec![entry(ep(1, 1), ep(2, 80), 0, 0, 0)]);
         assert_eq!(
             (app.sort_field(), app.sort_dir()),
             (SortField::Peer, SortDir::Asc)
@@ -403,10 +548,10 @@ mod tests {
 
     #[test]
     fn cycle_resets_direction_even_after_toggle() {
-        let mut app = app_of(vec![conn(ep(1, 1), ep(2, 80), 0, 0, 0)]);
+        let mut app = app_of(vec![entry(ep(1, 1), ep(2, 80), 0, 0, 0)]);
         app.toggle_dir(); // Peer now Desc
         assert_eq!(app.sort_dir(), SortDir::Desc);
-        app.cycle_sort(); // → State, reset to natural Asc
+        app.cycle_sort(); // -> State, reset to natural Asc
         assert_eq!(
             (app.sort_field(), app.sort_dir()),
             (SortField::State, SortDir::Asc)
@@ -415,8 +560,8 @@ mod tests {
 
     #[test]
     fn bytes_up_sorts_descending_by_default() {
-        let small = conn(ep(1, 1), ep(2, 80), 5, 0, 0);
-        let big = conn(ep(1, 2), ep(3, 80), 500, 0, 0);
+        let small = entry(ep(1, 1), ep(2, 80), 5, 0, 0);
+        let big = entry(ep(1, 2), ep(3, 80), 500, 0, 0);
         let mut app = app_of(vec![small, big]);
         app.cycle_sort(); // State
         app.cycle_sort(); // BytesUp, Desc
@@ -426,35 +571,41 @@ mod tests {
 
     #[test]
     fn toggle_dir_reverses_without_changing_field() {
-        let a = conn(ep(1, 1), ep(2, 80), 0, 0, 0); // peer 10.0.0.2:80
-        let b = conn(ep(1, 2), ep(3, 80), 0, 0, 0); // peer 10.0.0.3:80
+        let a = entry(ep(1, 1), ep(2, 80), 0, 0, 0); // peer 10.0.0.2:80
+        let b = entry(ep(1, 2), ep(3, 80), 0, 0, 0); // peer 10.0.0.3:80
         let mut app = app_of(vec![a, b]);
-        assert_eq!(app.visible()[0].id, a.id); // Asc
+        assert_eq!(app.visible()[0].id, id_of(ep(1, 1), ep(2, 80), 0)); // Asc
         app.toggle_dir();
         assert_eq!(app.sort_field(), SortField::Peer);
-        assert_eq!(app.visible()[0].id, b.id); // Desc
+        assert_eq!(app.visible()[0].id, id_of(ep(1, 2), ep(3, 80), 0)); // Desc
     }
 
-    // db: responder :5432 → service "postgresql", peer 10.0.0.2 (sorts first)
-    // web: responder :443 → service "https", peer 10.0.0.4
-    fn db_conn() -> Connection {
-        conn(ep(1, 1111), ep(2, 5432), 0, 0, 0)
+    // db: responder :5432 -> service "postgresql", peer 10.0.0.2 (sorts first)
+    // web: responder :443 -> service "https", peer 10.0.0.4
+    fn db_entry() -> (Connection, Vec<StateSample>) {
+        entry(ep(1, 1111), ep(2, 5432), 0, 0, 0)
     }
-    fn web_conn() -> Connection {
-        conn(ep(3, 2222), ep(4, 443), 0, 0, 0)
+    fn web_entry() -> (Connection, Vec<StateSample>) {
+        entry(ep(3, 2222), ep(4, 443), 0, 0, 0)
+    }
+    fn db_id() -> ConnId {
+        id_of(ep(1, 1111), ep(2, 5432), 0)
+    }
+    fn web_id() -> ConnId {
+        id_of(ep(3, 2222), ep(4, 443), 0)
     }
 
     #[test]
     fn filter_narrows_to_one_then_clears() {
-        let mut app = app_of(vec![db_conn(), web_conn()]);
+        let mut app = app_of(vec![db_entry(), web_entry()]);
         app.enter_filter();
         assert_eq!(app.mode(), Mode::Filter);
         for c in "https".chars() {
             app.push_filter(c);
         }
-        // "https" has no 'h' in the db row → web only.
+        // "https" has no 'h' in the db row -> web only.
         let ids: Vec<_> = app.visible().iter().map(|r| r.id).collect();
-        assert_eq!(ids, vec![web_conn().id]);
+        assert_eq!(ids, vec![web_id()]);
         app.pop_filter(); // "http" still matches only the web row
         assert_eq!(app.visible().len(), 1);
         app.cancel_filter();
@@ -465,10 +616,9 @@ mod tests {
 
     #[test]
     fn subsequence_matches_non_adjacent_chars() {
-        let mut app = app_of(vec![web_conn()]); // search contains "https"
+        let mut app = app_of(vec![web_entry()]); // search contains "https"
         app.enter_filter();
         for c in "hts".chars() {
-            // h,t,s appear in order within "https" though not adjacently.
             app.push_filter(c);
         }
         assert_eq!(app.visible().len(), 1);
@@ -476,7 +626,7 @@ mod tests {
 
     #[test]
     fn confirm_keeps_filter_esc_clears_it() {
-        let mut app = app_of(vec![db_conn(), web_conn()]);
+        let mut app = app_of(vec![db_entry(), web_entry()]);
         app.enter_filter();
         for c in "postgres".chars() {
             app.push_filter(c);
@@ -484,26 +634,24 @@ mod tests {
         app.confirm_filter();
         assert_eq!(app.mode(), Mode::Nav);
         assert_eq!(app.query(), "postgres");
-        // The web row has no 'o' after its 'p', so "postgres" → the db row only.
+        // The web row has no 'o' after its 'p', so "postgres" -> the db row only.
         assert_eq!(app.visible().len(), 1);
     }
 
     #[test]
     fn selection_falls_back_to_first_visible_when_filtered_out() {
-        let mut app = app_of(vec![db_conn(), web_conn()]);
-        // db is first (peer 10.0.0.2:5432 < 10.0.0.4:443) → initially selected.
-        assert_eq!(app.selected(), Some(db_conn().id));
+        let mut app = app_of(vec![db_entry(), web_entry()]);
+        assert_eq!(app.selected(), Some(db_id()));
         app.enter_filter();
         for c in "https".chars() {
             app.push_filter(c);
         }
-        // db filtered out → selection falls back to the only visible row (web).
-        assert_eq!(app.selected(), Some(web_conn().id));
+        assert_eq!(app.selected(), Some(web_id()));
     }
 
     #[test]
     fn selection_becomes_none_when_nothing_matches() {
-        let mut app = app_of(vec![db_conn()]);
+        let mut app = app_of(vec![db_entry()]);
         app.enter_filter();
         for c in "zzz".chars() {
             app.push_filter(c);
@@ -514,34 +662,34 @@ mod tests {
 
     #[test]
     fn move_down_and_up_clamp_at_ends() {
-        let a = conn(ep(1, 1), ep(2, 22), 0, 0, 0);
-        let b = conn(ep(1, 2), ep(3, 22), 0, 0, 0);
-        let c = conn(ep(1, 3), ep(4, 22), 0, 0, 0);
+        let a = entry(ep(1, 1), ep(2, 22), 0, 0, 0);
+        let b = entry(ep(1, 2), ep(3, 22), 0, 0, 0);
+        let c = entry(ep(1, 3), ep(4, 22), 0, 0, 0);
         let mut app = app_of(vec![a, b, c]);
-        assert_eq!(app.selected(), Some(a.id)); // first
+        assert_eq!(app.selected(), Some(id_of(ep(1, 1), ep(2, 22), 0))); // first
         app.move_up(); // clamp at top
-        assert_eq!(app.selected(), Some(a.id));
+        assert_eq!(app.selected(), Some(id_of(ep(1, 1), ep(2, 22), 0)));
         app.move_down();
-        assert_eq!(app.selected(), Some(b.id));
+        assert_eq!(app.selected(), Some(id_of(ep(1, 2), ep(3, 22), 0)));
         app.move_down();
-        assert_eq!(app.selected(), Some(c.id));
+        assert_eq!(app.selected(), Some(id_of(ep(1, 3), ep(4, 22), 0)));
         app.move_down(); // clamp at bottom
-        assert_eq!(app.selected(), Some(c.id));
+        assert_eq!(app.selected(), Some(id_of(ep(1, 3), ep(4, 22), 0)));
         app.move_up();
-        assert_eq!(app.selected(), Some(b.id));
+        assert_eq!(app.selected(), Some(id_of(ep(1, 2), ep(3, 22), 0)));
     }
 
     #[test]
     fn resort_keeps_same_conn_selected() {
-        let a = conn(ep(1, 1), ep(2, 22), 10, 0, 0); // peer 10.0.0.2:22, up 10
-        let b = conn(ep(1, 2), ep(3, 22), 20, 0, 0); // peer 10.0.0.3:22, up 20
+        let a = entry(ep(1, 1), ep(2, 22), 10, 0, 0); // peer 10.0.0.2:22, up 10
+        let b = entry(ep(1, 2), ep(3, 22), 20, 0, 0); // peer 10.0.0.3:22, up 20
         let mut app = app_of(vec![a, b]);
         app.move_down(); // select b
-        assert_eq!(app.selected(), Some(b.id));
+        assert_eq!(app.selected(), Some(id_of(ep(1, 2), ep(3, 22), 0)));
         app.cycle_sort(); // State
-        app.cycle_sort(); // BytesUp Desc → order [b(20), a(10)]
-        assert_eq!(app.selected(), Some(b.id)); // still b
-        assert_eq!(app.visible()[0].id, b.id);
+        app.cycle_sort(); // BytesUp Desc -> order [b(20), a(10)]
+        assert_eq!(app.selected(), Some(id_of(ep(1, 2), ep(3, 22), 0))); // still b
+        assert_eq!(app.visible()[0].id, id_of(ep(1, 2), ep(3, 22), 0));
     }
 
     #[test]
@@ -550,5 +698,60 @@ mod tests {
         app.move_down();
         app.move_up();
         assert_eq!(app.selected(), None);
+    }
+
+    #[test]
+    fn master_list_resolves_active_set_and_bytes_as_of_t() {
+        // early opens at 0 with bytes 10, growing to 50 at t=150; late opens at 100.
+        let early = full_conn(ep(1, 1), ep(2, 80), 0, 0, 200, ConnState::Established);
+        let early_s = vec![
+            ss(0, ConnState::Established, 10, 0),
+            ss(150, ConnState::Established, 50, 0),
+        ];
+        let late = full_conn(ep(1, 2), ep(3, 80), 0, 100, 200, ConnState::Established);
+        let late_s = vec![ss(100, ConnState::Established, 5, 0)];
+        let mut app = App::new(
+            Timeline::new(vec![(early, early_s), (late, late_s)]),
+            "t".to_string(),
+        );
+        let early_id = id_of(ep(1, 1), ep(2, 80), 0);
+        // At the initial cursor (start = 0) only the early connection is active.
+        let v0 = app.visible();
+        assert_eq!(v0.len(), 1);
+        assert_eq!(v0[0].id, early_id);
+        assert_eq!(v0[0].bytes_up, 10);
+        // Step to 100: both connections are active.
+        app.step_forward();
+        assert_eq!(app.cursor(), Nanos(100));
+        assert_eq!(app.visible().len(), 2);
+        // Step to 150: the early row's bytes advance to its later sample.
+        app.step_forward();
+        assert_eq!(app.cursor(), Nanos(150));
+        let early_row = app
+            .visible()
+            .into_iter()
+            .find(|r| r.id == early_id)
+            .unwrap();
+        assert_eq!(early_row.bytes_up, 50);
+    }
+
+    #[test]
+    fn selection_reconciles_across_the_cursor() {
+        let early = full_conn(ep(1, 1), ep(2, 80), 0, 0, 200, ConnState::Established);
+        let early_s = vec![ss(0, ConnState::Established, 0, 0)];
+        let late = full_conn(ep(1, 2), ep(3, 80), 0, 100, 200, ConnState::Established);
+        let late_s = vec![ss(100, ConnState::Established, 0, 0)];
+        let mut app = App::new(
+            Timeline::new(vec![(early, early_s), (late, late_s)]),
+            "t".to_string(),
+        );
+        let early_id = id_of(ep(1, 1), ep(2, 80), 0);
+        let late_id = id_of(ep(1, 2), ep(3, 80), 0);
+        app.step_forward(); // cursor 100, both active
+        app.move_down(); // select the late connection (peer 10.0.0.3 sorts after 10.0.0.2)
+        assert_eq!(app.selected(), Some(late_id));
+        app.step_back(); // cursor 0: late not active -> fall back to early
+        assert_eq!(app.cursor(), Nanos(0));
+        assert_eq!(app.selected(), Some(early_id));
     }
 }
