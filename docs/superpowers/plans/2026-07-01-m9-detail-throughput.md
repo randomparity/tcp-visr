@@ -261,16 +261,26 @@ throughput row per column; `None` below minimum. `cargo test -p tcpvisr-tui thro
    `self.timeline.throughput_series(id)`. Import `ThroughputSample`.
 3. Update any `FocusConn` construction in existing tests.
 
+**⚠ Atomic commit boundary — Tasks 6 + 7 land together.** Step 1 adds the `DetailView::Throughput`
+variant. `render.rs::render_detail` matches `app.detail_view()` with arms for
+TimeSequence/InFlight/Rtt and **no wildcard**, so adding the variant makes that match
+non-exhaustive (E0004) and `tcpvisr-tui` will not compile until Task 7 adds the `Throughput` arm.
+Therefore Task 6 and Task 7 are **one green commit**: do them together and measure the acceptance at
+the end of Task 7. (Same class of change as the Tasks 2 + 3 boundary — an added enum variant, like a
+changed tuple signature, is not backward-compatible across a wildcard-free match.)
+
 **Tests (write first):**
 - Extend `tab_cycles_detail_view` to assert the four-way cycle ending back at `TimeSequence`
   (criterion 16).
 - `focus_exposes_throughput_series` mirroring `focus_exposes_rtt_series` (criterion 17, and
   detail-follows-selection is already covered by `detail_follows_selection` once the field exists).
 
-**Acceptance:** `cargo test -p tcpvisr-tui app::` green; the four-way cycle and the exposed series
-verified.
+**Acceptance (measured at the end of Task 7, the joint commit):** the four-way cycle and the exposed
+series verified; `cargo test -p tcpvisr-tui` green (only achievable once Task 7's match arm exists).
 
-**Rollback:** revert `app.rs`.
+**Rollback:** Tasks 6 and 7 revert **together** — reverting `app.rs` alone (removing the variant)
+also requires Task 7's `render.rs` `Throughput` arm to be reverted, else `render.rs` references a
+non-existent variant. Reverting both restores the three-view switcher.
 
 ---
 
@@ -306,10 +316,12 @@ verified.
 - Confirm existing `detail_closed_still_renders_full_master` and the other render tests still pass
   unchanged (criterion 18).
 
-**Acceptance:** `cargo test -p tcpvisr-tui render::` green; the throughput view renders title,
-legend, ms/bits axis, and a plotted goodput glyph; closed render byte-identical.
+**Acceptance (this is the joint Task 6 + 7 commit boundary):** `cargo test -p tcpvisr-tui` green and
+`cargo test --workspace` green (Task 5 already fixed the TUI `with_seq` sites; this restores the
+enum-exhaustive match); the throughput view renders title, legend, bits/sec axis, and a plotted
+goodput glyph; closed render byte-identical.
 
-**Rollback:** revert `render.rs`.
+**Rollback:** revert `render.rs` **and** Task 6's `app.rs` together (see Task 6's atomic-commit note).
 
 ---
 
