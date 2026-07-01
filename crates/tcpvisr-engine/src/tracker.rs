@@ -8,7 +8,7 @@ use crate::config::EngineConfig;
 use crate::conn::{ConnId, Connection, Direction, EndpointPair};
 use crate::metrics::{ConnectionMetrics, MetricError, MetricState, SeriesCollection};
 use crate::state::ConnState;
-use crate::timeline::{SeqKind, SeqSample, StateSample, Timeline};
+use crate::timeline::{ConnSeries, InFlightSample, SeqKind, SeqSample, StateSample, Timeline};
 
 /// `true` when `seq` sits backward of `baseline` in RFC 1982 serial space by more than
 /// `threshold` — a drop to a fresh ISN, not a retransmit/reorder or a forward `u32` wrap.
@@ -103,6 +103,7 @@ struct ConnTrack {
     series: Vec<MetricSample>,
     states: Vec<StateSample>,
     seq: Vec<SeqSample>,
+    inflight: Vec<InFlightSample>,
     unwrap: [SeqUnwrap; 2],
 }
 
@@ -423,6 +424,7 @@ impl Tracker {
             series: Vec::new(),
             states: Vec::new(),
             seq: Vec::new(),
+            inflight: Vec::new(),
             unwrap: [SeqUnwrap::default(); 2],
         };
         let dir = track.direction_of(src);
@@ -495,12 +497,19 @@ impl Tracker {
                 limit: self.config.max_samples,
             });
         }
-        let triples: Vec<(Connection, Vec<StateSample>, Vec<SeqSample>)> = self
+        let series: Vec<ConnSeries> = self
             .conns
             .iter()
-            .map(|c| (c.view(), c.states.clone(), c.seq.clone()))
+            .map(|c| {
+                (
+                    c.view(),
+                    c.states.clone(),
+                    c.seq.clone(),
+                    c.inflight.clone(),
+                )
+            })
             .collect();
-        Ok(Timeline::with_seq(triples))
+        Ok(Timeline::with_seq(series))
     }
 }
 

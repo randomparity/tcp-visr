@@ -52,6 +52,15 @@ pub struct StateSample {
     pub bytes_r2o: u64,
 }
 
+/// A connection paired with its three replay detail series (state, seq, in-flight), as fed to
+/// [`Timeline::with_seq`].
+pub type ConnSeries = (
+    Connection,
+    Vec<StateSample>,
+    Vec<SeqSample>,
+    Vec<InFlightSample>,
+);
+
 /// A connection's resolved state as of a cursor time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AsOf {
@@ -68,6 +77,7 @@ struct Entry {
     conn: Connection,
     samples: Vec<StateSample>,
     seq: Vec<SeqSample>,
+    inflight: Vec<InFlightSample>,
     effective_end: Nanos,
 }
 
@@ -85,31 +95,38 @@ impl Timeline {
     /// preserves the M5 constructor so existing call sites and fixtures are unchanged.
     #[must_use]
     pub fn new(conns: Vec<(Connection, Vec<StateSample>)>) -> Self {
-        Self::with_seq(conns.into_iter().map(|(c, s)| (c, s, Vec::new())).collect())
+        Self::with_seq(
+            conns
+                .into_iter()
+                .map(|(c, s)| (c, s, Vec::new(), Vec::new()))
+                .collect(),
+        )
     }
 
-    /// Builds the timeline from each connection, its `StateSample` series, and its `SeqSample`
-    /// series. Both series are stable-sorted by `t` because capture timestamps are not
-    /// guaranteed monotonic (design §14); `start` is the minimum `StateSample.t` and `end` is
-    /// the maximum `last_at`. A connection whose final state is `Closed`/`Reset` bounds its
-    /// interval at `last_at`; any still-open connection extends to `end`.
+    /// Builds the timeline from each connection, its `StateSample` series, its `SeqSample`
+    /// series, and its `InFlightSample` series. All three series are stable-sorted by `t`
+    /// because capture timestamps are not guaranteed monotonic (design §14); `start` is the
+    /// minimum `StateSample.t` and `end` is the maximum `last_at`. A connection whose final
+    /// state is `Closed`/`Reset` bounds its interval at `last_at`; any still-open connection
+    /// extends to `end`.
     #[must_use]
-    pub fn with_seq(conns: Vec<(Connection, Vec<StateSample>, Vec<SeqSample>)>) -> Self {
+    pub fn with_seq(conns: Vec<ConnSeries>) -> Self {
         let end = conns
             .iter()
-            .map(|(c, _, _)| c.last_at)
+            .map(|(c, _, _, _)| c.last_at)
             .max()
             .unwrap_or(Nanos(0));
         let start = conns
             .iter()
-            .flat_map(|(_, s, _)| s.iter().map(|x| x.t))
+            .flat_map(|(_, s, _, _)| s.iter().map(|x| x.t))
             .min()
             .unwrap_or(Nanos(0));
         let mut entries: Vec<Entry> = Vec::with_capacity(conns.len());
         let mut event_times: Vec<Nanos> = Vec::new();
-        for (conn, mut samples, mut seq) in conns {
+        for (conn, mut samples, mut seq, mut inflight) in conns {
             samples.sort_by_key(|s| s.t);
             seq.sort_by_key(|s| s.t);
+            inflight.sort_by_key(|s| s.t);
             for s in &samples {
                 event_times.push(s.t);
             }
@@ -119,6 +136,7 @@ impl Timeline {
                 conn,
                 samples,
                 seq,
+                inflight,
                 effective_end,
             });
         }
@@ -155,6 +173,16 @@ impl Timeline {
     pub fn seq_series(&self, id: ConnId) -> &[SeqSample] {
         match self.entries.iter().find(|e| e.conn.id == id) {
             Some(e) => &e.seq,
+            None => &[],
+        }
+    }
+
+    /// The focus connection's `InFlightSample` series (`t`-sorted), or an empty slice if `id` is
+    /// unknown or its series was not collected.
+    #[must_use]
+    pub fn inflight_series(&self, id: ConnId) -> &[InFlightSample] {
+        match self.entries.iter().find(|e| e.conn.id == id) {
+            Some(e) => &e.inflight,
             None => &[],
         }
     }
@@ -426,12 +454,49 @@ mod tests {
             c,
             vec![ss(100, ConnState::Established, 0, 0)],
             vec![sq(300, 20, 10), sq(100, 0, 10)], // supplied out of t-order
+            Vec::new(),
         )]);
         let series = tl.seq_series(id);
         assert_eq!(series.len(), 2);
         assert_eq!(series[0].t, Nanos(100), "sorted by t at construction");
         assert_eq!(series[1].t, Nanos(300));
         assert_eq!(tl.x_span(id), Some((Nanos(100), Nanos(300))));
+    }
+
+    fn iff(t: u64, bytes: u64) -> InFlightSample {
+        InFlightSample {
+            t: Nanos(t),
+            dir: SampleDir::OriginToResponder,
+            bytes,
+        }
+    }
+
+    #[test]
+    fn with_seq_carries_inflight_sorted_and_exposes_series() {
+        let c = conn(0, 100, 300, ConnState::Established);
+        let id = c.id;
+        let tl = Timeline::with_seq(vec![(
+            c,
+            vec![ss(100, ConnState::Established, 0, 0)],
+            vec![sq(100, 0, 10)],
+            vec![iff(300, 5), iff(100, 10)], // supplied out of t-order
+        )]);
+        let series = tl.inflight_series(id);
+        assert_eq!(series.len(), 2);
+        assert_eq!(series[0].t, Nanos(100), "sorted by t at construction");
+        assert_eq!(series[1].t, Nanos(300));
+        assert_eq!(series[0].bytes, 10);
+    }
+
+    #[test]
+    fn inflight_series_empty_for_unknown_id() {
+        let c = conn(0, 0, 10, ConnState::Established);
+        let other = ConnId {
+            pair: EndpointPair::new(ep(9, 1), ep(9, 2)),
+            instance: 7,
+        };
+        let tl = Timeline::new(vec![(c, vec![ss(0, ConnState::Established, 0, 0)])]);
+        assert!(tl.inflight_series(other).is_empty());
     }
 
     #[test]

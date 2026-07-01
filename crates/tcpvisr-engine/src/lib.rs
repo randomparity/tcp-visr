@@ -11,5 +11,5 @@ pub use config::EngineConfig;
 pub use conn::{ConnId, Connection, EndpointPair};
 pub use metrics::{ConnectionMetrics, MetricError, SeriesCollection};
 pub use state::ConnState;
-pub use timeline::{AsOf, InFlightSample, SeqKind, SeqSample, StateSample, Timeline};
+pub use timeline::{AsOf, ConnSeries, InFlightSample, SeqKind, SeqSample, StateSample, Timeline};
 pub use tracker::{Tracker, track};
