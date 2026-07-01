@@ -375,6 +375,9 @@ and roadmap ordering already encode those, and duplicate state rots.
 | [0009](../adr/0009-tui-master-list-architecture.md) | TUI master-list architecture: pure `App`/render/key seams, `TestBackend` snapshots | Accepted |
 | [0010](../adr/0010-timeline-transport-as-of-t.md) | Seekable `Timeline` + pure `Transport`; as-of-`T` master list; dedicated `StateSample` series | Accepted |
 | [0011](../adr/0011-detail-seq-timeline-and-rendering.md) | Detail Time/Sequence: dedicated `SeqSample` series + pure character-cell grid rendering | Accepted |
+| [0012](../adr/0012-detail-inflight-and-view-switcher.md) | Detail In-flight: dedicated `InFlightSample` series (both directions), pure projection, `Tab` view-switcher, empty-on-replay kernel-cwnd overlay seam | Accepted |
+| [0013](../adr/0013-detail-rtt.md) | Detail RTT: dedicated `RttSample` series (measured-flow attribution), engine-smoothed SRTT (RFC 6298 EWMA), empty-on-replay kernel-srtt overlay seam | Accepted |
+| [0014](../adr/0014-detail-throughput-goodput.md) | Detail Throughput/goodput: dedicated `ThroughputSample` series (sender-flow attribution), engine-derived goodput over the throughput window, finalized four-view switcher, no kernel overlay | Accepted |
 
 ## 14. Risks
 

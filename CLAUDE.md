@@ -10,21 +10,25 @@ building toward v0.1 (replay-only). The full design is the source of truth:
 [docs/design/tcp-visr-design.md](docs/design/tcp-visr-design.md); cross-cutting decisions are
 [ADRs](docs/adr/) and are authoritative when they disagree with the design doc.
 
-**Current state:** milestones M0–M8 are implemented. Working CLI subcommands are `parse`,
+**Current state:** milestones M0–M9 are implemented. Working CLI subcommands are `parse`,
 `conns`, `metrics`, and `replay` (all replay path only). `replay` opens the interactive TUI
 over a capture with a seekable timeline: play/pause, 0.1–10× speed, seek, and step, with the
 master list resolving each connection's state and bytes "as of" the cursor time via the
 cross-connection interval index (M5). `Enter` opens a per-connection detail pane (`Esc` closes
-it) and `Tab` cycles it through three views: a Time/Sequence (Stevens) graph — a cursor-driven
-seq-vs-time plot with retransmit/SACK marks, from an engine-unwrapped `i64` sequence offset so
-multi-GB transfers do not fold (M6); an In-flight graph — the wire bytes-outstanding
-sawtooth, sampled at both send and ack time, with a typed kernel-cwnd overlay seam that is empty
-on replay and filled by live enrichment later (M7); and an RTT graph — per-ack RTT points plus an
-engine-smoothed SRTT line (RFC 6298 EWMA), each sample attributed to the measured (acked-sender)
-flow, with a typed kernel-srtt overlay seam empty on replay (M8). The remaining detail view —
-throughput/goodput — rounds out the `Tab` view-switcher in M9; `live` and kernel enrichment are
-not built yet; `live` returns "not implemented yet". Do not assume a feature exists because the
-design describes it — check the roadmap (design §10) and the code.
+it) and `Tab` cycles it through the four — now complete — detail views: a Time/Sequence (Stevens)
+graph — a cursor-driven seq-vs-time plot with retransmit/SACK marks, from an engine-unwrapped
+`i64` sequence offset so multi-GB transfers do not fold (M6); an In-flight graph — the wire
+bytes-outstanding sawtooth, sampled at both send and ack time, with a typed kernel-cwnd overlay
+seam that is empty on replay and filled by live enrichment later (M7); an RTT graph — per-ack RTT
+points plus an engine-smoothed SRTT line (RFC 6298 EWMA), each sample attributed to the measured
+(acked-sender) flow, with a typed kernel-srtt overlay seam empty on replay (M8); and a
+Throughput/goodput graph — the trailing-window throughput and the non-retransmitted goodput,
+attributed to the sending flow and sampled in both directions per segment so the rate decays as
+bytes age out of the window (M9). Goodput is engine-derived over the same window as
+`throughput_bps` (which stays frozen for the M3 oracle); this view has no kernel overlay (design
+§10.M12 overlays only M7/M8). `live` and kernel enrichment are not built yet; `live` returns "not
+implemented yet". Do not assume a feature exists because the design describes it — check the
+roadmap (design §10) and the code.
 
 ## Commands
 

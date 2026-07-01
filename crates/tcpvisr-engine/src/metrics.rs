@@ -49,7 +49,9 @@ struct DirState {
     frontier: Option<TcpSeq>,
     last_data_ts: Option<Nanos>,
     pending_rtt: VecDeque<(TcpSeq, Nanos)>,
-    tput: VecDeque<(Nanos, u32)>,
+    /// Trailing throughput window: `(ts, payload_len, retransmit)`. The `retransmit` flag lets the
+    /// same window yield both throughput (all bytes) and goodput (non-retransmitted bytes only).
+    tput: VecDeque<(Nanos, u32, bool)>,
     tput_max_ts: Option<Nanos>,
 }
 
@@ -164,8 +166,12 @@ impl MetricState {
             rtt = oldest.map(|send_ts| Nanos(seg.ts.0.saturating_sub(send_ts.0)));
         }
 
-        // Step 5: throughput (frozen, window-bounded, defensive divide).
-        let throughput_bps = self.throughput(d, seg, cfg);
+        // Step 5: throughput (frozen, window-bounded, defensive divide). The retransmit flag from
+        // Step 2 is folded into the window so goodput can be read from the same state (ADR-0014 §2).
+        self.window_push_and_evict(d, seg, retransmit, cfg);
+        let throughput_bps = self
+            .throughput_at(dir, seg.ts, cfg)
+            .map_or(0, |(total, _good)| total);
 
         MetricSample {
             t: seg.ts,
@@ -193,27 +199,35 @@ impl MetricState {
         })
     }
 
-    fn throughput(&mut self, d: usize, seg: &Segment, cfg: &EngineConfig) -> u64 {
-        let window = cfg.throughput_window.0;
+    /// Pushes this segment's data bytes (with its retransmit classification) into `dir`'s trailing
+    /// throughput window and evicts entries that can never fall in any future window. Data-free
+    /// segments push nothing. Called once per segment from `observe`, for the segment's direction.
+    fn window_push_and_evict(
+        &mut self,
+        d: usize,
+        seg: &Segment,
+        retransmit: bool,
+        cfg: &EngineConfig,
+    ) {
         if seg.payload_len > 0 {
-            self.dir[d].tput.push_back((seg.ts, seg.payload_len));
+            self.dir[d]
+                .tput
+                .push_back((seg.ts, seg.payload_len, retransmit));
             self.dir[d].tput_max_ts = Some(match self.dir[d].tput_max_ts {
                 Some(m) => Nanos(m.0.max(seg.ts.0)),
                 None => seg.ts,
             });
         }
+        let window = cfg.throughput_window.0;
         if window == 0 {
-            return 0;
+            return;
         }
-        // Membership is `ts > t - window`, written as `ts + window > t` to avoid u64 underflow
-        // when the window extends before t=0 (else the first window of a capture drops its bytes).
-        // Use u128 throughout so `ts + window` cannot overflow.
-        let w = u128::from(window);
         // Evict entries that can never fall in any future window: an entry is excludable once
         // `ts + window <= max_ts` (the most permissive future window starts at max_ts - window).
+        let w = u128::from(window);
         if let Some(max_ts) = self.dir[d].tput_max_ts {
             let max = u128::from(max_ts.0);
-            while let Some(&(ts, _)) = self.dir[d].tput.front() {
+            while let Some(&(ts, _, _)) = self.dir[d].tput.front() {
                 if u128::from(ts.0) + w <= max {
                     self.dir[d].tput.pop_front();
                 } else {
@@ -221,21 +235,49 @@ impl MetricState {
                 }
             }
         }
-        // Sum bytes in (seg.ts - window, seg.ts]  ==  ts + window > seg.ts  &&  ts <= seg.ts.
-        let t = u128::from(seg.ts.0);
-        let mut bytes: u128 = 0;
-        for &(ts, len) in &self.dir[d].tput {
+    }
+
+    /// The trailing-window `(throughput_bps, goodput_bps)` for `dir` as of time `t`, or `None` if
+    /// `dir` has never sent a data byte. `throughput` sums every windowed data byte (byte-identical
+    /// to the frozen `MetricSample.throughput_bps`); `goodput` sums only the non-retransmitted ones
+    /// (ADR-0014 §2). Pure read of the window `observe` maintains — used by the M9 collector to
+    /// snapshot both directions per segment. `window == 0` yields `(0, 0)`.
+    pub(crate) fn throughput_at(
+        &self,
+        dir: Direction,
+        t: Nanos,
+        cfg: &EngineConfig,
+    ) -> Option<(u64, u64)> {
+        let d = idx(dir);
+        self.dir[d].tput_max_ts?; // None until this direction has sent data.
+        let window = cfg.throughput_window.0;
+        if window == 0 {
+            return Some((0, 0));
+        }
+        // Membership is `ts > t - window`, written as `ts + window > t` to avoid u64 underflow when
+        // the window extends before t=0. Use u128 throughout so `ts + window` cannot overflow.
+        let w = u128::from(window);
+        let tt = u128::from(t.0);
+        let (mut total, mut good): (u128, u128) = (0, 0);
+        for &(ts, len, retransmit) in &self.dir[d].tput {
             let ts = u128::from(ts.0);
-            if ts + w > t && ts <= t {
-                bytes += u128::from(len);
+            if ts + w > tt && ts <= tt {
+                let bytes = u128::from(len);
+                total += bytes;
+                if !retransmit {
+                    good += bytes;
+                }
             }
         }
-        let bits = bytes.saturating_mul(8).saturating_mul(1_000_000_000);
-        match u64::try_from(bits / w) {
-            Ok(v) => v,
-            Err(_) => u64::MAX,
-        }
+        Some((scale_bps(total, w), scale_bps(good, w)))
     }
+}
+
+/// Scales `bytes` over a window of `w` nanoseconds to bits/second, in `u128` then saturated to
+/// `u64` — the frozen M3 defensive divide.
+fn scale_bps(bytes: u128, w: u128) -> u64 {
+    let bits = bytes.saturating_mul(8).saturating_mul(1_000_000_000);
+    u64::try_from(bits / w).unwrap_or(u64::MAX)
 }
 
 /// Which tracked instances buffer a `MetricSample` series.
@@ -563,6 +605,100 @@ mod derive_tests {
             &c,
         );
         assert_eq!(s2.throughput_bps, 800);
+    }
+
+    #[test]
+    fn goodput_excludes_retransmitted_bytes() {
+        let mut m = MetricState::new();
+        let c = cfg(); // 1s window, 3ms reorder
+        // O2R 100 B new @seq100 t=0 (frontier -> 200).
+        m.observe(
+            &seg(ACK, 100, 1, 100, 0, false),
+            Direction::OriginToResponder,
+            &c,
+        );
+        // O2R retransmit of seq100 @t=4ms (behind frontier, gap 4ms >= 3ms reorder -> retransmit).
+        let s = m.observe(
+            &seg(ACK, 100, 1, 100, 4_000_000, false),
+            Direction::OriginToResponder,
+            &c,
+        );
+        assert!(
+            s.retransmit,
+            "behind-frontier resend after a >= 3ms gap is a retransmit"
+        );
+        // Both 100 B entries are in the 1s window ending at 4ms.
+        let (tp, gp) = m
+            .throughput_at(Direction::OriginToResponder, Nanos(4_000_000), &c)
+            .expect("O2R has sent data");
+        assert_eq!(
+            tp, 1_600,
+            "throughput counts the new and the retransmitted 100 B"
+        );
+        assert_eq!(gp, 800, "goodput counts only the non-retransmitted 100 B");
+        // The sample's throughput_bps still equals the total (frozen M3 value).
+        assert_eq!(s.throughput_bps, 1_600);
+    }
+
+    #[test]
+    fn goodput_equals_throughput_on_a_loss_free_flow() {
+        let mut m = MetricState::new();
+        let c = cfg();
+        m.observe(
+            &seg(ACK, 0, 1, 100, 0, false),
+            Direction::OriginToResponder,
+            &c,
+        );
+        let (tp, gp) = m
+            .throughput_at(Direction::OriginToResponder, Nanos(0), &c)
+            .expect("data");
+        assert_eq!((tp, gp), (800, 800));
+    }
+
+    #[test]
+    fn throughput_at_is_none_for_a_direction_that_never_sent_data() {
+        let mut m = MetricState::new();
+        let c = cfg();
+        // Only O2R sends data; R2O sends a pure ACK (no payload).
+        m.observe(
+            &seg(ACK, 100, 1, 100, 0, false),
+            Direction::OriginToResponder,
+            &c,
+        );
+        m.observe(
+            &seg(ACK, 1, 200, 0, 1_000, false),
+            Direction::ResponderToOrigin,
+            &c,
+        );
+        assert!(
+            m.throughput_at(Direction::ResponderToOrigin, Nanos(1_000), &c)
+                .is_none(),
+            "a direction that only ACKs has no throughput sample"
+        );
+        assert!(
+            m.throughput_at(Direction::OriginToResponder, Nanos(0), &c)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn throughput_at_decays_as_bytes_age_out_of_the_window() {
+        let mut m = MetricState::new();
+        let c = cfg(); // 1s window
+        m.observe(
+            &seg(ACK, 0, 1, 100, 0, false),
+            Direction::OriginToResponder,
+            &c,
+        );
+        // Read the O2R rate at a later time WITHOUT another O2R send (the reverse-ACK snapshot).
+        let inside = m
+            .throughput_at(Direction::OriginToResponder, Nanos(500_000_000), &c)
+            .expect("data");
+        assert_eq!(inside.0, 800, "within the window the 100 B still counts");
+        let past = m
+            .throughput_at(Direction::OriginToResponder, Nanos(1_500_000_000), &c)
+            .expect("data (still Some: O2R has sent)");
+        assert_eq!(past, (0, 0), "past the window every byte has aged out");
     }
 
     #[test]

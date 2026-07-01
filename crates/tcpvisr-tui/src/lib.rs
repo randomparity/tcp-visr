@@ -8,6 +8,7 @@ pub mod render;
 pub mod rtt;
 pub mod run;
 pub mod service;
+pub mod throughput;
 pub mod transport;
 
 pub use app::{App, ConnRow, DetailView, Mode, Outcome, SortDir, SortField};
@@ -17,4 +18,5 @@ pub use render::render;
 pub use rtt::{RttPlot, Series as RttSeries};
 pub use run::run;
 pub use service::service_name;
+pub use throughput::{Series as ThroughputSeries, ThroughputPlot};
 pub use transport::Transport;

@@ -11,6 +11,7 @@ use crate::app::{App, DetailView, FocusConn, Mode, SortDir, SortField};
 use crate::detail::{self, Mark, SeqPlot};
 use crate::inflight::{self, InFlightPlot, Mark as InFlightMark, Series};
 use crate::rtt::{self, Mark as RttMark, RttPlot, Series as RttSeries};
+use crate::throughput::{self, Mark as ThroughputMark, Series as ThroughputSeries, ThroughputPlot};
 
 /// Columns reserved on the left of the detail pane for Y-axis (sequence) labels.
 const GUTTER: u16 = 8;
@@ -116,6 +117,7 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect) {
         DetailView::TimeSequence => render_seq_body(frame, app, inner, &focus),
         DetailView::InFlight => render_inflight_body(frame, app, inner, &focus),
         DetailView::Rtt => render_rtt_body(frame, app, inner, &focus),
+        DetailView::Throughput => render_throughput_body(frame, app, inner, &focus),
     }
 }
 
@@ -321,6 +323,107 @@ fn draw_rtt_axes(frame: &mut Frame, inner: Rect, gutter: u16, plot: &RttPlot) {
     buf.set_string(end_x, label_row, end_label, Style::default());
 }
 
+/// Draws the Throughput/goodput graph (windowed total + goodput rates) into the reserved pane
+/// interior (M9). There is no kernel overlay (design §10.M12 overlays only M7/M8; ADR-0014 §4).
+fn render_throughput_body(frame: &mut Frame, app: &App, inner: Rect, focus: &FocusConn<'_>) {
+    let plot_w = inner.width - GUTTER;
+    let plot_h = inner.height - 2; // legend + time labels
+    let Some(plot) = throughput::project(
+        focus.throughput,
+        focus.focus_dir,
+        focus.x_span,
+        app.cursor(),
+        plot_w,
+        plot_h,
+    ) else {
+        frame.render_widget(Paragraph::new("widen terminal to view graph"), inner);
+        return;
+    };
+    let (unit, div) = rate_unit(plot.max_rate);
+    draw_throughput_legend(frame, inner, unit);
+    draw_throughput_plot(frame, inner, GUTTER, &plot);
+    draw_throughput_axes(frame, inner, GUTTER, &plot, div);
+}
+
+fn draw_throughput_legend(frame: &mut Frame, inner: Rect, unit: &str) {
+    let legend = format!(
+        "Throughput [{unit}]  {} total  {} goodput",
+        throughput::THROUGHPUT_GLYPH,
+        throughput::GOODPUT_GLYPH
+    );
+    let row = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: 1,
+    };
+    frame.render_widget(Paragraph::new(legend), row);
+}
+
+fn draw_throughput_plot(frame: &mut Frame, inner: Rect, gutter: u16, plot: &ThroughputPlot) {
+    let buf = frame.buffer_mut();
+    let x0 = inner.x + gutter;
+    let y_top = inner.y + 1; // below the legend row
+    for &ThroughputMark {
+        col,
+        row,
+        glyph,
+        series,
+    } in &plot.marks
+    {
+        let screen_row = plot.height - 1 - row; // bottom-origin row -> screen line
+        let x = x0 + col;
+        let y = y_top + screen_row;
+        let color = match series {
+            ThroughputSeries::Goodput => Color::Green,
+            ThroughputSeries::Throughput => Color::Reset,
+        };
+        buf.set_string(x, y, glyph.to_string(), Style::default().fg(color));
+    }
+}
+
+fn draw_throughput_axes(
+    frame: &mut Frame,
+    inner: Rect,
+    gutter: u16,
+    plot: &ThroughputPlot,
+    div: u64,
+) {
+    let buf = frame.buffer_mut();
+    let y_top = inner.y + 1;
+    // Y labels: max_rate at the top, 0 at the bottom, scaled to the legend's unit (via `div`) so
+    // even a Mbps/Gbps label stays inside the gutter and never overwrites plot columns.
+    buf.set_string(
+        inner.x,
+        y_top,
+        format!("{:>7}", fmt_rate_scaled(plot.max_rate, div)),
+        Style::default(),
+    );
+    let y_bottom = y_top + plot.height - 1;
+    buf.set_string(
+        inner.x,
+        y_bottom,
+        format!("{:>7}", fmt_rate_scaled(0, div)),
+        Style::default(),
+    );
+    // X labels: start / end seconds on the bottom label row.
+    let label_row = inner.y + inner.height - 1;
+    let start = fmt_seconds(plot.x_span.0);
+    let end = fmt_seconds(plot.x_span.1);
+    buf.set_string(
+        inner.x + gutter,
+        label_row,
+        format!("{start}s"),
+        Style::default(),
+    );
+    let end_label = format!("{end}s");
+    let end_x = inner
+        .x
+        .saturating_add(inner.width)
+        .saturating_sub(u16::try_from(end_label.len()).unwrap_or(0));
+    buf.set_string(end_x, label_row, end_label, Style::default());
+}
+
 fn draw_legend(frame: &mut Frame, inner: Rect) {
     let legend = format!(
         "Time/Sequence   {} retrans  {} sack",
@@ -454,6 +557,34 @@ fn fmt_rtt(t: Nanos) -> String {
     format!("{n}ns")
 }
 
+/// Picks the adaptive bits/second axis unit (bps/kbps/Mbps/Gbps) and its divisor for a given
+/// `max_rate`, so both tick labels scale to one unit shown once in the legend. Choosing the unit
+/// from `max_rate` keeps every scaled label's whole part < 1000 (so the label fits the gutter).
+fn rate_unit(max_rate: u64) -> (&'static str, u64) {
+    const UNITS: [(u64, &str); 3] = [
+        (1_000_000_000, "Gbps"),
+        (1_000_000, "Mbps"),
+        (1_000, "kbps"),
+    ];
+    for (div, unit) in UNITS {
+        if max_rate >= div {
+            return (unit, div);
+        }
+    }
+    ("bps", 1)
+}
+
+/// Formats a bits/second rate scaled to `div` (from [`rate_unit`]) as a compact, unit-less label
+/// that fits the detail-pane gutter: `<whole>.<3-frac>` for a scaled unit, or a bare integer for
+/// bps. Integer-only (deterministic snapshots). Keeps a Mbps/Gbps `max_rate` from overflowing the
+/// gutter into the plot, like `fmt_seq` does for the bytes axis.
+fn fmt_rate_scaled(bps: u64, div: u64) -> String {
+    if div <= 1 {
+        return bps.to_string();
+    }
+    format!("{}.{:03}", bps / div, (bps % div) * 1000 / div)
+}
+
 fn sort_label(field: SortField) -> &'static str {
     match field {
         SortField::Peer => "peer",
@@ -466,7 +597,7 @@ fn sort_label(field: SortField) -> &'static str {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
-    use super::{fmt_rtt, render};
+    use super::{fmt_rate_scaled, fmt_rtt, rate_unit, render};
     use crate::app::App;
     use crate::handle_key;
     use core::net::{IpAddr, Ipv4Addr};
@@ -714,6 +845,7 @@ mod tests {
             vec![sq],
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         )]);
         let mut app = App::new(tl, "t".to_string());
         app.open_detail();
@@ -749,6 +881,7 @@ mod tests {
             vec![],
             inflight,
             Vec::new(),
+            Vec::new(),
         )]);
         let mut app = App::new(tl, "t".to_string());
         app.open_detail();
@@ -780,7 +913,7 @@ mod tests {
             rtt: Nanos(3_000_000),
             srtt: Nanos(1_500_000),
         }];
-        let tl = Timeline::with_seq(vec![(c2, vec![ss(0, 100, 0)], vec![], vec![], rtt)]);
+        let tl = Timeline::with_seq(vec![(c2, vec![ss(0, 100, 0)], vec![], vec![], rtt, vec![])]);
         let mut app = App::new(tl, "t".to_string());
         app.open_detail();
         app.cycle_detail_view(); // -> InFlight
@@ -806,6 +939,119 @@ mod tests {
         assert_eq!(fmt_rtt(Nanos(2_000_000_000)), "2.000s");
     }
 
+    // Criterion 15a: the axis unit adapts to the rate magnitude (so a slow flow is not forced onto a
+    // Mbps scale that reads 0.000), and the tick label scales to that unit.
+    #[test]
+    fn rate_unit_adapts_and_scales() {
+        assert_eq!(rate_unit(800), ("bps", 1));
+        assert_eq!(rate_unit(12_000), ("kbps", 1_000));
+        assert_eq!(rate_unit(3_000_000), ("Mbps", 1_000_000));
+        assert_eq!(rate_unit(2_000_000_000), ("Gbps", 1_000_000_000));
+        assert_eq!(fmt_rate_scaled(800, 1), "800");
+        assert_eq!(fmt_rate_scaled(1_500_000, 1_000_000), "1.500");
+        assert_eq!(fmt_rate_scaled(500_000_000, 1_000_000), "500.000");
+    }
+
+    // The scaled Y label fits the 8-column gutter (<= 7 chars) at every realistic rate, so it never
+    // overwrites plot columns — the rate-axis analogue of `large_seq_axis_label_is_abbreviated_not_raw`.
+    #[test]
+    fn rate_axis_label_fits_gutter() {
+        for &bps in &[
+            0u64,
+            800,
+            12_000,
+            3_000_000,
+            500_000_000,
+            999_000_000,
+            1_500_000_000,
+            999_000_000_000,
+        ] {
+            let (_unit, div) = rate_unit(bps);
+            let label = fmt_rate_scaled(bps, div);
+            assert!(
+                label.len() <= 7,
+                "{bps} -> {label:?} ({} chars) overflows the gutter",
+                label.len()
+            );
+        }
+    }
+
+    // Criterion 19: the Throughput view renders title, legend, an axis label, a bits/sec unit, and a
+    // plotted goodput glyph. The goodput glyph '#' appears once in the legend ('# goodput'), so
+    // require at least TWO '#' — the extra one is the plotted goodput mark. The '.' total glyph is
+    // not usable as evidence (it appears in the time labels and fmt_rate output).
+    #[test]
+    fn throughput_view_open_shows_graph() {
+        let c = conn_span(ep(1, 5), ep(2, 443), 0, 1_000, ConnState::Established);
+        let mut c2 = c;
+        c2.bytes_o2r = 100;
+        // One sample at t=0 (revealed at the initial cursor = 0) with goodput < throughput so the
+        // goodput mark plots below the total. max_rate = 3 Mbps.
+        let throughput = vec![tcpvisr_engine::ThroughputSample {
+            t: Nanos(0),
+            dir: tcpvisr_core::SampleDir::OriginToResponder,
+            throughput_bps: 3_000_000,
+            goodput_bps: 1_500_000,
+        }];
+        let tl = Timeline::with_seq(vec![(
+            c2,
+            vec![ss(0, 100, 0)],
+            vec![],
+            vec![],
+            vec![],
+            throughput,
+        )]);
+        let mut app = App::new(tl, "t".to_string());
+        app.open_detail();
+        app.cycle_detail_view(); // -> InFlight
+        app.cycle_detail_view(); // -> Rtt
+        app.cycle_detail_view(); // -> Throughput
+        let s = draw(&app, 120, 14);
+        assert!(s.contains("DETAIL"), "detail title: {s}");
+        assert!(s.contains("Throughput"), "throughput legend: {s}");
+        assert!(s.contains("0.000s"), "an axis time label: {s}");
+        assert!(
+            s.contains("Mbps"),
+            "bits/sec axis unit (max_rate = 3.000Mbps): {s}"
+        );
+        let hashes = s.matches('#').count();
+        assert!(
+            hashes >= 2,
+            "at least one plotted goodput glyph beyond the legend: {hashes} in {s}"
+        );
+    }
+
+    #[test]
+    fn throughput_view_too_narrow_shows_widen_message() {
+        let c = conn_span(ep(1, 5), ep(2, 443), 0, 1_000, ConnState::Established);
+        let mut c2 = c;
+        c2.bytes_o2r = 100;
+        let throughput = vec![tcpvisr_engine::ThroughputSample {
+            t: Nanos(0),
+            dir: tcpvisr_core::SampleDir::OriginToResponder,
+            throughput_bps: 800,
+            goodput_bps: 800,
+        }];
+        let tl = Timeline::with_seq(vec![(
+            c2,
+            vec![ss(0, 100, 0)],
+            vec![],
+            vec![],
+            vec![],
+            throughput,
+        )]);
+        let mut app = App::new(tl, "t".to_string());
+        app.open_detail();
+        app.cycle_detail_view(); // InFlight
+        app.cycle_detail_view(); // Rtt
+        app.cycle_detail_view(); // Throughput
+        let s = draw(&app, 34, 12); // right pane inner plot < MIN_W after the gutter
+        assert!(
+            s.contains("widen terminal"),
+            "narrow throughput guidance: {s}"
+        );
+    }
+
     #[test]
     fn inflight_view_too_narrow_shows_widen_message() {
         let c = conn_span(ep(1, 5), ep(2, 443), 0, 1_000, ConnState::Established);
@@ -821,6 +1067,7 @@ mod tests {
             vec![ss(0, 100, 0)],
             vec![],
             inflight,
+            Vec::new(),
             Vec::new(),
         )]);
         let mut app = App::new(tl, "t".to_string());
@@ -854,6 +1101,7 @@ mod tests {
             vec![sq],
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         )]);
         let mut app = App::new(tl, "t".to_string());
         app.open_detail();
@@ -885,6 +1133,7 @@ mod tests {
             c2,
             vec![ss(0, 5_000_000_000, 0)],
             vec![d(0, 0), d(1_000, 5_000_000_000)],
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         )]);
