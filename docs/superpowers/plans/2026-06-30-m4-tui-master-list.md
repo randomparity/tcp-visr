@@ -194,7 +194,10 @@ tcpvisr-core = { path = "../tcpvisr-core" }
 tcpvisr-engine = { path = "../tcpvisr-engine" }
 ```
 
-Run `cargo build -p tcpvisr-tui` once to fetch ratatui, then `cargo deny check`. If `cargo deny check` reports a license not in `deny.toml`'s `allow` list, add the exact SPDX id it names (e.g. a `Zlib`/`BSD-3-Clause` transitive dep) to the `allow` array in `deny.toml`. Only add ids `cargo deny` actually flags.
+Run `cargo build -p tcpvisr-tui` once to fetch ratatui, then `cargo deny check`. Handle its three gates:
+- **licenses:** if it reports a license not in `deny.toml`'s `allow` list, add the exact SPDX id it names (e.g. a `Zlib`/`BSD-3-Clause` transitive dep) to the `allow` array. Only add ids `cargo deny` actually flags.
+- **advisories:** if it reports a `RUSTSEC` advisory against a ratatui transitive dep, **stop and surface it** — a real advisory is a blocker to report, not something to silence.
+- **bans:** a duplicate-version warning is acceptable unless `deny.toml` sets `multiple-versions = "deny"`; do not add a ban skip without cause. Do not weaken any deny gate to make the build pass.
 
 - [ ] **Step 2: Write the failing test**
 
@@ -455,10 +458,15 @@ pub use app::{App, ConnRow, Mode, Outcome, SortDir, SortField};
 
 Note: `Connection`, `ConnId`, `EndpointPair`, `Nanos` must be constructible in tests — they are (`Connection` fields are all `pub`; `EndpointPair::new` is public). If `Connection` is not `Clone`, drop the `.clone()` calls and rebuild via `conn(...)`. (It is `Clone + Copy`.)
 
-- [ ] **Step 3: Run test to verify it fails/passes incrementally**
+- [ ] **Step 3: Run the tests**
 
 Run: `cargo test -p tcpvisr-tui app::`
-Expected: PASS — the skeleton already implements `new`/`visible`. (If it fails to compile, fix field/type mismatches against the engine before proceeding.)
+Expected: PASS. This is a **scaffolding task**: `App::new`/`visible()` are the
+foundational data projection, so implementation and its assertion tests land together
+and there is no separate red phase. Behavioral red→green coverage comes from the later
+sort/filter/selection tasks (Tasks 3–5), which each write a failing test against the
+missing method first. (If this task fails to compile, fix field/type mismatches against
+the engine before proceeding.)
 
 - [ ] **Step 4: Guardrails**
 
@@ -597,25 +605,41 @@ git commit -m "feat(tui): add sort field cycling and direction toggle"
 **Interfaces:**
 - Produces on `App`: `pub fn enter_filter(&mut self)`, `pub fn push_filter(&mut self, c: char)`, `pub fn pop_filter(&mut self)`, `pub fn confirm_filter(&mut self)`, `pub fn cancel_filter(&mut self)`. `visible()` now filters rows whose `search` contains the lowercased `query` as a subsequence, then sorts. Selection is reconciled to stay visible (falls back to first visible / `None`).
 
+**Note on test data — subsequence matching is permissive.** The composite search
+string includes the lowercased state, and `is_subsequence` matches non-adjacent
+characters. Since almost every fixture connection is `Established`, short queries can
+accidentally be subsequences of the shared word `established` (e.g. `ssh` ⊆
+`e-s-tabli-s-h-ed`). These tests therefore filter on **service labels that share no
+subsequence with `established`** — `postgresql` vs `https` — so each query narrows to
+exactly one row deterministically. `https` has no `p`/`o`/`g` and `postgres` has no
+`h`, so neither is a subsequence of the other row's string.
+
 - [ ] **Step 1: Write the failing test**
 
 Add to `tests`:
 
 ```rust
+    // db: responder :5432 → service "postgresql", peer 10.0.0.2 (sorts first)
+    // web: responder :443 → service "https", peer 10.0.0.4
+    fn db_conn() -> Connection {
+        conn(ep(1, 1111), ep(2, 5432), 0, 0, 0)
+    }
+    fn web_conn() -> Connection {
+        conn(ep(3, 2222), ep(4, 443), 0, 0, 0)
+    }
+
     #[test]
-    fn filter_narrows_by_subsequence_and_widens_on_backspace() {
-        let ssh = conn(ep(1, 1), ep(2, 22), 0, 0, 0);
-        let web = conn(ep(1, 2), ep(3, 443), 0, 0, 0);
-        let mut app = app_of(vec![ssh.clone(), web.clone()]);
+    fn filter_narrows_to_one_then_clears() {
+        let mut app = app_of(vec![db_conn(), web_conn()]);
         app.enter_filter();
         assert_eq!(app.mode(), Mode::Filter);
-        for c in "ssh".chars() {
+        for c in "https".chars() {
             app.push_filter(c);
         }
+        // "https" has no 'p'/'o'/'g'/'t'-'t' chain in the db row → web only.
         let ids: Vec<_> = app.visible().iter().map(|r| r.id).collect();
-        assert_eq!(ids, vec![ssh.id]);
-        app.pop_filter(); // "ss"
-        // "ss" is still only a subsequence of the ssh row's search string.
+        assert_eq!(ids, vec![web_conn().id]);
+        app.pop_filter(); // "http" still matches only the web row
         assert_eq!(app.visible().len(), 1);
         app.cancel_filter();
         assert_eq!(app.mode(), Mode::Nav);
@@ -625,10 +649,10 @@ Add to `tests`:
 
     #[test]
     fn subsequence_matches_non_adjacent_chars() {
-        let web = conn(ep(1, 2), ep(3, 443), 0, 0, 0); // search contains "https"
-        let mut app = app_of(vec![web.clone()]);
+        let mut app = app_of(vec![web_conn()]); // search contains "https"
         app.enter_filter();
         for c in "hts".chars() {
+            // h,t,s appear in order within "https" though not adjacently.
             app.push_filter(c);
         }
         assert_eq!(app.visible().len(), 1);
@@ -636,38 +660,34 @@ Add to `tests`:
 
     #[test]
     fn confirm_keeps_filter_esc_clears_it() {
-        let ssh = conn(ep(1, 1), ep(2, 22), 0, 0, 0);
-        let web = conn(ep(1, 2), ep(3, 443), 0, 0, 0);
-        let mut app = app_of(vec![ssh, web]);
+        let mut app = app_of(vec![db_conn(), web_conn()]);
         app.enter_filter();
-        for c in "ssh".chars() {
+        for c in "postgres".chars() {
             app.push_filter(c);
         }
         app.confirm_filter();
         assert_eq!(app.mode(), Mode::Nav);
-        assert_eq!(app.query(), "ssh");
+        assert_eq!(app.query(), "postgres");
+        // "postgres" has no 'h' → the db (postgresql) row only.
         assert_eq!(app.visible().len(), 1);
     }
 
     #[test]
     fn selection_falls_back_to_first_visible_when_filtered_out() {
-        let ssh = conn(ep(1, 1), ep(2, 22), 0, 0, 0);
-        let web = conn(ep(1, 2), ep(3, 443), 0, 0, 0);
-        let mut app = app_of(vec![ssh.clone(), web.clone()]);
-        // select the ssh row (it is first, peer 10.0.0.2:22 < 10.0.0.3:443)
-        assert_eq!(app.selected(), Some(ssh.id));
+        let mut app = app_of(vec![db_conn(), web_conn()]);
+        // db is first (peer 10.0.0.2:5432 < 10.0.0.4:443) → initially selected.
+        assert_eq!(app.selected(), Some(db_conn().id));
         app.enter_filter();
         for c in "https".chars() {
             app.push_filter(c);
         }
-        // ssh filtered out → selection falls back to the only visible row (web)
-        assert_eq!(app.selected(), Some(web.id));
+        // db filtered out → selection falls back to the only visible row (web).
+        assert_eq!(app.selected(), Some(web_conn().id));
     }
 
     #[test]
     fn selection_becomes_none_when_nothing_matches() {
-        let ssh = conn(ep(1, 1), ep(2, 22), 0, 0, 0);
-        let mut app = app_of(vec![ssh]);
+        let mut app = app_of(vec![db_conn()]);
         app.enter_filter();
         for c in "zzz".chars() {
             app.push_filter(c);
@@ -1438,9 +1458,10 @@ fn replay_without_tty_exits_nonzero_with_actionable_message() {
 }
 
 #[test]
-fn replay_missing_file_reports_opening_capture() {
-    // A missing file must fail before the tty check would matter; either way it
-    // must not say "not implemented".
+fn replay_no_longer_reports_not_implemented() {
+    // Under the harness's piped stdout the tty guard fires first, so this does not
+    // exercise the ingest path (that is covered by conns/parse tests); it only
+    // asserts `replay` is now wired and no longer stubbed as "not implemented".
     let out = bin()
         .args(["replay", "/no/such/file.pcap"])
         .output()
