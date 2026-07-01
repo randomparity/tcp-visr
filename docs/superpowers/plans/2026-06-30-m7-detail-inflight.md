@@ -315,20 +315,26 @@ Expected: compile error — `with_seq` takes 3-tuples, no `inflight_series`.
   }
   ```
 
-- [ ] **Step 4: Run to verify pass**
+- [ ] **Step 4: Patch EVERY existing `with_seq` call site in the workspace (4 test sites)**
 
-Run: `cargo test -p tcpvisr-engine 2>&1 | tail -20`
-Expected: PASS (all engine tests, including the existing M6 `with_seq` test which now needs the 4th tuple element — see Step 4b).
+Changing `with_seq` to the 4-tuple breaks all existing 3-tuple callers. `Timeline::new` (production) and `Tracker::into_timeline` (production) are updated in this task and Task 4; the **test** call sites must each gain a trailing empty inflight vector. There are **four**, not one — verify with `rg -n "with_seq\(vec!\[" crates`:
+- `crates/tcpvisr-engine/src/timeline.rs:412` — `with_seq_sorts_and_exposes_series_and_x_span`: its single tuple `(c, vec![...], vec![sq(300,20,10), sq(100,0,10)])` → append `, Vec::new()`.
+- `crates/tcpvisr-tui/src/render.rs:505` — `detail_open_shows_title_legend_and_a_mark`: `(c2, vec![ss(0,100,0)], vec![sq])` → append `, Vec::new()`.
+- `crates/tcpvisr-tui/src/render.rs:532` — `detail_pane_too_narrow_shows_widen_message`: `(c2, vec![ss(0,100,0)], vec![sq])` → append `, Vec::new()`.
+- `crates/tcpvisr-tui/src/render.rs:559` — `large_seq_axis_label_is_abbreviated_not_raw`: the multi-line tuple `(c2, vec![ss(0,5_000_000_000,0)], vec![d(0,0), d(1_000,5_000_000_000)])` → append `, Vec::new()` before the closing `)`.
 
-- [ ] **Step 4b: Fix the one existing `with_seq` call site in `timeline.rs` tests**
+These are mechanical (empty inflight vector; the M6 tests' behavior is unchanged) and confined to test code.
 
-The M6 test `with_seq_sorts_and_exposes_series_and_x_span` calls `with_seq` with a 3-tuple. Add a trailing `Vec::new()` (empty inflight) to its single tuple so it compiles. Re-run Step 4.
+- [ ] **Step 5: Run to verify pass (whole workspace — the tui crate's tests call `with_seq` too)**
 
-- [ ] **Step 5: Guardrails + commit**
+Run: `cargo test --workspace 2>&1 | tail -25`
+Expected: PASS — the engine tests (incl. the new Task 3 tests) AND the tcpvisr-tui render tests, which only compile once all four Step 4 sites are patched. If the tui crate fails to compile, a `with_seq` call site was missed — re-check `rg -n "with_seq\(vec!\[" crates`.
+
+- [ ] **Step 6: Guardrails + commit**
 
 ```bash
 cargo fmt --all --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --workspace
-git add crates/tcpvisr-engine/src/timeline.rs
+git add crates/tcpvisr-engine/src/timeline.rs crates/tcpvisr-tui/src/render.rs
 git commit -m "feat(engine): carry the in-flight series through the Timeline"
 ```
 
@@ -1106,7 +1112,20 @@ git commit -m "feat(tui): render the In-flight detail view and view-switch hint"
 **Interfaces:**
 - Consumes: `EngineConfig.collect_inflight_timeline` (Task 1), `App::focus().inflight` (Task 6), the existing `build_replay_app` seam.
 
-- [ ] **Step 1: Write the failing test** — add to `main.rs` `mod build_replay_tests`:
+- [ ] **Step 1: Write the failing test (the RED one first)** — add to `main.rs` `mod build_replay_tests`. This test names `replay_engine_config`, which does not exist yet, so it fails to compile until Step 3:
+
+```rust
+#[test]
+fn run_replay_config_enables_inflight_collection() {
+    // The replay path must turn the flag on; guard against a regression that drops it.
+    // We cannot run the TUI here, so assert the config the replay path builds.
+    let cfg = replay_engine_config(10_000_000);
+    assert!(cfg.collect_inflight_timeline, "replay must collect the in-flight timeline");
+    assert!(cfg.collect_seq_timeline && cfg.collect_state_timeline, "M5/M6 series still on");
+}
+```
+
+Also add this **non-regression guard** (not a RED test — its deps already exist by Task 9, so it passes as soon as it is added; it documents the end-to-end seam):
 
 ```rust
 #[test]
@@ -1128,21 +1147,8 @@ fn build_replay_app_collects_inflight_series_for_the_focus_connection() {
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cargo test -p tcp-visr build_replay_app_collects_inflight 2>&1 | tail -20`
-Expected: FAIL — with the flag off in the default `EngineConfig` the series is empty; here the test sets it, so it should pass once `focus.inflight` exists... Actually it exercises the app seam directly, so run it: if `focus.inflight` field exists (Task 6) it already passes. If so, this test only *documents* the seam. To make it a genuine RED first, instead assert against `run_replay`'s config path — see Step 3 note. Expected here: the test passes only after Step 3 wires the flag; before Step 3 it still passes because the test sets `cfg` itself. So treat Step 1's test as the guard and add the RED via the config assertion below.
-
-Add this second test which is RED until Step 3:
-
-```rust
-#[test]
-fn run_replay_config_enables_inflight_collection() {
-    // The replay path must turn the flag on; guard against a regression that drops it.
-    // We can't run the TUI here, so assert the config the replay path builds.
-    let cfg = replay_engine_config(10_000_000);
-    assert!(cfg.collect_inflight_timeline, "replay must collect the in-flight timeline");
-    assert!(cfg.collect_seq_timeline && cfg.collect_state_timeline, "M5/M6 series still on");
-}
-```
+Run: `cargo test -p tcp-visr run_replay_config_enables_inflight 2>&1 | tail -20`
+Expected: FAIL — compile error, `replay_engine_config` not found (the RED test). The guard test compiles and would pass, but the crate does not build until Step 3, so the whole run is red.
 
 - [ ] **Step 3: Implement** — extract the replay config into a small helper so it is testable, and set the flag:
 
