@@ -120,9 +120,9 @@ so it is testable from hand-built vectors (testing convention).
 - **`toggle_play()`** flips `playing`. Toggling to playing while the cursor is already at
   `end` first rewinds the cursor to `start` (so a finished playthrough replays rather than
   no-opping).
-- **Speed** is a fixed ladder `[0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0]`. `faster()` /
-  `slower()` step one rung, clamped at the ends. Speed only scales cursor advance; it never
-  re-parses (ADR-0004).
+- **Speed** is a fixed ladder `[0.1, 0.5, 1.0, 2.0, 5.0, 10.0]` (every rung renders exactly
+  at one decimal, §3.6). `faster()` / `slower()` step one rung, clamped at the ends. Speed
+  only scales cursor advance; it never re-parses (ADR-0004).
 - **`seek(forward)`** moves the cursor by a fixed step of `max((end - start) / 50, 1ns)`
   (≈2% of the span), clamped to `[start, end]`.
 - **`set_cursor(T)`** clamps `T` into `[start, end]` (used by step-by-event).
