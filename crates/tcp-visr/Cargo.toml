@@ -19,6 +19,7 @@ serde_json = "=1.0.150"
 tcpvisr-core = { path = "../tcpvisr-core" }
 tcpvisr-engine = { path = "../tcpvisr-engine" }
 tcpvisr-ingest = { path = "../tcpvisr-ingest" }
+tcpvisr-tui = { path = "../tcpvisr-tui" }
 
 [dev-dependencies]
 etherparse = "=0.20.2"

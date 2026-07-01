@@ -23,7 +23,7 @@ fn help_flag_exits_zero_and_shows_usage() {
 
 #[test]
 fn unimplemented_subcommand_exits_nonzero_with_message() {
-    let output = bin().arg("replay").output().unwrap();
+    let output = bin().arg("live").output().unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("not implemented"));
