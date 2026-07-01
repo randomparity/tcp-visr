@@ -261,12 +261,44 @@ with
 
 ```rust
 if self.collected_samples >= self.config.retention.max_samples() {
-    if self.config.retention.window().is_some() { self.evict_oldest_global(); }
+    if self.config.retention.window().is_some() { self.evict_oldest_global(idx); }
     else { self.overflowed = true; return; }
 }
 ```
+(each `record_*` already has `idx` in scope.)
 
-where `evict_oldest_global` pops one front sample from the current connection's longest non-empty series (respecting the `states` keep-≥1 rule) and decrements the count. This keeps FailFast identical.
+where `evict_oldest_global` pops one front sample from connection `idx`'s longest non-empty series (respecting the `states` keep-≥1 rule) and decrements the count. After it returns, `record_*` falls through to `collected_samples += 1; push_back(sample)`, so the steady state holds exactly at the ceiling (evict-one, add-one). Concrete code:
+
+```rust
+/// Backstop under Evict: pop one front sample from connection `idx`'s longest non-empty series
+/// (states may not drop below 1) to make room, keeping `collected_samples` consistent. If nothing
+/// is evictable (only a single states sample), the count may momentarily sit one over the ceiling —
+/// acceptable for a safety backstop; window eviction is the primary bound.
+fn evict_oldest_global(&mut self, idx: usize) {
+    let c = &mut self.conns[idx];
+    // (len, min_keep) per series; states keeps >=1, the rest >=0.
+    let candidates: [(usize, usize); 6] = [
+        (c.states.len(), 1), (c.series.len(), 0), (c.seq.len(), 0),
+        (c.inflight.len(), 0), (c.rtt.len(), 0), (c.throughput.len(), 0),
+    ];
+    let pick = candidates.iter().enumerate()
+        .filter(|(_, (len, keep))| len > keep)
+        .max_by_key(|(_, (len, _))| *len)
+        .map(|(i, _)| i);
+    let popped = match pick {
+        Some(0) => c.states.pop_front().is_some(),
+        Some(1) => c.series.pop_front().is_some(),
+        Some(2) => c.seq.pop_front().is_some(),
+        Some(3) => c.inflight.pop_front().is_some(),
+        Some(4) => c.rtt.pop_front().is_some(),
+        Some(5) => c.throughput.pop_front().is_some(),
+        _ => false,
+    };
+    if popped { self.collected_samples = self.collected_samples.saturating_sub(1); }
+}
+```
+
+Add a backstop-specific test: `RetentionPolicy::Evict { window: Nanos(u64::MAX), max_samples: 3 }` (a window so wide it never triggers), feed >3 samples on one connection, and assert `t.conns[0]` retains exactly 3 total across series with the most recent `states` present — the backstop, not the window, did the bounding. This keeps FailFast identical (its arm still sets `overflowed`).
 
 - [ ] **Step 4: Run to verify pass + no regression**
 
@@ -327,6 +359,7 @@ fn whole_connection_evicted_when_terminal_and_past_horizon() {
     t.observe(&tcpvisr_core::Item::Tick(Nanos(5_000)));
     assert!(t.conns.is_empty(), "terminal + last_at<horizon -> whole-connection eviction");
     assert!(t.live.is_empty());
+    assert!(t.next_instance.is_empty(), "next_instance pruned too (no unbounded map growth)");
 }
 ```
 
@@ -358,7 +391,28 @@ fn observe_tick(&mut self, t: Nanos) {
 }
 ```
 
-2. `emit_decay_samples(now)`: for each connection index, if its trailing window at `now` is non-empty in a direction that has sent data, push a `ThroughputSample`/`InFlightSample` at `now` (reuse `collect_throughput_points`/`collect_inflight_points` but stamped at `now` rather than a segment ts). Factor a helper that snapshots a synthetic time. Guard on `metrics.throughput_at(dir, now, &cfg)` returning `Some` (it already computes decay as bytes age out); skip a connection idle past `dead_after` (leave it for `evict_dead_connections`).
+2. **First, extract time-parameterized collectors** (challenge finding B — the existing collectors read `seg.ts`, but a decay tick has no segment; `metrics.throughput_at(dir, t, cfg)` and `metrics.in_flight(dir)` already take a time/direction, so this is a pure rename, not a logic change):
+
+```rust
+// was: collect_throughput_points(&mut self, idx, seg) using seg.ts
+fn collect_throughput_points(&mut self, idx: usize, seg: &Segment) {
+    self.collect_throughput_at(idx, seg.ts);
+}
+fn collect_throughput_at(&mut self, idx: usize, t: Nanos) {
+    if self.overflowed || !self.config.collect_throughput_timeline { return; }
+    for d in [Direction::OriginToResponder, Direction::ResponderToOrigin] {
+        if let Some((throughput_bps, goodput_bps)) =
+            self.conns[idx].metrics.throughput_at(d, t, &self.config)
+        {
+            self.record_throughput(idx, ThroughputSample { t, dir: dir_sample(d), throughput_bps, goodput_bps });
+        }
+    }
+}
+```
+
+Do the same rename for in-flight: `collect_inflight_points(idx, seg)` → `collect_inflight_at(idx, seg.ts)`, with `collect_inflight_at(&mut self, idx, t: Nanos)` snapshotting `metrics.in_flight(d)` stamped at `t`.
+
+Then `emit_decay_samples(now)`: for each connection index whose activity is *not* past `dead_after` (leave those for `evict_dead_connections`), call `self.collect_throughput_at(idx, now)` and `self.collect_inflight_at(idx, now)`. `throughput_at` returns `None` for a direction that never sent data and computes decay as bytes age out of the window, so a fully-drained window yields a `0`-bps sample and an empty one yields nothing.
 
 3. `evict_dead_connections`:
 
@@ -378,12 +432,17 @@ fn evict_dead_connections(&mut self) {
         !((terminal || idle) && c.last_at.0 < horizon)
     });
     if self.conns.len() != before {
-        // Rebuild the pair->index map; drop stale next_instance entries for absent pairs.
+        // Rebuild the pair->index map AND prune next_instance for pairs with no survivor, else
+        // that HashMap grows unbounded under churn (challenge finding A, criterion 17). A later
+        // reuse of a fully-evicted pair legitimately restarts its instance at 0.
         self.live.clear();
+        let mut survivors: std::collections::HashSet<EndpointPair> = std::collections::HashSet::new();
         for (i, c) in self.conns.iter().enumerate() {
             self.live.insert(c.id.pair, i); // last instance of a pair wins the live slot
+            survivors.insert(c.id.pair);
         }
-        // decrement collected_samples by the removed connections' retained sample counts:
+        self.next_instance.retain(|pair, _| survivors.contains(pair));
+        // keep the global sample counter consistent after bulk removal:
         self.recount_collected();
     }
 }
@@ -819,15 +878,20 @@ pub fn set_domain(&mut self, start: Nanos, end: Nanos) {
 }
 ```
 
-In `app.rs`: add fields `is_live: bool`, `follow: bool`, `live_status: LiveStatus` to `App`; define `LiveStatus`. `new_live` builds an empty `Timeline::new(vec![])` app (reuse `new_with_names` internals) with `is_live: true, follow: true`. Add a helper `rebuild_metas_for(&self, timeline)` refactored out of `new_with_names` that returns a fresh `HashMap<ConnId, ConnMeta>` given the names table. Keep a `names: NameTable` clone on `App` (cheap; bounded) so `retarget` can resolve new connections' hosts. `retarget`:
+In `app.rs`: add fields `is_live: bool`, `follow: bool`, `live_status: LiveStatus`, and `names: NameTable` to `App`; define `LiveStatus`. Extract `meta_for(c: &Connection, names: &NameTable) -> ConnMeta` (an associated fn — the per-connection projection currently inlined in `new_with_names`) and have `new_with_names` build its map via `meta_for` **and store `names.clone()`** in the new field (cheap; the table is bounded). `new_live` builds an empty `Timeline::new(vec![])` app with `is_live: true, follow: true` and the passed names. `retarget` (collect ids first to avoid a `&mut self.metas` / `&self.timeline` borrow overlap — challenge finding E):
 
 ```rust
 pub fn retarget(&mut self, timeline: Timeline, horizon: Nanos, now: Nanos, status: LiveStatus) {
-    // reconcile metas to exactly the snapshot's connection set (add new, drop absent)
+    // reconcile metas to exactly the snapshot's connection set (add new, drop absent).
     let present: std::collections::HashSet<ConnId> = timeline.connections().map(|c| c.id).collect();
     self.metas.retain(|id, _| present.contains(id));
-    for c in timeline.connections() {
-        self.metas.entry(c.id).or_insert_with(|| Self::meta_for(c, &self.names));
+    let fresh: Vec<Connection> = timeline
+        .connections()
+        .filter(|c| !self.metas.contains_key(&c.id))
+        .cloned()
+        .collect();
+    for c in &fresh {
+        self.metas.insert(c.id, Self::meta_for(c, &self.names));
     }
     self.timeline = timeline;
     self.live_status = status;
@@ -837,7 +901,7 @@ pub fn retarget(&mut self, timeline: Timeline, horizon: Nanos, now: Nanos, statu
 }
 ```
 
-`meta_for(&Connection, &NameTable) -> ConnMeta` is the per-connection projection extracted from `new_with_names`. `toggle_follow` flips `follow`; when re-enabling, pin cursor to `end`. `is_live`/`is_following`/`live_status` accessors.
+`toggle_follow` flips `follow`; when re-enabling, pin cursor to `end` (`self.transport.set_cursor(self.transport.bounds().1)`). `is_live`/`is_following`/`live_status` accessors. (`Connection` is `Copy`, so `.cloned()` is cheap.)
 
 In `keys.rs`: when `app.is_live()`, `space` calls `toggle_follow()` (not `toggle_play`), and a manual `seek` sets `follow = false` (freeze on manual seek). Guard replay behavior behind `!is_live()`.
 
@@ -1047,7 +1111,19 @@ Update `Command::name` and the `run` match arm. Under `#[cfg(feature = "live")]`
 - Build the main-thread `Tracker` with `EngineConfig { retention: Evict { window: retention_secs*1e9, max_samples: 2_000_000 }, collect_* all true, series_collection: All, ..default }` and a `NameTable`; `App::new_live(&names, title)`.
 - Guard: `struct CaptureGuard { stop: Arc<AtomicBool>, handle: Option<JoinHandle<_>> }` with `Drop` setting `stop` + joining. Own it for the capture lifetime so panic/unwind tears down.
 - `run_live(app, |app| { drain the channel via try_recv into tracker+names, count drops from the atomic, track packet count + first-packet time for the 5s grace advisory, build `tracker.snapshot()`, then `app.retarget(snapshot, tracker.retention_horizon(), tracker.now(), LiveStatus{ dropped, approximate: dropped>0 })` })`.
-- Grace advisory: if no `LiveEvent::Item(Segment)` seen within 5s of start, set a status hint (e.g. fold into `LiveStatus` or the title) — non-fatal; clears on first packet. Keep it simple: track `first_packet_seen: bool` and `start: Instant`; surface the hint in the title until the first packet.
+- Grace advisory (criterion 4) — factor a **pure, unit-testable** decision so it isn't timing-coupled prose:
+
+```rust
+const GRACE: Duration = Duration::from_secs(5);
+/// The silent-empty advisory: None once any packet has arrived, or before the grace window;
+/// Some(hint) after GRACE elapses with zero packets. Non-fatal (a quiet interface is not an error).
+fn grace_hint(first_packet_seen: bool, elapsed: Duration) -> Option<&'static str> {
+    if first_packet_seen || elapsed < GRACE { None }
+    else { Some("no packets yet — check privileges/interface/filter") }
+}
+```
+
+Unit-test it directly (`grace_hint(false, 6s) == Some(_)`; `grace_hint(true, 6s) == None`; `grace_hint(false, 1s) == None`). In `next_frame`, track `first_packet_seen: bool` and a `start: Instant`, and surface `grace_hint(seen, start.elapsed())` in the header until the first packet clears it.
 
 Under `#[cfg(not(feature = "live"))]`, the arm returns `Err("live capture: this binary was built without live support; rebuild with --features live".into())`.
 
