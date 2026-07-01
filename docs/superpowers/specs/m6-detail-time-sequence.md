@@ -106,15 +106,25 @@ change: the tracker now also collects the seq timeline, so the built `Timeline` 
 For the focus connection (§3.5) and its focus direction (§3.6):
 
 - **X axis (time)** spans `[opened_at, effective_end]` — the connection's full active
-  interval (M5 `effective_end`: `last_at` if closed, else capture end). It is **fixed**;
-  scrubbing does not rescale it.
-- **Y axis (sequence)** spans `[0, max_rel]`, where `max_rel` is the largest relative
-  sequence among the focus direction's samples, and a sample's relative sequence is
-  `seq.serial_diff(baseline)` with `baseline` the RFC-1982 serial-minimum sequence over that
-  direction's samples (ADR-0006; never naive subtraction). Fixed; scrubbing does not rescale.
+  interval (M5 `effective_end`: `last_at` if closed, else capture end). This span is **not**
+  `Connection.last_at` (which, for a still-open connection, precedes the capture end); it is
+  read from the new `Timeline::x_span(id)` accessor (§4) so the detail's time axis matches the
+  master header's `t=… / total`. It is **fixed**; scrubbing does not rescale it.
+- **Y axis (sequence)** spans `[0, max_rel]`. A sample's **relative sequence** (its row
+  position) is `rel(s) = s.seq.serial_diff(baseline)`, where `baseline` is the RFC-1982
+  serial-**minimum** `seq` over the focus direction's samples (ADR-0006; never naive
+  subtraction). The axis top `max_rel` is `max(rel(s) + s.len)` over those samples — i.e. the
+  furthest byte the stream reached, so a point is never plotted above the axis (a `Sack`
+  sample has `len = 0`, so it contributes only its own row). Fixed; scrubbing does not rescale.
+- **Degenerate spans.** If the time span is zero (`opened_at == effective_end`, a
+  single-timestamp connection) every revealed mark and the cursor column go in **column 0**.
+  If `max_rel == 0` (the focus direction has no byte extent — e.g. only `Sack` marks at the
+  baseline) every mark goes on the **bottom row**. Neither case is an error; the mapping
+  divides only when the span is non-zero.
 - **Marks.** Each `SeqSample` of the focus direction with `t ≤ T` maps to a cell
-  `(col, row)`: `col` from `t` linearly across the X span, `row` from the relative sequence
-  linearly across the Y span (row 0 at the bottom = sequence 0). The glyph is by kind:
+  `(col, row)`: `col` from `t` linearly across the X span, `row` from `rel(s)` linearly across
+  `[0, max_rel]` (row 0 at the bottom = sequence 0; the point plots at the segment **start**
+  seq, so a retransmit dips back to its earlier row). The glyph is by kind:
   - `Data { retransmit: false, out_of_order: false }` → the plain data glyph,
   - `Data { out_of_order: true, retransmit: false }` → the out-of-order glyph,
   - `Data { retransmit: true, .. }` → the retransmit glyph,
@@ -134,8 +144,9 @@ For the focus connection (§3.5) and its focus direction (§3.6):
 
 The detail follows `App::selected()` (the M5 `ConnId`-tracked selection). Opening the detail
 does not change which connection is selected; moving the selection while open moves the
-detail. The focus connection's static view (`origin`, `responder`, `opened_at`,
-`effective_end`) and its `seq_series` come from the `Timeline` by `ConnId`.
+detail. The focus connection's static view (`origin`, `responder`) comes from the
+`Connection`; its `[opened_at, effective_end]` X span from `Timeline::x_span(id)` (§4); and
+its `seq_series` from `Timeline::seq_series(id)` — all keyed by `ConnId`.
 
 ### 3.6 Focus direction
 
@@ -156,8 +167,11 @@ tests are deterministic. Axis time labels reuse the M5 fixed-3-decimal-seconds f
 
 - `timeline.rs` (or a new `seq.rs` re-exported alongside): add `SeqKind`, `SeqSample`; the
   `Timeline` `Entry` gains a `seq: Vec<SeqSample>`; add `seq_series(&self, id) -> &[SeqSample]`
-  (empty slice for an unknown/uncollected id). `Timeline::new` takes the seq series per
-  connection (extend its input tuple) and sorts each by `t` (stable), like `StateSample`.
+  (empty slice for an unknown/uncollected id) and `x_span(&self, id) -> Option<(Nanos, Nanos)>`
+  returning the connection's `[opened_at, effective_end]` (the private `effective_end` is not
+  otherwise reachable, and `Connection.last_at` is the wrong right edge for a still-open
+  connection). `Timeline::new` takes the seq series per connection (extend its input tuple)
+  and sorts each by `t` (stable), like `StateSample`.
 - `config.rs`: add `collect_seq_timeline: bool` (default `false`).
 - `tracker.rs`: when the flag is set, for every connection and every processed segment, run
   the existing metric derivation and, from its result + the segment, push `SeqSample`s: one
@@ -212,9 +226,11 @@ Dependency direction is unchanged (TUI → engine → core).
 5. **Seq collection counts against the ceiling.** With `collect_seq_timeline = true` and a
    `max_samples` smaller than the number of state+seq samples a fixture produces,
    `into_timeline` returns `SampleCeiling`. (Engine unit test.)
-6. **Relative sequence is serial-correct across a `u32` wrap.** A focus direction whose seqs
-   are `u32::MAX-100` (len 50) then `200` projects to relative rows `0` and `~351` (serial
-   diff), not a fold. (Projection unit test.)
+6. **Relative sequence is serial-correct across a `u32` wrap.** A focus direction with data
+   segments at start seq `u32::MAX-100` (len 50) then `200` (len 50) projects the two points
+   at relative rows `0` and `301` (`200.serial_diff(u32::MAX-100)`, a forward advance, not a
+   fold), and the Y-axis top `max_rel` is `351` (`301 + 50`, the second segment's extent).
+   (Projection unit test.)
 7. **Reveal to `T`.** For a series with marks at `t = {0, 10, 20}` and a cursor at `t = 10`,
    the projection emits the marks at `t = 0` and `t = 10` and omits the one at `t = 20`; at
    `t = 20` all three appear. (Projection unit test.)
@@ -225,9 +241,13 @@ Dependency direction is unchanged (TUI → engine → core).
    point that fall in the same cell render the retransmit glyph; a data point and a SACK in
    one cell render the SACK glyph (priority `retransmit > sack > out_of_order > data`).
    (Projection unit test.)
-10. **Point placement.** A single data point at `(t = midpoint, rel_seq = max_rel)` lands in
-    the middle column and the top row of the plot area; a point at `(opened_at, 0)` lands at
-    the bottom-left. (Projection unit test.)
+10. **Point placement.** A data point whose `rel(s)` equals `max_rel` at `t = midpoint` lands
+    in the middle column and the top row of the plot area; a point at `(opened_at, rel 0)`
+    lands at the bottom-left. (Projection unit test.)
+10a. **Degenerate spans.** A focus connection with a single data segment (`opened_at ==
+    effective_end`, one sample) projects that mark to column 0 and the bottom row without a
+    divide-by-zero; a focus direction with only a `Sack` mark at the baseline (`max_rel == 0`)
+    projects it to the bottom row. (Projection unit test.)
 11. **Cursor column.** The projection marks the column corresponding to `T` with the cursor
     glyph where no data mark occupies that cell. (Projection unit test.)
 12. **Narrow-terminal guard.** Projecting into a viewport below the minimum inner
@@ -254,6 +274,9 @@ Dependency direction is unchanged (TUI → engine → core).
   empty-state message; the master list keeps its M5 empty states. (§3.2, §3.4.)
 - **Focus direction has no samples ≤ `T`** → empty plot area with axes + cursor column, not an
   error. (§3.4.)
+- **Single-sample / zero-width span** → a connection whose focus direction has one data
+  segment (`opened_at == effective_end`, or `max_rel == 0`) plots into column 0 / the bottom
+  row with no divide-by-zero. (§3.4, criterion 10a.)
 - **`u32` sequence wrap within a connection** → relative sequence via RFC-1982 serial
   arithmetic; a wrap is a forward advance, never a fold. (§3.4, criterion 6.)
 - **Dense capture (many segments per column)** → column bucketing bounds render to
@@ -272,10 +295,11 @@ Dependency direction is unchanged (TUI → engine → core).
   `collect_seq_timeline = true`, asserting the emitted `SeqSample`s and the `Timeline`
   accessor. Reuse the M3 derivation fixtures for retransmit/out-of-order/SACK classification —
   assert the *seq point's* kind, not how it is computed.
-- **Projection unit tests** (criteria 6–12) from hand-built `Vec<SeqSample>` and explicit
-  viewport sizes, asserting axis ranges and specific `(col, row, glyph)` marks — including the
-  `u32`-wrap relative-sequence case, reveal-to-`T`, bucketing priority, placement, the cursor
-  column, and the narrow-terminal outcome. No terminal needed.
+- **Projection unit tests** (criteria 6–12, incl. 10a) from hand-built `Vec<SeqSample>` and
+  explicit viewport sizes, asserting axis ranges and specific `(col, row, glyph)` marks —
+  including the `u32`-wrap relative-sequence case, reveal-to-`T`, bucketing priority,
+  placement, degenerate (zero-width / `max_rel == 0`) spans, the cursor column, and the
+  narrow-terminal outcome. No terminal needed.
 - **App / keys unit tests** (criteria 13–14) for open/close modality and detail-follows-
   selection, from hand-built timelines.
 - **`ratatui::TestBackend` render tests** (criteria 15–16): closed reproduces the M5 master;
