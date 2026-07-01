@@ -5,7 +5,9 @@
 use std::collections::HashMap;
 
 use tcpvisr_core::{Endpoint, Nanos, SampleDir};
-use tcpvisr_engine::{AsOf, ConnId, ConnState, InFlightSample, RttSample, SeqSample, Timeline};
+use tcpvisr_engine::{
+    AsOf, ConnId, ConnState, InFlightSample, RttSample, SeqSample, ThroughputSample, Timeline,
+};
 
 use crate::service::service_name;
 use crate::transport::Transport;
@@ -21,6 +23,7 @@ pub struct FocusConn<'a> {
     pub series: &'a [SeqSample],
     pub inflight: &'a [InFlightSample],
     pub rtt: &'a [RttSample],
+    pub throughput: &'a [ThroughputSample],
 }
 
 /// Which detail graph the pane shows when open (`Tab` cycles it).
@@ -216,6 +219,7 @@ impl App {
             series: self.timeline.seq_series(id),
             inflight: self.timeline.inflight_series(id),
             rtt: self.timeline.rtt_series(id),
+            throughput: self.timeline.throughput_series(id),
         })
     }
 
@@ -885,6 +889,34 @@ mod tests {
         let f = app.focus().expect("selected");
         assert_eq!(f.rtt.len(), 1);
         assert_eq!(f.rtt[0].rtt, Nanos(500));
+    }
+
+    #[test]
+    fn focus_exposes_throughput_series() {
+        use tcpvisr_core::SampleDir;
+        use tcpvisr_engine::ThroughputSample;
+        let c = full_conn(ep(1, 1), ep(2, 443), 0, 0, 10, ConnState::Established);
+        let mut c2 = c;
+        c2.bytes_o2r = 100;
+        let throughput = vec![ThroughputSample {
+            t: Nanos(0),
+            dir: SampleDir::OriginToResponder,
+            throughput_bps: 800,
+            goodput_bps: 400,
+        }];
+        let tl = Timeline::with_seq(vec![(
+            c2,
+            vec![ss(0, ConnState::Established, 100, 0)],
+            vec![],
+            vec![],
+            vec![],
+            throughput,
+        )]);
+        let app = App::new(tl, "t".to_string());
+        let f = app.focus().expect("selected");
+        assert_eq!(f.throughput.len(), 1);
+        assert_eq!(f.throughput[0].throughput_bps, 800);
+        assert_eq!(f.throughput[0].goodput_bps, 400);
     }
 
     #[test]

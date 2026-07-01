@@ -225,14 +225,15 @@ fn build_replay_app(
     Ok(tcpvisr_tui::App::new(timeline, title))
 }
 
-/// The `EngineConfig` the replay path uses: all four replay timelines on (state, seq, in-flight,
-/// rtt), plus the sample ceiling.
+/// The `EngineConfig` the replay path uses: all five replay timelines on (state, seq, in-flight,
+/// rtt, throughput), plus the sample ceiling.
 fn replay_engine_config(max_samples: usize) -> EngineConfig {
     EngineConfig {
         collect_state_timeline: true,
         collect_seq_timeline: true,
         collect_inflight_timeline: true,
         collect_rtt_timeline: true,
+        collect_throughput_timeline: true,
         max_samples,
         ..EngineConfig::default()
     }
@@ -437,6 +438,40 @@ mod build_replay_tests {
             cfg.collect_rtt_timeline,
             "replay must collect the RTT timeline"
         );
+    }
+
+    #[test]
+    fn run_replay_config_enables_throughput_collection() {
+        let cfg = replay_engine_config(10_000_000);
+        assert!(
+            cfg.collect_throughput_timeline,
+            "replay must collect the throughput timeline"
+        );
+    }
+
+    #[test]
+    fn build_replay_app_collects_throughput_series_for_the_focus_connection() {
+        // metrics_basic connection 0: focus dir O2R (SYN + 100 B data >> 1-B SYN-ACK). The 100 B
+        // O2R data at t=2ms is not a retransmit, so the O2R throughput sample there is
+        // throughput_bps == goodput_bps == 800 (100 B * 8 / 1s window), verified from the M3 oracle.
+        let cfg = replay_engine_config(10_000_000);
+        let app = build_replay_app(&fixture(), cfg).expect("build");
+        let focus = app
+            .focus()
+            .expect("a connection is selected at the initial cursor");
+        assert!(
+            !focus.throughput.is_empty(),
+            "fixture with sent data yields a non-empty focus throughput series"
+        );
+        let at_2ms = focus
+            .throughput
+            .iter()
+            .find(|s| {
+                s.dir == tcpvisr_core::SampleDir::OriginToResponder && s.t == Nanos(2_000_000)
+            })
+            .expect("an O2R throughput sample at t=2ms (the 100 B data send)");
+        assert_eq!(at_2ms.throughput_bps, 800, "100 B over the 1s window");
+        assert_eq!(at_2ms.goodput_bps, 800, "the 100 B is not a retransmit");
     }
 
     #[test]
