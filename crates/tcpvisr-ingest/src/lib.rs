@@ -5,6 +5,8 @@ pub mod dns;
 #[cfg(feature = "live")]
 pub mod libpcap;
 pub mod link;
+#[cfg(feature = "live")]
+pub mod live;
 pub mod replay;
 
 use std::path::PathBuf;
@@ -14,6 +16,8 @@ pub use dns::parse_dns_answers;
 #[cfg(feature = "live")]
 pub use libpcap::parse_file_libpcap;
 pub use link::LinkType;
+#[cfg(feature = "live")]
+pub use live::{InterfaceInfo, LiveCapture, LiveError, LiveEvent, LiveOptions, list_interfaces};
 pub use replay::{parse_file, parse_file_visit, parse_file_visit_named};
 
 use tcpvisr_core::{Item, NameObservation};
