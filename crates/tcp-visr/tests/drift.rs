@@ -50,6 +50,30 @@ fn regenerate_metrics_fixtures() {
 }
 
 #[test]
+fn committed_name_fixtures_match_builder() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+    for (name, bytes) in support::name_fixture_set() {
+        let path = std::path::Path::new(dir).join(name);
+        let on_disk =
+            std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        assert_eq!(
+            on_disk, bytes,
+            "committed {name} is stale; regenerate fixtures"
+        );
+    }
+}
+
+#[test]
+#[ignore = "regenerates the committed name fixture; run explicitly after a reviewed change"]
+fn regenerate_name_fixtures() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+    std::fs::create_dir_all(dir).unwrap();
+    for (name, bytes) in support::name_fixture_set() {
+        std::fs::write(std::path::Path::new(dir).join(name), bytes).unwrap();
+    }
+}
+
+#[test]
 fn committed_oracle_goldens_are_present_json() {
     // The goldens are byte-matched against live output by tests/metrics.rs; here we only assert
     // each exists and is non-empty JSON with a trailing newline, so an accidental deletion or

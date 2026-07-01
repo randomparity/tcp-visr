@@ -1631,6 +1631,7 @@ dependencies = [
  "etherparse",
  "serde",
  "serde_json",
+ "simple-dns",
  "tcpvisr-core",
  "tcpvisr-engine",
  "tcpvisr-ingest",
