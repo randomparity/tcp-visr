@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use tcpvisr_core::{Endpoint, Nanos, SampleDir};
-use tcpvisr_engine::{AsOf, ConnId, ConnState, InFlightSample, SeqSample, Timeline};
+use tcpvisr_engine::{AsOf, ConnId, ConnState, InFlightSample, RttSample, SeqSample, Timeline};
 
 use crate::service::service_name;
 use crate::transport::Transport;
@@ -20,6 +20,7 @@ pub struct FocusConn<'a> {
     pub focus_dir: SampleDir,
     pub series: &'a [SeqSample],
     pub inflight: &'a [InFlightSample],
+    pub rtt: &'a [RttSample],
 }
 
 /// Which detail graph the pane shows when open (`Tab` cycles it).
@@ -27,6 +28,7 @@ pub struct FocusConn<'a> {
 pub enum DetailView {
     TimeSequence,
     InFlight,
+    Rtt,
 }
 
 /// One master-list row: a connection projected as of the cursor time.
@@ -213,6 +215,7 @@ impl App {
             focus_dir,
             series: self.timeline.seq_series(id),
             inflight: self.timeline.inflight_series(id),
+            rtt: self.timeline.rtt_series(id),
         })
     }
 
@@ -222,11 +225,12 @@ impl App {
         self.detail_view
     }
 
-    /// Advances the detail view (wrapping): Time/Sequence -> In-flight -> Time/Sequence.
+    /// Advances the detail view (wrapping): Time/Sequence -> In-flight -> RTT -> Time/Sequence.
     pub fn cycle_detail_view(&mut self) {
         self.detail_view = match self.detail_view {
             DetailView::TimeSequence => DetailView::InFlight,
-            DetailView::InFlight => DetailView::TimeSequence,
+            DetailView::InFlight => DetailView::Rtt,
+            DetailView::Rtt => DetailView::TimeSequence,
         };
     }
 
@@ -851,7 +855,35 @@ mod tests {
         app.cycle_detail_view();
         assert_eq!(app.detail_view(), DetailView::InFlight);
         app.cycle_detail_view();
+        assert_eq!(app.detail_view(), DetailView::Rtt);
+        app.cycle_detail_view();
         assert_eq!(app.detail_view(), DetailView::TimeSequence);
+    }
+
+    #[test]
+    fn focus_exposes_rtt_series() {
+        use tcpvisr_core::SampleDir;
+        use tcpvisr_engine::RttSample;
+        let c = full_conn(ep(1, 1), ep(2, 443), 0, 0, 10, ConnState::Established);
+        let mut c2 = c;
+        c2.bytes_o2r = 100;
+        let rtt = vec![RttSample {
+            t: Nanos(0),
+            dir: SampleDir::OriginToResponder,
+            rtt: Nanos(500),
+            srtt: Nanos(500),
+        }];
+        let tl = Timeline::with_seq(vec![(
+            c2,
+            vec![ss(0, ConnState::Established, 100, 0)],
+            vec![],
+            vec![],
+            rtt,
+        )]);
+        let app = App::new(tl, "t".to_string());
+        let f = app.focus().expect("selected");
+        assert_eq!(f.rtt.len(), 1);
+        assert_eq!(f.rtt[0].rtt, Nanos(500));
     }
 
     #[test]
@@ -871,6 +903,7 @@ mod tests {
             vec![ss(0, ConnState::Established, 100, 0)],
             vec![],
             inflight,
+            vec![],
         )]);
         let app = App::new(tl, "t".to_string());
         let f = app.focus().expect("selected");

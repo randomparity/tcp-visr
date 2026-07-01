@@ -8,7 +8,9 @@ use crate::config::EngineConfig;
 use crate::conn::{ConnId, Connection, Direction, EndpointPair};
 use crate::metrics::{ConnectionMetrics, MetricError, MetricState, SeriesCollection};
 use crate::state::ConnState;
-use crate::timeline::{ConnSeries, InFlightSample, SeqKind, SeqSample, StateSample, Timeline};
+use crate::timeline::{
+    ConnSeries, InFlightSample, RttSample, SeqKind, SeqSample, StateSample, Timeline,
+};
 
 /// `true` when `seq` sits backward of `baseline` in RFC 1982 serial space by more than
 /// `threshold` — a drop to a fresh ISN, not a retransmit/reorder or a forward `u32` wrap.
@@ -50,6 +52,20 @@ fn dir_opposite(d: Direction) -> Direction {
     match d {
         Direction::OriginToResponder => Direction::ResponderToOrigin,
         Direction::ResponderToOrigin => Direction::OriginToResponder,
+    }
+}
+
+fn sdir_opposite(d: SampleDir) -> SampleDir {
+    match d {
+        SampleDir::OriginToResponder => SampleDir::ResponderToOrigin,
+        SampleDir::ResponderToOrigin => SampleDir::OriginToResponder,
+    }
+}
+
+fn sdir_index(d: SampleDir) -> usize {
+    match d {
+        SampleDir::OriginToResponder => 0,
+        SampleDir::ResponderToOrigin => 1,
     }
 }
 
@@ -104,6 +120,8 @@ struct ConnTrack {
     states: Vec<StateSample>,
     seq: Vec<SeqSample>,
     inflight: Vec<InFlightSample>,
+    rtt: Vec<RttSample>,
+    srtt: [Option<Nanos>; 2],
     unwrap: [SeqUnwrap; 2],
 }
 
@@ -364,6 +382,51 @@ impl Tracker {
         }
     }
 
+    /// Stores one `RttSample` on the instance at `idx`, enforcing `max_samples`.
+    fn record_rtt(&mut self, idx: usize, sample: RttSample) {
+        if self.overflowed {
+            return;
+        }
+        if self.collected_samples >= self.config.max_samples {
+            self.overflowed = true;
+            return;
+        }
+        self.collected_samples += 1;
+        self.conns[idx].rtt.push(sample);
+    }
+
+    /// Records the per-ack RTT + smoothed SRTT when RTT collection is on and this segment yielded
+    /// an RTT. The RTT measures the *opposite* (acked-sender) flow, so the sample is tagged with
+    /// `opposite(sample.dir)` (ADR-0013 §1); `srtt` is the RFC 6298 EWMA (α = 1/8) over that
+    /// direction, computed in `u128` to avoid overflow (ADR-0013 §2).
+    fn collect_rtt_points(&mut self, idx: usize, sample: &MetricSample) {
+        if self.overflowed || !self.config.collect_rtt_timeline {
+            return;
+        }
+        let Some(rtt) = sample.rtt else {
+            return;
+        };
+        let m = sdir_opposite(sample.dir);
+        let mi = sdir_index(m);
+        let srtt = match self.conns[idx].srtt[mi] {
+            None => rtt,
+            Some(prev) => {
+                let v = (7u128 * u128::from(prev.0) + u128::from(rtt.0)) / 8;
+                Nanos(u64::try_from(v).unwrap_or(u64::MAX))
+            }
+        };
+        self.conns[idx].srtt[mi] = Some(srtt);
+        self.record_rtt(
+            idx,
+            RttSample {
+                t: sample.t,
+                dir: m,
+                rtt,
+                srtt,
+            },
+        );
+    }
+
     /// Folds one `Item` into tracker state. `Tick`s are inert in replay (idle is evaluated
     /// per-segment from each segment's own ts); they never create a connection.
     pub fn observe(&mut self, item: &Item) {
@@ -393,7 +456,8 @@ impl Tracker {
                 if !self.overflowed
                     && (want_metric
                         || self.config.collect_seq_timeline
-                        || self.config.collect_inflight_timeline)
+                        || self.config.collect_inflight_timeline
+                        || self.config.collect_rtt_timeline)
                 {
                     let sample = self.conns[idx].metrics.observe(seg, dir, &self.config);
                     if want_metric {
@@ -401,6 +465,7 @@ impl Tracker {
                     }
                     self.collect_seq_points(idx, seg, dir, &sample);
                     self.collect_inflight_points(idx, seg);
+                    self.collect_rtt_points(idx, &sample);
                 }
                 return;
             }
@@ -464,6 +529,8 @@ impl Tracker {
             states: Vec::new(),
             seq: Vec::new(),
             inflight: Vec::new(),
+            rtt: Vec::new(),
+            srtt: [None, None],
             unwrap: [SeqUnwrap::default(); 2],
         };
         let dir = track.direction_of(src);
@@ -480,7 +547,8 @@ impl Tracker {
         let sample = (!self.overflowed
             && (want_metric
                 || self.config.collect_seq_timeline
-                || self.config.collect_inflight_timeline))
+                || self.config.collect_inflight_timeline
+                || self.config.collect_rtt_timeline))
             .then(|| track.metrics.observe(seg, dir, &self.config));
         let idx = self.conns.len();
         self.conns.push(track);
@@ -491,6 +559,7 @@ impl Tracker {
             }
             self.collect_seq_points(idx, seg, dir, &sample);
             self.collect_inflight_points(idx, seg);
+            self.collect_rtt_points(idx, &sample);
         }
         if self.config.collect_state_timeline {
             let s = self.conns[idx].snapshot(seg.ts);
@@ -549,6 +618,7 @@ impl Tracker {
                     c.states.clone(),
                     c.seq.clone(),
                     c.inflight.clone(),
+                    c.rtt.clone(),
                 )
             })
             .collect();
@@ -1369,6 +1439,133 @@ mod inflight_tests {
         let mut t = Tracker::new(cfg);
         t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 1_000));
         t.observe(&seg(c, s, TcpFlags::ACK, 110, 1, 20, 2_000));
+        assert!(matches!(
+            t.into_timeline().expect_err("ceiling"),
+            MetricError::SampleCeiling { .. }
+        ));
+    }
+}
+
+#[cfg(test)]
+mod rtt_tests {
+    use super::test_support::{ep, seg};
+    use super::*;
+    use tcpvisr_core::{SampleDir, TcpFlags};
+
+    fn rtt_cfg() -> EngineConfig {
+        EngineConfig {
+            collect_rtt_timeline: true,
+            ..EngineConfig::default()
+        }
+    }
+
+    fn only_id(tl: &crate::timeline::Timeline) -> ConnId {
+        tl.connections().next().expect("one connection").id
+    }
+
+    /// (t, rtt, srtt) triples for the O2R-measured RTT samples, t-ordered by the Timeline.
+    fn o2r_rtt(tl: &crate::timeline::Timeline) -> Vec<(u64, u64, u64)> {
+        tl.rtt_series(only_id(tl))
+            .iter()
+            .filter(|s| s.dir == SampleDir::OriginToResponder)
+            .map(|s| (s.t.0, s.rtt.0, s.srtt.0))
+            .collect()
+    }
+
+    // Criterion 1: the RTT of O2R data is measured on the R2O ACK, so the sample is tagged O2R
+    // (the acked sender), not R2O (the ACK's own direction).
+    #[test]
+    fn rtt_attributed_to_measured_flow_not_ack_direction() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(rtt_cfg());
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 1_000)); // O2R data seq100 len10
+        t.observe(&seg(s, c, TcpFlags::ACK, 1, 110, 0, 1_500)); // R2O pure ACK=110
+        let tl = t.into_timeline().expect("timeline");
+        let all = tl.rtt_series(only_id(&tl));
+        assert_eq!(all.len(), 1, "exactly one RTT sample");
+        assert_eq!(
+            all[0].dir,
+            SampleDir::OriginToResponder,
+            "measured flow is O2R"
+        );
+        assert_eq!((all[0].t.0, all[0].rtt.0), (1_500, 500));
+    }
+
+    // Criterion 2: srtt is the RFC 6298 EWMA (α=1/8): 800, (7*800+800)/8=800, (7*800+400)/8=750.
+    #[test]
+    fn srtt_is_rfc6298_ewma() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(rtt_cfg());
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 0)); // O2R -> pending(110,0)
+        t.observe(&seg(s, c, TcpFlags::ACK, 1, 110, 0, 800)); // R2O ACK110 -> rtt800
+        t.observe(&seg(c, s, TcpFlags::ACK, 110, 1, 10, 1_000)); // O2R -> pending(120,1000)
+        t.observe(&seg(s, c, TcpFlags::ACK, 1, 120, 0, 1_800)); // R2O ACK120 -> rtt800
+        t.observe(&seg(c, s, TcpFlags::ACK, 120, 1, 10, 2_000)); // O2R -> pending(130,2000)
+        t.observe(&seg(s, c, TcpFlags::ACK, 1, 130, 0, 2_400)); // R2O ACK130 -> rtt400
+        let tl = t.into_timeline().expect("timeline");
+        assert_eq!(
+            o2r_rtt(&tl),
+            vec![(800, 800, 800), (1_800, 800, 800), (2_400, 400, 750)]
+        );
+    }
+
+    // Criterion 3a: a duplicate ACK that does not advance the frontier yields no RTT sample.
+    #[test]
+    fn duplicate_ack_produces_no_rtt_sample() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(rtt_cfg());
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 0)); // O2R
+        t.observe(&seg(s, c, TcpFlags::ACK, 1, 110, 0, 500)); // R2O ACK110 -> rtt500
+        t.observe(&seg(s, c, TcpFlags::ACK, 1, 110, 0, 900)); // R2O dup ACK110 -> no advance
+        let tl = t.into_timeline().expect("timeline");
+        assert_eq!(
+            o2r_rtt(&tl),
+            vec![(500, 500, 500)],
+            "only the advancing ACK yields RTT"
+        );
+    }
+
+    // Criterion 3b: a retransmitted range clears the pending queue (Karn), so the later ACK finds
+    // nothing to pair and yields no RTT sample.
+    #[test]
+    fn karn_retransmit_produces_no_rtt_sample() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(rtt_cfg());
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 0)); // O2R -> pending(110,0)
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 10_000_000)); // O2R retransmit (gap > 3ms)
+        t.observe(&seg(s, c, TcpFlags::ACK, 1, 110, 0, 11_000_000)); // R2O ACK110 -> pending empty
+        let tl = t.into_timeline().expect("timeline");
+        assert!(
+            tl.rtt_series(only_id(&tl)).is_empty(),
+            "Karn cleared the pending send"
+        );
+    }
+
+    // Criterion 6: off by default.
+    #[test]
+    fn rtt_off_by_default_is_empty() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(EngineConfig {
+            collect_state_timeline: true,
+            ..EngineConfig::default()
+        });
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 0));
+        t.observe(&seg(s, c, TcpFlags::ACK, 1, 110, 0, 500));
+        let tl = t.into_timeline().expect("timeline");
+        assert!(tl.rtt_series(only_id(&tl)).is_empty());
+    }
+
+    // Criterion 5: two RTT samples with max_samples=1 -> SampleCeiling.
+    #[test]
+    fn rtt_collection_counts_against_ceiling() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut cfg = rtt_cfg();
+        cfg.max_samples = 1;
+        let mut t = Tracker::new(cfg);
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 0));
+        t.observe(&seg(s, c, TcpFlags::ACK, 1, 110, 0, 500)); // rtt #1
+        t.observe(&seg(c, s, TcpFlags::ACK, 110, 1, 10, 1_000));
+        t.observe(&seg(s, c, TcpFlags::ACK, 1, 120, 0, 1_500)); // rtt #2 -> ceiling
         assert!(matches!(
             t.into_timeline().expect_err("ceiling"),
             MetricError::SampleCeiling { .. }

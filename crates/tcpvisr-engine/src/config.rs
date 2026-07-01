@@ -6,6 +6,12 @@ use crate::metrics::SeriesCollection;
 
 /// Connection-tracker + metric-derivation configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "four orthogonal collect-<series> timeline gates (state/seq/inflight/rtt); each is an \
+              independently unit-tested on/off knob per ADR-0010/0011/0012/0013, not a state flag \
+              cluster that would read better as an enum"
+)]
 pub struct EngineConfig {
     /// Idle gap after which a fresh SYN on the same pair starts a new instance.
     pub dead_after: Nanos,
@@ -27,6 +33,8 @@ pub struct EngineConfig {
     pub collect_seq_timeline: bool,
     /// Whether the tracker records a per-segment `InFlightSample` timeline (M7 detail).
     pub collect_inflight_timeline: bool,
+    /// Whether the tracker records a per-ack `RttSample` timeline (M8 detail).
+    pub collect_rtt_timeline: bool,
 }
 
 impl Default for EngineConfig {
@@ -41,6 +49,7 @@ impl Default for EngineConfig {
             collect_state_timeline: false,
             collect_seq_timeline: false,
             collect_inflight_timeline: false,
+            collect_rtt_timeline: false,
         }
     }
 }
@@ -68,6 +77,12 @@ mod tests {
     fn inflight_timeline_defaults_off() {
         let c = EngineConfig::default();
         assert!(!c.collect_inflight_timeline);
+    }
+
+    #[test]
+    fn rtt_timeline_defaults_off() {
+        let c = EngineConfig::default();
+        assert!(!c.collect_rtt_timeline);
     }
 
     #[test]
