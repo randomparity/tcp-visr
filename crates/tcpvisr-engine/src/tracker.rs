@@ -330,6 +330,40 @@ impl Tracker {
         }
     }
 
+    /// Stores one `InFlightSample` on the instance at `idx`, enforcing `max_samples`.
+    fn record_inflight(&mut self, idx: usize, sample: InFlightSample) {
+        if self.overflowed {
+            return;
+        }
+        if self.collected_samples >= self.config.max_samples {
+            self.overflowed = true;
+            return;
+        }
+        self.collected_samples += 1;
+        self.conns[idx].inflight.push(sample);
+    }
+
+    /// Snapshots each direction's current outstanding for this segment when in-flight collection
+    /// is on and not overflowed (ADR-0012 §1: both directions, so ACK-driven drains are sampled
+    /// at ack time rather than deferred to the next same-direction send).
+    fn collect_inflight_points(&mut self, idx: usize, seg: &Segment) {
+        if self.overflowed || !self.config.collect_inflight_timeline {
+            return;
+        }
+        for d in [Direction::OriginToResponder, Direction::ResponderToOrigin] {
+            if let Some(bytes) = self.conns[idx].metrics.in_flight(d) {
+                self.record_inflight(
+                    idx,
+                    InFlightSample {
+                        t: seg.ts,
+                        dir: dir_sample(d),
+                        bytes,
+                    },
+                );
+            }
+        }
+    }
+
     /// Folds one `Item` into tracker state. `Tick`s are inert in replay (idle is evaluated
     /// per-segment from each segment's own ts); they never create a connection.
     pub fn observe(&mut self, item: &Item) {
@@ -356,12 +390,17 @@ impl Tracker {
                 // the ceiling has tripped the result is already doomed, so stop deriving entirely
                 // rather than keep growing per-connection state on a discarded series.
                 let want_metric = self.should_collect(self.conns[idx].id);
-                if !self.overflowed && (want_metric || self.config.collect_seq_timeline) {
+                if !self.overflowed
+                    && (want_metric
+                        || self.config.collect_seq_timeline
+                        || self.config.collect_inflight_timeline)
+                {
                     let sample = self.conns[idx].metrics.observe(seg, dir, &self.config);
                     if want_metric {
                         self.record_sample(idx, sample);
                     }
                     self.collect_seq_points(idx, seg, dir, &sample);
+                    self.collect_inflight_points(idx, seg);
                 }
                 return;
             }
@@ -438,7 +477,10 @@ impl Tracker {
         // Derive the first sample only for collected instances, and not past the ceiling
         // (see `observe_segment`).
         let want_metric = self.should_collect(track.id);
-        let sample = (!self.overflowed && (want_metric || self.config.collect_seq_timeline))
+        let sample = (!self.overflowed
+            && (want_metric
+                || self.config.collect_seq_timeline
+                || self.config.collect_inflight_timeline))
             .then(|| track.metrics.observe(seg, dir, &self.config));
         let idx = self.conns.len();
         self.conns.push(track);
@@ -448,6 +490,7 @@ impl Tracker {
                 self.record_sample(idx, sample);
             }
             self.collect_seq_points(idx, seg, dir, &sample);
+            self.collect_inflight_points(idx, seg);
         }
         if self.config.collect_state_timeline {
             let s = self.conns[idx].snapshot(seg.ts);
@@ -1254,5 +1297,81 @@ mod seq_tests {
                 out_of_order: true
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod inflight_tests {
+    use super::test_support::{ep, seg};
+    use super::*;
+    use tcpvisr_core::{SampleDir, TcpFlags};
+
+    fn iff_cfg() -> EngineConfig {
+        EngineConfig {
+            collect_state_timeline: true,
+            collect_seq_timeline: true,
+            collect_inflight_timeline: true,
+            ..EngineConfig::default()
+        }
+    }
+
+    fn only_id(tl: &crate::timeline::Timeline) -> ConnId {
+        tl.connections().next().expect("one connection").id
+    }
+
+    fn o2r_inflight(tl: &crate::timeline::Timeline) -> Vec<(u64, u64)> {
+        tl.inflight_series(only_id(tl))
+            .iter()
+            .filter(|s| s.dir == SampleDir::OriginToResponder)
+            .map(|s| (s.t.0, s.bytes))
+            .collect()
+    }
+
+    #[test]
+    fn inflight_rises_on_send_and_drains_at_ack_time() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(iff_cfg());
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 1_000)); // O2R +10
+        t.observe(&seg(s, c, TcpFlags::ACK, 1, 110, 0, 2_000)); // R2O ACK drains O2R
+        t.observe(&seg(c, s, TcpFlags::ACK, 110, 1, 5, 3_000)); // O2R +5
+        let tl = t.into_timeline().expect("timeline");
+        assert_eq!(o2r_inflight(&tl), vec![(1_000, 10), (2_000, 0), (3_000, 5)]);
+    }
+
+    #[test]
+    fn inflight_is_serial_correct_across_u32_wrap() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(iff_cfg());
+        t.observe(&seg(c, s, TcpFlags::ACK, u32::MAX - 100, 1, 50, 1_000));
+        t.observe(&seg(c, s, TcpFlags::ACK, 200, 1, 50, 2_000)); // never acked
+        let tl = t.into_timeline().expect("timeline");
+        let bytes: Vec<u64> = o2r_inflight(&tl).iter().map(|(_, b)| *b).collect();
+        assert_eq!(bytes, vec![50, 351]); // serial distance across the wrap
+    }
+
+    #[test]
+    fn inflight_off_by_default_is_empty() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(EngineConfig {
+            collect_state_timeline: true,
+            ..EngineConfig::default()
+        });
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 1_000));
+        let tl = t.into_timeline().expect("timeline");
+        assert!(tl.inflight_series(only_id(&tl)).is_empty());
+    }
+
+    #[test]
+    fn inflight_collection_counts_against_ceiling() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut cfg = iff_cfg();
+        cfg.max_samples = 1; // first segment already produces state + seq + inflight samples
+        let mut t = Tracker::new(cfg);
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 1_000));
+        t.observe(&seg(c, s, TcpFlags::ACK, 110, 1, 20, 2_000));
+        assert!(matches!(
+            t.into_timeline().expect_err("ceiling"),
+            MetricError::SampleCeiling { .. }
+        ));
     }
 }
