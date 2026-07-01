@@ -1,6 +1,7 @@
 //! Capture faucets: pcap/pcapng replay and libpcap live capture -> Item stream.
 
 pub mod decode;
+pub mod dns;
 #[cfg(feature = "live")]
 pub mod libpcap;
 pub mod link;
@@ -9,12 +10,13 @@ pub mod replay;
 use std::path::PathBuf;
 
 pub use decode::{DecodeOutcome, SkipReason, decode_frame};
+pub use dns::parse_dns_answers;
 #[cfg(feature = "live")]
 pub use libpcap::parse_file_libpcap;
 pub use link::LinkType;
-pub use replay::{parse_file, parse_file_visit};
+pub use replay::{parse_file, parse_file_visit, parse_file_visit_named};
 
-use tcpvisr_core::Item;
+use tcpvisr_core::{Item, NameObservation};
 
 /// Counts of packets skipped during a parse, keyed by reason (design §7).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -72,6 +74,7 @@ pub struct ReplayParse {
     pub items: Vec<Item>,
     pub skipped: SkipCounts,
     pub link_type: LinkType,
+    pub names: Vec<NameObservation>,
 }
 
 /// Whole-file ingest failures. Per-packet problems are counted, not errors (design §7).

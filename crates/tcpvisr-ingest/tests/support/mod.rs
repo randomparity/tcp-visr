@@ -145,6 +145,43 @@ pub fn ipv4_udp(src_port: u16, dst_port: u16) -> Vec<u8> {
     buf
 }
 
+/// A raw IPv4/UDP-53 DNS *response*: `example.com A 93.184.216.34` (source port 53 marks a
+/// response, so `decode_frame` emits a `Names` outcome). Duplicated from the `decode.rs` unit-test
+/// helper because `src/` unit tests and this integration-test crate cannot share a module.
+pub fn ipv4_udp_dns_response() -> Vec<u8> {
+    use simple_dns::rdata::{A, RData};
+    use simple_dns::{CLASS, Name, Packet, ResourceRecord};
+    let mut p = Packet::new_reply(1);
+    p.answers.push(ResourceRecord::new(
+        Name::new("example.com").expect("dns name"),
+        CLASS::IN,
+        300,
+        RData::A(A {
+            address: u32::from(core::net::Ipv4Addr::new(93, 184, 216, 34)),
+        }),
+    ));
+    let dns = p.build_bytes_vec().expect("build dns");
+    let mut buf = Vec::new();
+    PacketBuilder::ipv4([93, 184, 216, 34], [10, 0, 0, 2], 64)
+        .udp(53, 40000)
+        .write(&mut buf, &dns)
+        .expect("build ipv4 udp dns response");
+    buf
+}
+
+/// A raw IPv4/UDP DNS *query* (destination port 53, source ≠ 53, empty answer section): decodes to
+/// `Skipped(NonTcp)` and yields no name.
+pub fn ipv4_udp_dns_query() -> Vec<u8> {
+    use simple_dns::Packet;
+    let dns = Packet::new_reply(2).build_bytes_vec().expect("build dns");
+    let mut buf = Vec::new();
+    PacketBuilder::ipv4([10, 0, 0, 2], [93, 184, 216, 34], 64)
+        .udp(40000, 53)
+        .write(&mut buf, &dns)
+        .expect("build ipv4 udp dns query");
+    buf
+}
+
 // ---- Link-layer wrappers (prepend the link header to IP bytes) ----
 
 #[must_use]

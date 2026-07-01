@@ -8,8 +8,8 @@ mod support;
 
 use support::{
     DLT_EN10MB, DLT_LINUX_SLL, DLT_LINUX_SLL2, DLT_NULL, DLT_RAW, Pkt, ethernet, ipv4_tcp_syn,
-    ipv4_udp, ipv6_fragment_tcp, ipv6_hopopt_tcp, ipv6_tcp, legacy_pcap, null, pcapng, sll, sll2,
-    write_temp,
+    ipv4_udp, ipv4_udp_dns_query, ipv4_udp_dns_response, ipv6_fragment_tcp, ipv6_hopopt_tcp,
+    ipv6_tcp, legacy_pcap, null, pcapng, sll, sll2, write_temp,
 };
 use tcpvisr_core::Item;
 use tcpvisr_ingest::{IngestError, LinkType, parse_file};
@@ -231,4 +231,32 @@ fn header_only_capture_decodes_like_full_snaplen() {
     // The header-only segment must carry the *non-zero on-wire* payload length
     // (acceptance criterion 3), not the truncated captured length.
     assert_eq!(only_segment(&hdr_parsed.items).payload_len, 80);
+}
+
+#[test]
+fn faucet_routes_names_and_excludes_them_from_non_tcp() {
+    // One TCP SYN + one DNS response (A example.com -> 93.184.216.34).
+    let bytes = legacy_pcap(
+        DLT_RAW,
+        &[
+            Pkt::new(TS, ipv4_tcp_syn(1234, 80)),
+            Pkt::new(TS + 1000, ipv4_udp_dns_response()),
+        ],
+    );
+    let path = write_temp("dns_route.pcap", &bytes);
+    let parsed = parse_file(&path).expect("parse");
+    assert_eq!(parsed.items.len(), 1, "only the SYN is an Item");
+    assert_eq!(parsed.names.len(), 1, "the DNS answer is a name");
+    assert_eq!(parsed.names[0].name.as_ref(), "example.com");
+    assert_eq!(
+        parsed.skipped.non_tcp, 0,
+        "the DNS packet is used, not skipped"
+    );
+
+    // A UDP/53 query (no answers) is counted non_tcp, yields no name.
+    let q = legacy_pcap(DLT_RAW, &[Pkt::new(TS, ipv4_udp_dns_query())]);
+    let qpath = write_temp("dns_query.pcap", &q);
+    let qp = parse_file(&qpath).expect("parse");
+    assert_eq!(qp.names.len(), 0);
+    assert_eq!(qp.skipped.non_tcp, 1);
 }

@@ -10,7 +10,7 @@ building toward v0.1 (replay-only). The full design is the source of truth:
 [docs/design/tcp-visr-design.md](docs/design/tcp-visr-design.md); cross-cutting decisions are
 [ADRs](docs/adr/) and are authoritative when they disagree with the design doc.
 
-**Current state:** milestones M0–M9 are implemented. Working CLI subcommands are `parse`,
+**Current state:** milestones M0–M10 are implemented. Working CLI subcommands are `parse`,
 `conns`, `metrics`, and `replay` (all replay path only). `replay` opens the interactive TUI
 over a capture with a seekable timeline: play/pause, 0.1–10× speed, seek, and step, with the
 master list resolving each connection's state and bytes "as of" the cursor time via the
@@ -26,7 +26,15 @@ Throughput/goodput graph — the trailing-window throughput and the non-retransm
 attributed to the sending flow and sampled in both directions per segment so the rate decays as
 bytes age out of the window (M9). Goodput is engine-derived over the same window as
 `throughput_bps` (which stays frozen for the M3 oracle); this view has no kernel overlay (design
-§10.M12 overlays only M7/M8). `live` and kernel enrichment are not built yet; `live` returns "not
+§10.M12 overlays only M7/M8). Each connection's peer also carries a **host (DNS) label**: capture-DNS
+resolves IP→name from the A/AAAA answers in UDP/53 response packets, parsed in the shared
+`decode_frame` (`simple-dns`) into `NameObservation`s that ride *beside* the `Item` stream — the pure
+engine and the M3 oracle are untouched. A bounded latest-wins `NameTable` (`tcpvisr-core`) answers
+`resolve(ip)`; the TUI renders `host:port` over `ip:port` on rows, in the fuzzy filter, and in the
+detail title, and the header shows a resolved-name count (M10). Names are sanitized to printable
+ASCII (attacker-controlled input) and are advisory (the numeric peer stays visible via `conns`/
+`metrics`). The live reverse-DNS-with-caching half of M10 is deferred to the live milestones behind
+the same `NameTable` (ADR-0015). `live` and kernel enrichment are not built yet; `live` returns "not
 implemented yet". Do not assume a feature exists because the design describes it — check the
 roadmap (design §10) and the code.
 

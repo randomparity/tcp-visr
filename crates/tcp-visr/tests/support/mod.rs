@@ -87,6 +87,42 @@ pub fn tcp_with_sack(
     buf
 }
 
+/// An Ethernet+IPv4+UDP-53 DNS response `example.com A 93.184.216.34` (source port 53 marks a
+/// response). Deterministic — `simple-dns` serializes with no clock/randomness (M10).
+#[must_use]
+pub fn udp_dns_response() -> Vec<u8> {
+    use simple_dns::rdata::{A, RData};
+    use simple_dns::{CLASS, Name, Packet, ResourceRecord};
+    let mut p = Packet::new_reply(1);
+    p.answers.push(ResourceRecord::new(
+        Name::new("example.com").expect("dns name"),
+        CLASS::IN,
+        300,
+        RData::A(A {
+            address: u32::from_be_bytes([93, 184, 216, 34]),
+        }),
+    ));
+    let dns = p.build_bytes_vec().expect("build dns");
+    let mut buf = Vec::new();
+    PacketBuilder::ethernet2([2, 0, 0, 0, 0, 3], [2, 0, 0, 0, 0, 1])
+        .ipv4([10, 0, 0, 53], C, 64)
+        .udp(53, 40000)
+        .write(&mut buf, &dns)
+        .expect("build dns response frame");
+    buf
+}
+
+/// The committed M10 name-resolution fixture: a SYN to `93.184.216.34:443` (creates the
+/// connection) plus a DNS response resolving that IP to `example.com`.
+#[must_use]
+pub fn name_fixture_set() -> Vec<(&'static str, Vec<u8>)> {
+    use flag::SYN;
+    let peer = [93, 184, 216, 34];
+    let syn = tcp(C, peer, 51324, 443, SYN, 1000, 0, 0);
+    let cap = legacy_pcap(&[(1_000_000, syn), (2_000_000, udp_dns_response())]);
+    vec![("name_resolution.pcap", cap)]
+}
+
 /// A legacy `.pcap` (microsecond magic, little-endian). `frames[i] = (ts_us, bytes)`.
 #[must_use]
 pub fn legacy_pcap(frames: &[(u64, Vec<u8>)]) -> Vec<u8> {

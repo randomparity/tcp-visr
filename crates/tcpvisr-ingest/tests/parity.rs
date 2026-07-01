@@ -10,7 +10,8 @@ mod support;
 
 use support::{
     DLT_EN10MB, DLT_LINUX_SLL, DLT_LINUX_SLL2, DLT_NULL, DLT_RAW, Pkt, ethernet, ipv4_tcp_syn,
-    ipv6_hopopt_tcp, ipv6_tcp, legacy_pcap, null, pcapng, sll, sll2, write_temp,
+    ipv4_udp_dns_response, ipv6_hopopt_tcp, ipv6_tcp, legacy_pcap, null, pcapng, sll, sll2,
+    write_temp,
 };
 use tcpvisr_ingest::{parse_file, parse_file_libpcap};
 
@@ -26,6 +27,7 @@ fn assert_parity(name: &str, bytes: &[u8]) {
     );
     assert_eq!(pure.items, lib.items, "items differ for {name}");
     assert_eq!(pure.skipped, lib.skipped, "skip counts differ for {name}");
+    assert_eq!(pure.names, lib.names, "names differ for {name}");
 }
 
 #[test]
@@ -72,6 +74,11 @@ fn parity_for_each_link_type() {
             DLT_EN10MB,
             &[Pkt::new(TS, ethernet(&ipv4_tcp_syn(1, 80), false))],
         ),
+    );
+    // A DNS response: both faucets must extract identical name observations, not only segments.
+    assert_parity(
+        "par_dns_v4.pcap",
+        &legacy_pcap(DLT_RAW, &[Pkt::new(TS, ipv4_udp_dns_response())]),
     );
 }
 

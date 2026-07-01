@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use tcpvisr_core::{Endpoint, Nanos, SampleDir};
+use tcpvisr_core::{Endpoint, HostName, NameTable, Nanos, SampleDir};
 use tcpvisr_engine::{
     AsOf, ConnId, ConnState, InFlightSample, RttSample, SeqSample, ThroughputSample, Timeline,
 };
@@ -24,6 +24,7 @@ pub struct FocusConn<'a> {
     pub inflight: &'a [InFlightSample],
     pub rtt: &'a [RttSample],
     pub throughput: &'a [ThroughputSample],
+    pub responder_host: Option<HostName>,
 }
 
 /// Which detail graph the pane shows when open (`Tab` cycles it).
@@ -40,6 +41,7 @@ pub enum DetailView {
 pub struct ConnRow {
     pub id: ConnId,
     pub peer: Endpoint,
+    pub host: Option<HostName>,
     pub service: Option<&'static str>,
     pub state: ConnState,
     pub origin_inferred: bool,
@@ -53,6 +55,7 @@ pub struct ConnRow {
 #[derive(Debug)]
 struct ConnMeta {
     peer: Endpoint,
+    host: Option<HostName>,
     service: Option<&'static str>,
     origin_inferred: bool,
     search_prefix: String,
@@ -105,20 +108,35 @@ pub struct App {
 }
 
 impl App {
-    /// Builds the app from a capture's [`Timeline`] and a header title string.
+    /// Builds the app from a capture's [`Timeline`] and a header title string, with no host names.
     #[must_use]
     pub fn new(timeline: Timeline, title: String) -> Self {
+        Self::new_with_names(timeline, &NameTable::default(), title)
+    }
+
+    /// Builds the app, resolving each connection's peer to a host label from `names` (design §6,
+    /// §10.M10). Names are static per capture, so resolution happens once here, not per frame.
+    #[must_use]
+    pub fn new_with_names(timeline: Timeline, names: &NameTable, title: String) -> Self {
         let metas: HashMap<ConnId, ConnMeta> = timeline
             .connections()
             .map(|c| {
                 let service = service_name(c.responder.port);
-                let search_prefix =
-                    format!("{} {} {}", c.origin, c.responder, service.unwrap_or(""))
-                        .to_lowercase();
+                let host = names.resolve(c.responder.ip).cloned();
+                let host_str = host.as_ref().map_or("", HostName::as_ref);
+                let search_prefix = format!(
+                    "{} {} {} {}",
+                    c.origin,
+                    c.responder,
+                    host_str,
+                    service.unwrap_or("")
+                )
+                .to_lowercase();
                 (
                     c.id,
                     ConnMeta {
                         peer: c.responder,
+                        host,
                         service,
                         origin_inferred: c.origin_inferred,
                         search_prefix,
@@ -173,6 +191,7 @@ impl App {
         Some(ConnRow {
             id: a.id,
             peer: m.peer,
+            host: m.host.clone(),
             service: m.service,
             state: a.state,
             origin_inferred: m.origin_inferred,
@@ -221,6 +240,7 @@ impl App {
             inflight: self.timeline.inflight_series(id),
             rtt: self.timeline.rtt_series(id),
             throughput: self.timeline.throughput_series(id),
+            responder_host: self.metas.get(&id).and_then(|m| m.host.clone()),
         })
     }
 
@@ -588,6 +608,46 @@ mod tests {
     fn unknown_responder_port_has_no_service() {
         let app = app_of(vec![entry(ep(1, 40000), ep(2, 40001), 0, 0, 0)]);
         assert_eq!(app.visible()[0].service, None);
+    }
+
+    fn table_of(pairs: &[(Endpoint, &str)]) -> tcpvisr_core::NameTable {
+        let mut t = tcpvisr_core::NameTable::default();
+        for (ep, name) in pairs {
+            t.observe(tcpvisr_core::NameObservation {
+                ts: Nanos(1),
+                ip: ep.ip,
+                name: tcpvisr_core::HostName::new(name).unwrap(),
+            });
+        }
+        t
+    }
+
+    #[test]
+    fn row_carries_resolved_host_over_ip() {
+        let (c, s) = entry(ep(1, 51324), ep(2, 443), 10, 20, 0);
+        let names = table_of(&[(ep(2, 443), "github.com")]);
+        let app = App::new_with_names(Timeline::new(vec![(c, s)]), &names, "t".to_string());
+        let row = &app.visible()[0];
+        assert_eq!(row.host.as_ref().map(HostName::as_ref), Some("github.com"));
+    }
+
+    #[test]
+    fn unresolved_peer_has_no_host() {
+        // app_of uses the plain App::new -> empty NameTable -> no host.
+        let app = app_of(vec![entry(ep(1, 1), ep(2, 443), 0, 0, 0)]);
+        assert!(app.visible()[0].host.is_none());
+    }
+
+    #[test]
+    fn filter_matches_resolved_host_name() {
+        let (c, s) = entry(ep(1, 51324), ep(2, 443), 10, 20, 0);
+        let names = table_of(&[(ep(2, 443), "github.com")]);
+        let mut app = App::new_with_names(Timeline::new(vec![(c, s)]), &names, "t".to_string());
+        app.enter_filter();
+        for ch in "github".chars() {
+            app.push_filter(ch);
+        }
+        assert_eq!(app.visible().len(), 1, "host name matches the filter");
     }
 
     #[test]

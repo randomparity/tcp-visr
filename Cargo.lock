@@ -1542,6 +1542,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "simple-dns"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a75cbde1bf934313596a004973e462f9a82caa814dcf1a5f507bdf51597eeb4"
+dependencies = [
+ "bitflags 2.13.0",
+]
+
+[[package]]
 name = "siphasher"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1622,6 +1631,7 @@ dependencies = [
  "etherparse",
  "serde",
  "serde_json",
+ "simple-dns",
  "tcpvisr-core",
  "tcpvisr-engine",
  "tcpvisr-ingest",
@@ -1655,6 +1665,7 @@ dependencies = [
  "etherparse",
  "pcap",
  "pcap-parser",
+ "simple-dns",
  "tcpvisr-core",
  "thiserror 2.0.18",
 ]

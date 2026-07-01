@@ -213,16 +213,26 @@ fn build_replay_app(
     cfg: EngineConfig,
 ) -> Result<tcpvisr_tui::App, Box<dyn std::error::Error>> {
     let mut tracker = Tracker::new(cfg);
-    let (_link, skipped) =
-        tcpvisr_ingest::parse_file_visit(file, &mut |item| tracker.observe(item))?;
+    let mut names = tcpvisr_core::NameTable::default();
+    let (_link, skipped) = tcpvisr_ingest::parse_file_visit_named(
+        file,
+        &mut |item| tracker.observe(item),
+        &mut |obs| names.observe(obs.clone()),
+    )?;
     let timeline = tracker.into_timeline()?;
+    let capped = if names.dropped() > 0 {
+        ", names capped"
+    } else {
+        ""
+    };
     let title = format!(
-        "tcp-visr — {}  ({} connections, skipped {})",
+        "tcp-visr — {}  ({} connections, {} names, skipped {}{capped})",
         file.display(),
         timeline.connection_count(),
+        names.len(),
         skipped.total(),
     );
-    Ok(tcpvisr_tui::App::new(timeline, title))
+    Ok(tcpvisr_tui::App::new_with_names(timeline, &names, title))
 }
 
 /// The `EngineConfig` the replay path uses: all five replay timelines on (state, seq, in-flight,
@@ -389,6 +399,35 @@ mod build_replay_tests {
 
     fn fixture() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/metrics_basic.pcap")
+    }
+
+    fn dns_fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/name_resolution.pcap")
+    }
+
+    #[test]
+    fn build_replay_app_resolves_and_counts_names() {
+        let cfg = replay_engine_config(10_000_000);
+        let app = build_replay_app(&dns_fixture(), cfg).expect("build");
+        // The responder (93.184.216.34:443) resolves to the fixture's DNS host name.
+        let row = app
+            .visible()
+            .into_iter()
+            .find(|r| r.host.is_some())
+            .expect("a resolved row");
+        assert_eq!(
+            row.host.as_ref().map(tcpvisr_core::HostName::as_ref),
+            Some("example.com")
+        );
+        // The title reports the resolved-name count.
+        assert!(app.title().contains("1 names"), "title: {}", app.title());
+    }
+
+    #[test]
+    fn build_replay_app_reports_zero_names_without_dns() {
+        let cfg = replay_engine_config(10_000_000);
+        let app = build_replay_app(&fixture(), cfg).expect("build");
+        assert!(app.title().contains("0 names"), "title: {}", app.title());
     }
 
     #[test]
