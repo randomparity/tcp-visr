@@ -179,6 +179,20 @@ impl MetricState {
         }
     }
 
+    /// The wire bytes-outstanding for `dir` (`snd_nxt − acked`, serial, clamped ≥ 0), or `None`
+    /// if `dir` has no send frontier or nothing acked yet. Pure read of current state; used by
+    /// the M7 in-flight collector to snapshot both directions (ADR-0012 §1).
+    pub(crate) fn in_flight(&self, dir: Direction) -> Option<u64> {
+        let d = idx(dir);
+        let snd = self.dir[d].snd_nxt?;
+        let acked = self.dir[d].acked?;
+        Some(if serial_le(acked, snd) {
+            u64::from(snd.serial_diff(acked))
+        } else {
+            0
+        })
+    }
+
     fn throughput(&mut self, d: usize, seg: &Segment, cfg: &EngineConfig) -> u64 {
         let window = cfg.throughput_window.0;
         if seg.payload_len > 0 {
@@ -302,6 +316,29 @@ mod derive_tests {
 
     fn cfg() -> EngineConfig {
         EngineConfig::default()
+    }
+
+    #[test]
+    fn in_flight_query_matches_sample_and_snapshots_opposite_drain() {
+        let mut m = MetricState::new();
+        let c = cfg();
+        // O2R sends 10 bytes @seq100; own outstanding == 10, query agrees.
+        let s1 = m.observe(
+            &seg(ACK, 100, 1, 10, 1_000, false),
+            Direction::OriginToResponder,
+            &c,
+        );
+        assert_eq!(s1.in_flight_bytes, 10);
+        assert_eq!(m.in_flight(Direction::OriginToResponder), Some(10));
+        // R2O has no send frontier yet -> None.
+        assert_eq!(m.in_flight(Direction::ResponderToOrigin), None);
+        // R2O ACK=110 drains O2R: querying O2R now reads 0 (the ack-time drain).
+        m.observe(
+            &seg(ACK, 1, 110, 0, 2_000, false),
+            Direction::ResponderToOrigin,
+            &c,
+        );
+        assert_eq!(m.in_flight(Direction::OriginToResponder), Some(0));
     }
 
     #[test]

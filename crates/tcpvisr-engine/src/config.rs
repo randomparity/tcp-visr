@@ -25,6 +25,8 @@ pub struct EngineConfig {
     pub collect_state_timeline: bool,
     /// Whether the tracker records a per-segment `SeqSample` Time/Sequence series (M6 detail).
     pub collect_seq_timeline: bool,
+    /// Whether the tracker records a per-segment `InFlightSample` timeline (M7 detail).
+    pub collect_inflight_timeline: bool,
 }
 
 impl Default for EngineConfig {
@@ -38,6 +40,7 @@ impl Default for EngineConfig {
             max_samples: 10_000_000,
             collect_state_timeline: false,
             collect_seq_timeline: false,
+            collect_inflight_timeline: false,
         }
     }
 }
@@ -59,6 +62,12 @@ mod tests {
         // M2 defaults unchanged:
         assert_eq!(c.dead_after, Nanos(120_000_000_000));
         assert_eq!(c.reset_threshold, 1 << 30);
+    }
+
+    #[test]
+    fn inflight_timeline_defaults_off() {
+        let c = EngineConfig::default();
+        assert!(!c.collect_inflight_timeline);
     }
 
     #[test]

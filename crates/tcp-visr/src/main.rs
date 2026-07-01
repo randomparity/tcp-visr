@@ -225,6 +225,18 @@ fn build_replay_app(
     Ok(tcpvisr_tui::App::new(timeline, title))
 }
 
+/// The `EngineConfig` the replay path uses: all three replay timelines on (state, seq,
+/// in-flight), plus the sample ceiling.
+fn replay_engine_config(max_samples: usize) -> EngineConfig {
+    EngineConfig {
+        collect_state_timeline: true,
+        collect_seq_timeline: true,
+        collect_inflight_timeline: true,
+        max_samples,
+        ..EngineConfig::default()
+    }
+}
+
 /// Streams `file` into the engine, then browses the resulting connections in the interactive
 /// timeline TUI. Requires an interactive terminal; refuses to run when stdout is redirected so
 /// it never blocks a pipe.
@@ -236,12 +248,7 @@ fn run_replay(file: &Path, max_samples: usize) -> Result<(), Box<dyn std::error:
     if !std::io::stdout().is_terminal() {
         return Err("replay requires an interactive terminal (stdout is not a tty)".into());
     }
-    let cfg = EngineConfig {
-        collect_state_timeline: true,
-        collect_seq_timeline: true,
-        max_samples,
-        ..EngineConfig::default()
-    };
+    let cfg = replay_engine_config(max_samples);
     let app = build_replay_app(file, cfg)?;
     tcpvisr_tui::run(app)?;
     Ok(())
@@ -405,6 +412,39 @@ mod build_replay_tests {
         let err = build_replay_app(&fixture(), cfg).expect_err("ceiling");
         let msg = err.to_string();
         assert!(msg.contains("--max-samples"), "actionable: {msg}");
+    }
+
+    #[test]
+    fn run_replay_config_enables_inflight_collection() {
+        // The replay path must turn the flag on; guard against a regression that drops it.
+        // We cannot run the TUI here, so assert the config the replay path builds.
+        let cfg = replay_engine_config(10_000_000);
+        assert!(
+            cfg.collect_inflight_timeline,
+            "replay must collect the in-flight timeline"
+        );
+        assert!(
+            cfg.collect_seq_timeline && cfg.collect_state_timeline,
+            "M5/M6 series still on"
+        );
+    }
+
+    #[test]
+    fn build_replay_app_collects_inflight_series_for_the_focus_connection() {
+        let cfg = EngineConfig {
+            collect_state_timeline: true,
+            collect_seq_timeline: true,
+            collect_inflight_timeline: true,
+            ..EngineConfig::default()
+        };
+        let app = build_replay_app(&fixture(), cfg).expect("build");
+        let focus = app
+            .focus()
+            .expect("a connection is selected at the initial cursor");
+        assert!(
+            !focus.inflight.is_empty(),
+            "fixture with data segments yields a non-empty focus in-flight series"
+        );
     }
 
     #[test]
