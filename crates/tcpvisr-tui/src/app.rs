@@ -4,11 +4,22 @@
 
 use std::collections::HashMap;
 
-use tcpvisr_core::{Endpoint, Nanos};
-use tcpvisr_engine::{AsOf, ConnId, ConnState, Timeline};
+use tcpvisr_core::{Endpoint, Nanos, SampleDir};
+use tcpvisr_engine::{AsOf, ConnId, ConnState, SeqSample, Timeline};
 
 use crate::service::service_name;
 use crate::transport::Transport;
+
+/// The selected connection projected for the detail pane: its endpoints, X span, focus
+/// direction (higher-byte), and its `SeqSample` series (borrowed from the `Timeline`).
+#[derive(Debug)]
+pub struct FocusConn<'a> {
+    pub origin: Endpoint,
+    pub responder: Endpoint,
+    pub x_span: (Nanos, Nanos),
+    pub focus_dir: SampleDir,
+    pub series: &'a [SeqSample],
+}
 
 /// One master-list row: a connection projected as of the cursor time.
 #[derive(Debug, Clone)]
@@ -75,6 +86,7 @@ pub struct App {
     query: String,
     selected: Option<ConnId>,
     title: String,
+    detail_open: bool,
 }
 
 impl App {
@@ -110,6 +122,7 @@ impl App {
             query: String::new(),
             selected: None,
             title,
+            detail_open: false,
         };
         app.selected = app.visible().first().map(|r| r.id);
         app
@@ -149,6 +162,46 @@ impl App {
             origin_inferred: m.origin_inferred,
             bytes_up: a.bytes_o2r,
             bytes_down: a.bytes_r2o,
+        })
+    }
+
+    /// Opens the detail pane for the selected row (no-op when nothing is selected).
+    pub fn open_detail(&mut self) {
+        if self.selected.is_some() {
+            self.detail_open = true;
+        }
+    }
+
+    /// Closes the detail pane.
+    pub fn close_detail(&mut self) {
+        self.detail_open = false;
+    }
+
+    /// Whether the detail pane is open.
+    #[must_use]
+    pub fn is_detail_open(&self) -> bool {
+        self.detail_open
+    }
+
+    /// The selected connection projected for the detail pane, or `None` if nothing is selected
+    /// or the connection is unknown. The focus direction is the higher-byte direction (tie ->
+    /// O2R).
+    #[must_use]
+    pub fn focus(&self) -> Option<FocusConn<'_>> {
+        let id = self.selected?;
+        let c = self.timeline.connections().find(|c| c.id == id)?;
+        let x_span = self.timeline.x_span(id)?;
+        let focus_dir = if c.bytes_o2r >= c.bytes_r2o {
+            SampleDir::OriginToResponder
+        } else {
+            SampleDir::ResponderToOrigin
+        };
+        Some(FocusConn {
+            origin: c.origin,
+            responder: c.responder,
+            x_span,
+            focus_dir,
+            series: self.timeline.seq_series(id),
         })
     }
 
@@ -735,6 +788,48 @@ mod tests {
             .find(|r| r.id == early_id)
             .unwrap();
         assert_eq!(early_row.bytes_up, 50);
+    }
+
+    #[test]
+    fn enter_opens_only_with_a_selection_esc_closes() {
+        let mut app = app_of(vec![entry(ep(1, 51324), ep(2, 443), 10, 20, 0)]);
+        assert!(!app.is_detail_open());
+        app.open_detail();
+        assert!(app.is_detail_open(), "opens when a row is selected");
+        app.close_detail();
+        assert!(!app.is_detail_open());
+
+        let mut empty = app_of(vec![]);
+        empty.open_detail();
+        assert!(!empty.is_detail_open(), "no selection -> stays closed");
+    }
+
+    #[test]
+    fn focus_resolves_selected_connection_and_higher_byte_direction() {
+        // O2R 5 bytes, R2O 500 bytes -> focus direction is R2O.
+        let mut down = full_conn(ep(1, 1), ep(2, 443), 0, 0, 10, ConnState::Established);
+        down.bytes_o2r = 5;
+        down.bytes_r2o = 500;
+        let samples = vec![ss(0, ConnState::Established, 5, 500)];
+        let app = App::new(Timeline::new(vec![(down, samples)]), "t".to_string());
+        let f = app.focus().expect("selected connection resolves");
+        assert_eq!(f.origin, ep(1, 1));
+        assert_eq!(f.responder, ep(2, 443));
+        assert_eq!(f.x_span, (Nanos(0), Nanos(10)));
+        assert_eq!(f.focus_dir, SampleDir::ResponderToOrigin);
+    }
+
+    #[test]
+    fn detail_follows_selection() {
+        let a = entry(ep(1, 1), ep(2, 22), 0, 0, 0); // peer 10.0.0.2
+        let b = entry(ep(1, 2), ep(3, 22), 0, 0, 0); // peer 10.0.0.3
+        let mut app = app_of(vec![a, b]);
+        app.open_detail();
+        let first = app.focus().expect("focus").responder;
+        app.move_down();
+        let second = app.focus().expect("focus").responder;
+        assert_ne!(first, second, "focus follows the moved selection");
+        assert_eq!(second, ep(3, 22));
     }
 
     #[test]
