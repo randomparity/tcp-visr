@@ -33,6 +33,16 @@ pub struct SeqSample {
     pub kind: SeqKind,
 }
 
+/// One point on a connection's In-flight graph (design §6, ADR-0012 §1). `bytes` is the wire
+/// bytes-outstanding for `dir` (the engine's `in_flight_bytes`) at time `t`; both directions are
+/// snapshotted per segment so an ACK's drain is sampled at ack time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InFlightSample {
+    pub t: Nanos,
+    pub dir: SampleDir,
+    pub bytes: u64,
+}
+
 /// A per-segment lifecycle snapshot: the connection's `(state, cumulative bytes)` at time `t`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StateSample {
@@ -434,6 +444,18 @@ mod tests {
         let tl = Timeline::new(vec![(c, vec![ss(0, ConnState::Established, 0, 0)])]);
         assert!(tl.seq_series(other).is_empty());
         assert_eq!(tl.x_span(other), None);
+    }
+
+    #[test]
+    fn inflight_sample_is_copy_and_holds_fields() {
+        let s = InFlightSample {
+            t: Nanos(5),
+            dir: SampleDir::OriginToResponder,
+            bytes: 42,
+        };
+        let copy = s; // Copy, not move
+        assert_eq!(copy, s);
+        assert_eq!(copy.bytes, 42);
     }
 
     #[test]
