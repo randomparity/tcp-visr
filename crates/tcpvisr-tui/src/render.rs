@@ -3,8 +3,9 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Text;
+use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState};
+use tcpvisr_core::Nanos;
 
 use crate::app::{App, Mode, SortDir, SortField};
 
@@ -17,10 +18,17 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 fn render_main(frame: &mut Frame, app: &App, area: Rect) {
-    let block = Block::bordered().title(app.title().to_string());
+    let block = Block::bordered()
+        .title(app.title().to_string())
+        .title(Line::from(transport_status(app)).right_aligned());
     let rows = app.visible();
     if rows.is_empty() {
-        let p = Paragraph::new("no connections in capture").block(block);
+        let msg = if app.is_capture_empty() {
+            "no connections in capture".to_string()
+        } else {
+            format!("no connections active at t={}s", fmt_seconds(app.cursor()))
+        };
+        let p = Paragraph::new(msg).block(block);
         frame.render_widget(p, area);
         return;
     }
@@ -82,12 +90,31 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 SortDir::Desc => '▼',
             };
             format!(
-                "/ filter   s sort:{}{arrow}   S reverse   ↑↓ select   q quit",
+                "space play/pause  ←→ seek  +/- speed  ,/. step  / filter  s sort:{}{arrow}  q quit",
                 sort_label(app.sort_field()),
             )
         }
     };
     frame.render_widget(Paragraph::new(text), area);
+}
+
+/// The right-aligned header segment: play state, speed, and `t=cursor / total` in seconds.
+fn transport_status(app: &App) -> String {
+    let glyph = if app.is_playing() { "▶" } else { "⏸" };
+    let (_, end) = app.bounds();
+    format!(
+        "[ {glyph} {:.1}x  t={}s / {}s ]",
+        app.speed(),
+        fmt_seconds(app.cursor()),
+        fmt_seconds(end),
+    )
+}
+
+/// Formats a nanosecond timestamp as fixed 3-decimal seconds via integer arithmetic (no locale,
+/// no float) so `TestBackend` snapshots stay deterministic.
+fn fmt_seconds(t: Nanos) -> String {
+    let ms = t.0 / 1_000_000;
+    format!("{}.{:03}", ms / 1000, ms % 1000)
 }
 
 fn sort_label(field: SortField) -> &'static str {
@@ -111,7 +138,7 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use tcpvisr_core::{Endpoint, Nanos};
-    use tcpvisr_engine::{ConnId, ConnState, Connection, EndpointPair};
+    use tcpvisr_engine::{ConnId, ConnState, Connection, EndpointPair, StateSample, Timeline};
 
     fn ep(a: u8, port: u16) -> Endpoint {
         Endpoint {
@@ -120,8 +147,12 @@ mod tests {
         }
     }
 
-    fn conn(origin: Endpoint, responder: Endpoint, inferred: bool) -> Connection {
-        Connection {
+    fn entry(
+        origin: Endpoint,
+        responder: Endpoint,
+        inferred: bool,
+    ) -> (Connection, Vec<StateSample>) {
+        let c = Connection {
             id: ConnId {
                 pair: EndpointPair::new(origin, responder),
                 instance: 0,
@@ -135,7 +166,115 @@ mod tests {
             bytes_o2r: 10,
             bytes_r2o: 20,
             segments: 1,
+        };
+        let s = StateSample {
+            t: Nanos(0),
+            state: ConnState::Established,
+            bytes_o2r: 10,
+            bytes_r2o: 20,
+        };
+        (c, vec![s])
+    }
+
+    fn app_of(entries: Vec<(Connection, Vec<StateSample>)>, title: &str) -> App {
+        App::new(Timeline::new(entries), title.to_string())
+    }
+
+    fn ss(t: u64, up: u64, down: u64) -> StateSample {
+        StateSample {
+            t: Nanos(t),
+            state: ConnState::Established,
+            bytes_o2r: up,
+            bytes_r2o: down,
         }
+    }
+
+    fn conn_span(
+        origin: Endpoint,
+        responder: Endpoint,
+        opened: u64,
+        last: u64,
+        state: ConnState,
+    ) -> Connection {
+        Connection {
+            id: ConnId {
+                pair: EndpointPair::new(origin, responder),
+                instance: 0,
+            },
+            state,
+            origin,
+            responder,
+            origin_inferred: false,
+            opened_at: Nanos(opened),
+            last_at: Nanos(last),
+            bytes_o2r: 0,
+            bytes_r2o: 0,
+            segments: 1,
+        }
+    }
+
+    /// A single connection open on `[0, end_ns]` with one sample at t=0.
+    fn app_span(end_ns: u64) -> App {
+        let c = conn_span(ep(1, 5), ep(2, 443), 0, end_ns, ConnState::Established);
+        App::new(
+            Timeline::new(vec![(c, vec![ss(0, 10, 20)])]),
+            "t".to_string(),
+        )
+    }
+
+    /// Two connections with a gap: A closed on `[0,100]`, B open on `[200,300]`. Between them
+    /// no connection is active.
+    fn gapped_app() -> App {
+        let a = conn_span(ep(1, 1), ep(2, 80), 0, 100, ConnState::Closed);
+        let a_s = vec![
+            ss(0, 0, 0),
+            StateSample {
+                t: Nanos(100),
+                state: ConnState::Closed,
+                bytes_o2r: 0,
+                bytes_r2o: 0,
+            },
+        ];
+        let b = conn_span(ep(1, 2), ep(3, 80), 200, 300, ConnState::Established);
+        let b_s = vec![ss(200, 0, 0), ss(300, 0, 0)];
+        App::new(Timeline::new(vec![(a, a_s), (b, b_s)]), "t".to_string())
+    }
+
+    #[test]
+    fn header_shows_transport_status() {
+        let app = app_span(2_000_000_000); // 2.000s total
+        let s = draw(&app, 100, 8);
+        assert!(s.contains("⏸"), "paused glyph: {s}");
+        assert!(s.contains("1.0x"), "speed: {s}");
+        assert!(s.contains("t=0.000s / 2.000s"), "cursor readout: {s}");
+    }
+
+    #[test]
+    fn header_shows_playing_glyph_after_toggle() {
+        let mut app = app_span(2_000_000_000);
+        app.toggle_play();
+        let s = draw(&app, 100, 8);
+        assert!(s.contains("▶"), "playing glyph: {s}");
+    }
+
+    #[test]
+    fn footer_shows_transport_hints() {
+        let app = app_span(1_000_000_000);
+        let s = draw(&app, 100, 8);
+        assert!(s.contains("space"), "play/pause hint: {s}");
+        assert!(s.contains("seek"), "seek hint: {s}");
+        assert!(s.contains("speed"), "speed hint: {s}");
+        assert!(s.contains("q quit"), "quit hint: {s}");
+    }
+
+    #[test]
+    fn empty_active_set_shows_gap_message() {
+        let mut app = gapped_app();
+        app.step_forward(); // cursor 100 (A still active at its close)
+        app.seek(true); // cursor 106 -> in the gap, nothing active
+        assert!(app.visible().is_empty(), "cursor is in the gap");
+        let s = draw(&app, 60, 6);
+        assert!(s.contains("no connections active"), "{s}");
     }
 
     fn buffer_string(buf: &Buffer) -> String {
@@ -164,9 +303,9 @@ mod tests {
 
     #[test]
     fn renders_header_columns_selection_and_footer() {
-        let app = App::new(
-            &[conn(ep(1, 5), ep(2, 443), false)],
-            "tcp-visr — c.pcap  (1 connections, skipped 0)".to_string(),
+        let app = app_of(
+            vec![entry(ep(1, 5), ep(2, 443), false)],
+            "tcp-visr — c.pcap  (1 connections, skipped 0)",
         );
         let s = draw(&app, 80, 10);
         assert!(s.contains("tcp-visr — c.pcap"), "{s}");
@@ -180,14 +319,14 @@ mod tests {
 
     #[test]
     fn renders_mid_stream_marker() {
-        let app = App::new(&[conn(ep(1, 5), ep(2, 443), true)], "t".to_string());
+        let app = app_of(vec![entry(ep(1, 5), ep(2, 443), true)], "t");
         let s = draw(&app, 80, 6);
         assert!(s.contains("Established~"), "{s}");
     }
 
     #[test]
     fn filter_mode_shows_query_line() {
-        let mut app = App::new(&[conn(ep(1, 5), ep(2, 443), false)], "t".to_string());
+        let mut app = app_of(vec![entry(ep(1, 5), ep(2, 443), false)], "t");
         handle_key(&mut app, key(KeyCode::Char('/')));
         handle_key(&mut app, key(KeyCode::Char('h')));
         let s = draw(&app, 80, 6);
@@ -196,7 +335,7 @@ mod tests {
 
     #[test]
     fn empty_capture_shows_placeholder() {
-        let app = App::new(&[], "t".to_string());
+        let app = app_of(vec![], "t");
         let s = draw(&app, 40, 6);
         assert!(s.contains("no connections in capture"), "{s}");
     }
@@ -205,10 +344,10 @@ mod tests {
     fn selected_row_visible_when_viewport_shorter_than_list() {
         // 5 connections, height only fits ~1 body row; move to the last and
         // assert its peer still renders (scroll-to-selection).
-        let conns: Vec<_> = (1..=5)
-            .map(|i| conn(ep(1, i), ep(2, 100 + i), false))
+        let entries: Vec<_> = (1..=5)
+            .map(|i| entry(ep(1, i), ep(2, 100 + i), false))
             .collect();
-        let mut app = App::new(&conns, "t".to_string());
+        let mut app = app_of(entries, "t");
         for _ in 0..4 {
             handle_key(&mut app, key(KeyCode::Down));
         }

@@ -25,6 +25,26 @@ fn replay_without_tty_exits_nonzero_with_actionable_message() {
 }
 
 #[test]
+fn replay_rejects_zero_max_samples_with_actionable_message() {
+    // Validation runs before the tty guard, so the harness's piped stdout still reaches it.
+    let out = bin()
+        .args([
+            "replay",
+            "--max-samples",
+            "0",
+            &fixture("metrics_basic.pcap"),
+        ])
+        .output()
+        .expect("run tcp-visr");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+    assert!(
+        stderr.contains("--max-samples must be at least 1"),
+        "actionable message: {stderr}"
+    );
+}
+
+#[test]
 fn replay_no_longer_reports_not_implemented() {
     // Under the harness's piped stdout the tty guard fires first, so this does not
     // exercise the ingest path (that is covered by conns/parse tests); it only

@@ -8,6 +8,7 @@ use crate::config::EngineConfig;
 use crate::conn::{ConnId, Connection, Direction, EndpointPair};
 use crate::metrics::{ConnectionMetrics, MetricError, MetricState, SeriesCollection};
 use crate::state::ConnState;
+use crate::timeline::{StateSample, Timeline};
 
 /// `true` when `seq` sits backward of `baseline` in RFC 1982 serial space by more than
 /// `threshold` — a drop to a fresh ISN, not a retransmit/reorder or a forward `u32` wrap.
@@ -49,6 +50,7 @@ struct ConnTrack {
     base_r2o: Option<TcpSeq>,
     metrics: MetricState,
     series: Vec<MetricSample>,
+    states: Vec<StateSample>,
 }
 
 impl ConnTrack {
@@ -119,6 +121,15 @@ impl ConnTrack {
         }
     }
 
+    fn snapshot(&self, t: Nanos) -> StateSample {
+        StateSample {
+            t,
+            state: self.state,
+            bytes_o2r: self.bytes_o2r,
+            bytes_r2o: self.bytes_r2o,
+        }
+    }
+
     fn view(&self) -> Connection {
         Connection {
             id: self.id,
@@ -181,6 +192,20 @@ impl Tracker {
         self.conns[idx].series.push(sample);
     }
 
+    /// Stores a per-segment state snapshot on the instance at `idx`, enforcing `max_samples`.
+    /// Gated by `config.collect_state_timeline` at the call site (all instances, not per-id).
+    fn record_state(&mut self, idx: usize, sample: StateSample) {
+        if self.overflowed {
+            return;
+        }
+        if self.collected_samples >= self.config.max_samples {
+            self.overflowed = true;
+            return;
+        }
+        self.collected_samples += 1;
+        self.conns[idx].states.push(sample);
+    }
+
     /// Folds one `Item` into tracker state. `Tick`s are inert in replay (idle is evaluated
     /// per-segment from each segment's own ts); they never create a connection.
     pub fn observe(&mut self, item: &Item) {
@@ -198,6 +223,10 @@ impl Tracker {
                 let dir = self.conns[idx].direction_of(src);
                 self.conns[idx].account(seg, dir);
                 self.conns[idx].apply_state(seg, dir);
+                if self.config.collect_state_timeline {
+                    let s = self.conns[idx].snapshot(seg.ts);
+                    self.record_state(idx, s);
+                }
                 // Derive metrics only for collected instances: `conns` (None) pays nothing, and
                 // the per-direction RTT/throughput state cannot grow for unrelated flows. Once
                 // the ceiling has tripped the result is already doomed, so stop deriving entirely
@@ -265,6 +294,7 @@ impl Tracker {
             base_r2o: None,
             metrics: MetricState::new(),
             series: Vec::new(),
+            states: Vec::new(),
         };
         let dir = track.direction_of(src);
         track.account(seg, dir);
@@ -283,6 +313,10 @@ impl Tracker {
         self.live.insert(pair, idx);
         if let Some(sample) = sample {
             self.record_sample(idx, sample);
+        }
+        if self.config.collect_state_timeline {
+            let s = self.conns[idx].snapshot(seg.ts);
+            self.record_state(idx, s);
         }
     }
 
@@ -315,6 +349,25 @@ impl Tracker {
             .collect();
         out.sort_by_key(|m| (m.conn.opened_at, m.conn.id.pair, m.conn.id.instance));
         Ok(out)
+    }
+
+    /// All tracked instances with their per-segment state timeline, built into a [`Timeline`].
+    ///
+    /// # Errors
+    /// Returns [`MetricError::SampleCeiling`] if collection hit `max_samples`.
+    pub fn into_timeline(self) -> Result<Timeline, MetricError> {
+        if self.overflowed {
+            return Err(MetricError::SampleCeiling {
+                samples: self.collected_samples + 1,
+                limit: self.config.max_samples,
+            });
+        }
+        let pairs: Vec<(Connection, Vec<StateSample>)> = self
+            .conns
+            .iter()
+            .map(|c| (c.view(), c.states.clone()))
+            .collect();
+        Ok(Timeline::new(pairs))
     }
 }
 
@@ -676,6 +729,68 @@ mod split_tests {
             let seq = TcpSeq(base.wrapping_sub(b));
             prop_assert_eq!(is_backward_reset(TcpSeq(base), seq, thr), b > thr);
         }
+    }
+}
+
+#[cfg(test)]
+mod timeline_tests {
+    use super::test_support::{ep, seg};
+    use super::*;
+    use crate::state::ConnState;
+    use tcpvisr_core::{Nanos, TcpFlags};
+
+    fn cfg() -> EngineConfig {
+        EngineConfig {
+            collect_state_timeline: true,
+            ..EngineConfig::default()
+        }
+    }
+
+    #[test]
+    fn collects_one_state_sample_per_segment() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(cfg());
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 1_000)); // 10 bytes o2r
+        t.observe(&seg(s, c, TcpFlags::ACK, 1, 110, 20, 2_000)); // 20 bytes r2o
+        let tl = t.into_timeline().expect("no ceiling");
+        assert_eq!(tl.connection_count(), 1);
+        let at = tl.resolve_at(Nanos(2_000));
+        assert_eq!(at[0].bytes_o2r, 10);
+        assert_eq!(at[0].bytes_r2o, 20);
+        assert_eq!(at[0].state, ConnState::Established);
+        // As of the first segment only, the second direction's bytes are not yet counted.
+        assert_eq!(tl.resolve_at(Nanos(1_000))[0].bytes_r2o, 0);
+    }
+
+    #[test]
+    fn none_flag_yields_empty_series() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(EngineConfig::default()); // collect_state_timeline = false
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 1_000));
+        let tl = t.into_timeline().expect("no ceiling");
+        // No samples -> the connection is never resolvable and bounds fall back to 0..last_at.
+        assert!(tl.resolve_at(Nanos(1_000)).is_empty());
+        assert_eq!(tl.bounds(), (Nanos(0), Nanos(1_000)));
+    }
+
+    #[test]
+    fn ceiling_exceeded_returns_error() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(EngineConfig {
+            collect_state_timeline: true,
+            max_samples: 1,
+            ..EngineConfig::default()
+        });
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 1_000));
+        t.observe(&seg(c, s, TcpFlags::ACK, 110, 1, 10, 2_000)); // 2nd sample > limit 1
+        let err = t.into_timeline().expect_err("should exceed");
+        assert_eq!(
+            err,
+            MetricError::SampleCeiling {
+                samples: 2,
+                limit: 1
+            }
+        );
     }
 }
 
