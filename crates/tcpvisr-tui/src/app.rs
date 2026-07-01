@@ -871,6 +871,7 @@ mod tests {
             vec![ss(0, ConnState::Established, 100, 0)],
             vec![],
             inflight,
+            vec![],
         )]);
         let app = App::new(tl, "t".to_string());
         let f = app.focus().expect("selected");

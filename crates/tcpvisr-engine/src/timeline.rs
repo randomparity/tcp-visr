@@ -43,6 +43,18 @@ pub struct InFlightSample {
     pub bytes: u64,
 }
 
+/// One point on a connection's RTT graph (design §6, §10.M8, ADR-0013 §1). `dir` is the measured
+/// data-flow direction (the sender being acked, i.e. opposite the ACK's own direction). `rtt` is
+/// the Karn-paired per-ack sample (the engine's `MetricSample.rtt`); `srtt` is the smoothed RTT
+/// (RFC 6298 EWMA, α = 1/8) over `dir`'s samples so far.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RttSample {
+    pub t: Nanos,
+    pub dir: SampleDir,
+    pub rtt: Nanos,
+    pub srtt: Nanos,
+}
+
 /// A per-segment lifecycle snapshot: the connection's `(state, cumulative bytes)` at time `t`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StateSample {
@@ -52,13 +64,14 @@ pub struct StateSample {
     pub bytes_r2o: u64,
 }
 
-/// A connection paired with its three replay detail series (state, seq, in-flight), as fed to
+/// A connection paired with its four replay detail series (state, seq, in-flight, rtt), as fed to
 /// [`Timeline::with_seq`].
 pub type ConnSeries = (
     Connection,
     Vec<StateSample>,
     Vec<SeqSample>,
     Vec<InFlightSample>,
+    Vec<RttSample>,
 );
 
 /// A connection's resolved state as of a cursor time.
@@ -78,6 +91,7 @@ struct Entry {
     samples: Vec<StateSample>,
     seq: Vec<SeqSample>,
     inflight: Vec<InFlightSample>,
+    rtt: Vec<RttSample>,
     effective_end: Nanos,
 }
 
@@ -98,7 +112,7 @@ impl Timeline {
         Self::with_seq(
             conns
                 .into_iter()
-                .map(|(c, s)| (c, s, Vec::new(), Vec::new()))
+                .map(|(c, s)| (c, s, Vec::new(), Vec::new(), Vec::new()))
                 .collect(),
         )
     }
@@ -113,20 +127,21 @@ impl Timeline {
     pub fn with_seq(conns: Vec<ConnSeries>) -> Self {
         let end = conns
             .iter()
-            .map(|(c, _, _, _)| c.last_at)
+            .map(|(c, _, _, _, _)| c.last_at)
             .max()
             .unwrap_or(Nanos(0));
         let start = conns
             .iter()
-            .flat_map(|(_, s, _, _)| s.iter().map(|x| x.t))
+            .flat_map(|(_, s, _, _, _)| s.iter().map(|x| x.t))
             .min()
             .unwrap_or(Nanos(0));
         let mut entries: Vec<Entry> = Vec::with_capacity(conns.len());
         let mut event_times: Vec<Nanos> = Vec::new();
-        for (conn, mut samples, mut seq, mut inflight) in conns {
+        for (conn, mut samples, mut seq, mut inflight, mut rtt) in conns {
             samples.sort_by_key(|s| s.t);
             seq.sort_by_key(|s| s.t);
             inflight.sort_by_key(|s| s.t);
+            rtt.sort_by_key(|s| s.t);
             for s in &samples {
                 event_times.push(s.t);
             }
@@ -137,6 +152,7 @@ impl Timeline {
                 samples,
                 seq,
                 inflight,
+                rtt,
                 effective_end,
             });
         }
@@ -183,6 +199,16 @@ impl Timeline {
     pub fn inflight_series(&self, id: ConnId) -> &[InFlightSample] {
         match self.entries.iter().find(|e| e.conn.id == id) {
             Some(e) => &e.inflight,
+            None => &[],
+        }
+    }
+
+    /// The focus connection's `RttSample` series (`t`-sorted), or an empty slice if `id` is
+    /// unknown or its series was not collected.
+    #[must_use]
+    pub fn rtt_series(&self, id: ConnId) -> &[RttSample] {
+        match self.entries.iter().find(|e| e.conn.id == id) {
+            Some(e) => &e.rtt,
             None => &[],
         }
     }
@@ -455,6 +481,7 @@ mod tests {
             vec![ss(100, ConnState::Established, 0, 0)],
             vec![sq(300, 20, 10), sq(100, 0, 10)], // supplied out of t-order
             Vec::new(),
+            Vec::new(),
         )]);
         let series = tl.seq_series(id);
         assert_eq!(series.len(), 2);
@@ -480,12 +507,51 @@ mod tests {
             vec![ss(100, ConnState::Established, 0, 0)],
             vec![sq(100, 0, 10)],
             vec![iff(300, 5), iff(100, 10)], // supplied out of t-order
+            Vec::new(),
         )]);
         let series = tl.inflight_series(id);
         assert_eq!(series.len(), 2);
         assert_eq!(series[0].t, Nanos(100), "sorted by t at construction");
         assert_eq!(series[1].t, Nanos(300));
         assert_eq!(series[0].bytes, 10);
+    }
+
+    fn ratt(t: u64, rtt: u64, srtt: u64) -> RttSample {
+        RttSample {
+            t: Nanos(t),
+            dir: SampleDir::OriginToResponder,
+            rtt: Nanos(rtt),
+            srtt: Nanos(srtt),
+        }
+    }
+
+    #[test]
+    fn with_seq_carries_rtt_sorted_and_exposes_series() {
+        let c = conn(0, 100, 300, ConnState::Established);
+        let id = c.id;
+        let tl = Timeline::with_seq(vec![(
+            c,
+            vec![ss(100, ConnState::Established, 0, 0)],
+            vec![sq(100, 0, 10)],
+            vec![iff(100, 10)],
+            vec![ratt(300, 5, 5), ratt(100, 9, 9)], // supplied out of t-order
+        )]);
+        let series = tl.rtt_series(id);
+        assert_eq!(series.len(), 2);
+        assert_eq!(series[0].t, Nanos(100), "sorted by t at construction");
+        assert_eq!(series[1].t, Nanos(300));
+        assert_eq!(series[0].rtt, Nanos(9));
+    }
+
+    #[test]
+    fn rtt_series_empty_for_unknown_id() {
+        let c = conn(0, 0, 10, ConnState::Established);
+        let other = ConnId {
+            pair: EndpointPair::new(ep(9, 1), ep(9, 2)),
+            instance: 7,
+        };
+        let tl = Timeline::new(vec![(c, vec![ss(0, ConnState::Established, 0, 0)])]);
+        assert!(tl.rtt_series(other).is_empty());
     }
 
     #[test]

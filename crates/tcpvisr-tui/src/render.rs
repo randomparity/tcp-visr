@@ -598,7 +598,13 @@ mod tests {
         };
         let mut c2 = c;
         c2.bytes_o2r = 100;
-        let tl = Timeline::with_seq(vec![(c2, vec![ss(0, 100, 0)], vec![sq], Vec::new())]);
+        let tl = Timeline::with_seq(vec![(
+            c2,
+            vec![ss(0, 100, 0)],
+            vec![sq],
+            Vec::new(),
+            Vec::new(),
+        )]);
         let mut app = App::new(tl, "t".to_string());
         app.open_detail();
         let s = draw(&app, 120, 14);
@@ -627,7 +633,13 @@ mod tests {
                 bytes: 100,
             },
         ];
-        let tl = Timeline::with_seq(vec![(c2, vec![ss(0, 100, 0)], vec![], inflight)]);
+        let tl = Timeline::with_seq(vec![(
+            c2,
+            vec![ss(0, 100, 0)],
+            vec![],
+            inflight,
+            Vec::new(),
+        )]);
         let mut app = App::new(tl, "t".to_string());
         app.open_detail();
         app.cycle_detail_view(); // -> InFlight
@@ -655,7 +667,13 @@ mod tests {
             dir: tcpvisr_core::SampleDir::OriginToResponder,
             bytes: 100,
         }];
-        let tl = Timeline::with_seq(vec![(c2, vec![ss(0, 100, 0)], vec![], inflight)]);
+        let tl = Timeline::with_seq(vec![(
+            c2,
+            vec![ss(0, 100, 0)],
+            vec![],
+            inflight,
+            Vec::new(),
+        )]);
         let mut app = App::new(tl, "t".to_string());
         app.open_detail();
         app.cycle_detail_view();
@@ -681,7 +699,13 @@ mod tests {
                 out_of_order: false,
             },
         };
-        let tl = Timeline::with_seq(vec![(c2, vec![ss(0, 100, 0)], vec![sq], Vec::new())]);
+        let tl = Timeline::with_seq(vec![(
+            c2,
+            vec![ss(0, 100, 0)],
+            vec![sq],
+            Vec::new(),
+            Vec::new(),
+        )]);
         let mut app = App::new(tl, "t".to_string());
         app.open_detail();
         // Width 34 -> right pane 17, inner 15, plot_w = 15 - 8 gutter = 7 < MIN_W(8) -> the guard
@@ -712,6 +736,7 @@ mod tests {
             c2,
             vec![ss(0, 5_000_000_000, 0)],
             vec![d(0, 0), d(1_000, 5_000_000_000)],
+            Vec::new(),
             Vec::new(),
         )]);
         let mut app = App::new(tl, "t".to_string());
