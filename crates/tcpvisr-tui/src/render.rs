@@ -165,11 +165,12 @@ fn draw_plot(frame: &mut Frame, inner: Rect, gutter: u16, plot: &SeqPlot) {
 fn draw_axes(frame: &mut Frame, inner: Rect, gutter: u16, plot: &SeqPlot) {
     let buf = frame.buffer_mut();
     let y_top = inner.y + 1;
-    // Y labels: max_rel at the top of the plot, 0 at the bottom.
+    // Y labels: max_rel at the top of the plot, 0 at the bottom. `fmt_seq` keeps a large
+    // (multi-GB) offset inside the gutter so it never overwrites plot columns.
     buf.set_string(
         inner.x,
         y_top,
-        format!("{:>7}", plot.max_rel),
+        format!("{:>7}", fmt_seq(plot.max_rel)),
         Style::default(),
     );
     let y_bottom = y_top + plot.height - 1;
@@ -226,6 +227,27 @@ fn transport_status(app: &App) -> String {
 fn fmt_seconds(t: Nanos) -> String {
     let ms = t.0 / 1_000_000;
     format!("{}.{:03}", ms / 1000, ms % 1000)
+}
+
+/// Formats a Y-axis sequence offset compactly so it fits the detail pane's gutter: raw below
+/// 100 000, else an SI-suffixed `<whole>.<tenth><K|M|G|T>`. Integer-only (deterministic
+/// snapshots). This keeps a multi-GB `max_rel` from overflowing the gutter into the plot.
+fn fmt_seq(n: i64) -> String {
+    const UNITS: [(i64, char); 4] = [
+        (1_000_000_000_000, 'T'),
+        (1_000_000_000, 'G'),
+        (1_000_000, 'M'),
+        (1_000, 'K'),
+    ];
+    if n < 100_000 {
+        return n.to_string();
+    }
+    for (div, suffix) in UNITS {
+        if n >= div {
+            return format!("{}.{}{suffix}", n / div, (n % div) * 10 / div);
+        }
+    }
+    n.to_string()
 }
 
 fn sort_label(field: SortField) -> &'static str {
@@ -514,6 +536,39 @@ mod tests {
         // fires, and the 15-wide inner still fits the "widen terminal" message.
         let s = draw(&app, 34, 12);
         assert!(s.contains("widen terminal"), "narrow detail guidance: {s}");
+    }
+
+    #[test]
+    fn large_seq_axis_label_is_abbreviated_not_raw() {
+        // Two O2R data points 5 GB apart -> max_rel ~5e9. The Y label must be SI-abbreviated
+        // (e.g. "5.0G") so it fits the gutter, never the raw 10-digit number (which would
+        // overflow into the plot columns).
+        let c = conn_span(ep(1, 5), ep(2, 443), 0, 1_000, ConnState::Established);
+        let mut c2 = c;
+        c2.bytes_o2r = 5_000_000_000;
+        let d = |t: u64, rel: i64| tcpvisr_engine::SeqSample {
+            t: Nanos(t),
+            dir: tcpvisr_core::SampleDir::OriginToResponder,
+            rel,
+            len: 100,
+            kind: tcpvisr_engine::SeqKind::Data {
+                retransmit: false,
+                out_of_order: false,
+            },
+        };
+        let tl = Timeline::with_seq(vec![(
+            c2,
+            vec![ss(0, 5_000_000_000, 0)],
+            vec![d(0, 0), d(1_000, 5_000_000_000)],
+        )]);
+        let mut app = App::new(tl, "t".to_string());
+        app.open_detail();
+        let s = draw(&app, 120, 14);
+        assert!(s.contains('G'), "Y axis label is SI-abbreviated: {s}");
+        assert!(
+            !s.contains("5000000000"),
+            "raw 10-digit seq number must not be printed into the gutter: {s}"
+        );
     }
 
     #[test]
