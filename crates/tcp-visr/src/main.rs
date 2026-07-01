@@ -225,13 +225,14 @@ fn build_replay_app(
     Ok(tcpvisr_tui::App::new(timeline, title))
 }
 
-/// The `EngineConfig` the replay path uses: all three replay timelines on (state, seq,
-/// in-flight), plus the sample ceiling.
+/// The `EngineConfig` the replay path uses: all four replay timelines on (state, seq, in-flight,
+/// rtt), plus the sample ceiling.
 fn replay_engine_config(max_samples: usize) -> EngineConfig {
     EngineConfig {
         collect_state_timeline: true,
         collect_seq_timeline: true,
         collect_inflight_timeline: true,
+        collect_rtt_timeline: true,
         max_samples,
         ..EngineConfig::default()
     }
@@ -426,6 +427,31 @@ mod build_replay_tests {
         assert!(
             cfg.collect_seq_timeline && cfg.collect_state_timeline,
             "M5/M6 series still on"
+        );
+    }
+
+    #[test]
+    fn run_replay_config_enables_rtt_collection() {
+        let cfg = replay_engine_config(10_000_000);
+        assert!(
+            cfg.collect_rtt_timeline,
+            "replay must collect the RTT timeline"
+        );
+    }
+
+    #[test]
+    fn build_replay_app_collects_rtt_series_for_the_focus_connection() {
+        // metrics_basic connection 0: focus dir O2R (SYN + 100 B data >> 1-B SYN-ACK) has RTT
+        // samples at t=1ms and t=3ms (SYN-ACK acking the SYN; final ACK acking the O2R data),
+        // verified from the M3 oracle.
+        let cfg = replay_engine_config(10_000_000);
+        let app = build_replay_app(&fixture(), cfg).expect("build");
+        let focus = app
+            .focus()
+            .expect("a connection is selected at the initial cursor");
+        assert!(
+            !focus.rtt.is_empty(),
+            "fixture with acked data yields a non-empty focus RTT series"
         );
     }
 
