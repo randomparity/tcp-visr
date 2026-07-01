@@ -90,3 +90,28 @@ fn both_faucets_classify_truncated() {
     assert_eq!(parse_file(&path).unwrap().skipped.truncated, 1);
     assert_eq!(parse_file_libpcap(&path).unwrap().skipped.truncated, 1);
 }
+
+#[test]
+fn parity_for_header_only_capture() {
+    use etherparse::PacketBuilder;
+
+    let mut full = Vec::new();
+    PacketBuilder::ipv4([10, 0, 0, 1], [10, 0, 0, 2], 64)
+        .tcp(1234, 80, 1000, 64240)
+        .ack(1)
+        .write(&mut full, &[0x42; 80])
+        .unwrap();
+    let orig_len = full.len() as u32;
+    let header_end = full.len() - 80;
+
+    let bytes = legacy_pcap(
+        DLT_RAW,
+        &[Pkt::truncated(TS, full[..header_end].to_vec(), orig_len)],
+    );
+    let path = write_temp("par_hdr_only.pcap", &bytes);
+    let pure = parse_file(&path).expect("pure-Rust faucet");
+    let lib = parse_file_libpcap(&path).expect("libpcap faucet");
+    assert_eq!(pure.items, lib.items, "items differ");
+    assert_eq!(pure.skipped, lib.skipped, "skip counts differ");
+    assert_eq!(pure.skipped.total(), 0, "nothing should be skipped");
+}
