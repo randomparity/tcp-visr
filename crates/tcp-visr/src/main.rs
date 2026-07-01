@@ -238,6 +238,7 @@ fn run_replay(file: &Path, max_samples: usize) -> Result<(), Box<dyn std::error:
     }
     let cfg = EngineConfig {
         collect_state_timeline: true,
+        collect_seq_timeline: true,
         max_samples,
         ..EngineConfig::default()
     };
@@ -404,5 +405,22 @@ mod build_replay_tests {
         let err = build_replay_app(&fixture(), cfg).expect_err("ceiling");
         let msg = err.to_string();
         assert!(msg.contains("--max-samples"), "actionable: {msg}");
+    }
+
+    #[test]
+    fn build_replay_app_collects_seq_series_for_the_focus_connection() {
+        let cfg = EngineConfig {
+            collect_state_timeline: true,
+            collect_seq_timeline: true,
+            ..EngineConfig::default()
+        };
+        let app = build_replay_app(&fixture(), cfg).expect("build");
+        let focus = app
+            .focus()
+            .expect("a connection is selected at the initial cursor");
+        assert!(
+            !focus.series.is_empty(),
+            "fixture with data segments yields a non-empty focus seq series"
+        );
     }
 }
