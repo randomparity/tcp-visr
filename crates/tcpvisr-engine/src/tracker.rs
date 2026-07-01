@@ -1,6 +1,6 @@
 //! The pure connection tracker (design §10.M2, ADR-0006).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use tcpvisr_core::{Endpoint, Item, MetricSample, Nanos, SampleDir, Segment, TcpFlags, TcpSeq};
 
@@ -102,6 +102,83 @@ impl SeqUnwrap {
     }
 }
 
+/// A retained sample carrying a time index, so [`evict_front`] can age any series generically.
+trait HasT {
+    fn t(&self) -> Nanos;
+}
+impl HasT for StateSample {
+    fn t(&self) -> Nanos {
+        self.t
+    }
+}
+impl HasT for SeqSample {
+    fn t(&self) -> Nanos {
+        self.t
+    }
+}
+impl HasT for InFlightSample {
+    fn t(&self) -> Nanos {
+        self.t
+    }
+}
+impl HasT for RttSample {
+    fn t(&self) -> Nanos {
+        self.t
+    }
+}
+impl HasT for ThroughputSample {
+    fn t(&self) -> Nanos {
+        self.t
+    }
+}
+impl HasT for MetricSample {
+    fn t(&self) -> Nanos {
+        self.t
+    }
+}
+
+/// Drops front (oldest) samples with `t < horizon` from `dq`, never below `keep_min`, decrementing
+/// `count` for each removed sample.
+fn evict_front<T: HasT>(dq: &mut VecDeque<T>, horizon: u64, keep_min: usize, count: &mut usize) {
+    while dq.len() > keep_min {
+        match dq.front() {
+            Some(f) if f.t().0 < horizon => {
+                dq.pop_front();
+                *count = count.saturating_sub(1);
+            }
+            _ => break,
+        }
+    }
+}
+
+/// The `Evict` memory backstop: frees one slot on `c` by dropping the oldest sample from its
+/// longest series, never dropping the last `states` sample. Returns whether a sample was popped.
+fn pop_longest_front(c: &mut ConnTrack) -> bool {
+    // Evictable length per series; `states` can only shrink above its keep-1 floor.
+    let lens = [
+        c.states.len().saturating_sub(1),
+        c.series.len(),
+        c.seq.len(),
+        c.inflight.len(),
+        c.rtt.len(),
+        c.throughput.len(),
+    ];
+    let Some((which, &max)) = lens.iter().enumerate().max_by_key(|(_, l)| **l) else {
+        return false;
+    };
+    if max == 0 {
+        return false;
+    }
+    match which {
+        0 => c.states.pop_front().is_some(),
+        1 => c.series.pop_front().is_some(),
+        2 => c.seq.pop_front().is_some(),
+        3 => c.inflight.pop_front().is_some(),
+        4 => c.rtt.pop_front().is_some(),
+        _ => c.throughput.pop_front().is_some(),
+    }
+}
+
 /// Full per-instance tracking state (internal). The public view is [`Connection`].
 struct ConnTrack {
     id: ConnId,
@@ -119,12 +196,12 @@ struct ConnTrack {
     base_o2r: Option<TcpSeq>,
     base_r2o: Option<TcpSeq>,
     metrics: MetricState,
-    series: Vec<MetricSample>,
-    states: Vec<StateSample>,
-    seq: Vec<SeqSample>,
-    inflight: Vec<InFlightSample>,
-    rtt: Vec<RttSample>,
-    throughput: Vec<ThroughputSample>,
+    series: VecDeque<MetricSample>,
+    states: VecDeque<StateSample>,
+    seq: VecDeque<SeqSample>,
+    inflight: VecDeque<InFlightSample>,
+    rtt: VecDeque<RttSample>,
+    throughput: VecDeque<ThroughputSample>,
     srtt: [Option<Nanos>; 2],
     unwrap: [SeqUnwrap; 2],
 }
@@ -269,6 +346,9 @@ pub struct Tracker {
     next_instance: HashMap<EndpointPair, u32>,
     collected_samples: usize,
     overflowed: bool,
+    /// The latest observed time (max of any segment/tick ts). Drives live eviction; stays at the
+    /// last segment ts under replay, where `Tick`s never arrive.
+    now: Nanos,
 }
 
 impl Tracker {
@@ -281,6 +361,7 @@ impl Tracker {
             next_instance: HashMap::new(),
             collected_samples: 0,
             overflowed: false,
+            now: Nanos(0),
         }
     }
 
@@ -293,45 +374,79 @@ impl Tracker {
         }
     }
 
-    /// Stores `sample` on the instance at `idx` when collected, enforcing `max_samples`.
+    /// Admission control shared by every `record_*`, enforcing the retention policy. Under
+    /// `FailFast`, sets `overflowed` and returns `false` when the ceiling is hit. Under `Evict`,
+    /// evicts one oldest sample from connection `idx` to make room and returns `true`. Increments
+    /// the collected count on a successful admit.
+    fn admit(&mut self, idx: usize) -> bool {
+        if self.collected_samples >= self.config.retention.max_samples() {
+            if self.config.retention.window().is_some() {
+                self.evict_oldest_global(idx);
+            } else {
+                self.overflowed = true;
+                return false;
+            }
+        }
+        self.collected_samples += 1;
+        true
+    }
+
+    /// Ages out samples older than the eviction horizon (`now − window`) from every series,
+    /// keeping at least the most recent `states` sample so the connection stays resolvable at
+    /// "now". No-op under `FailFast` (replay).
+    fn evict_samples(&mut self) {
+        let Some(window) = self.config.retention.window() else {
+            return;
+        };
+        let horizon = self.now.0.saturating_sub(window.0);
+        for c in &mut self.conns {
+            evict_front(&mut c.states, horizon, 1, &mut self.collected_samples);
+            evict_front(&mut c.series, horizon, 0, &mut self.collected_samples);
+            evict_front(&mut c.seq, horizon, 0, &mut self.collected_samples);
+            evict_front(&mut c.inflight, horizon, 0, &mut self.collected_samples);
+            evict_front(&mut c.rtt, horizon, 0, &mut self.collected_samples);
+            evict_front(&mut c.throughput, horizon, 0, &mut self.collected_samples);
+        }
+    }
+
+    /// Backstop under `Evict`: pop one oldest sample from connection `idx`'s longest series to make
+    /// room at the ceiling, keeping the collected count consistent.
+    fn evict_oldest_global(&mut self, idx: usize) {
+        if pop_longest_front(&mut self.conns[idx]) {
+            self.collected_samples = self.collected_samples.saturating_sub(1);
+        }
+    }
+
+    /// Stores `sample` on the instance at `idx` when collected, enforcing the retention policy.
     fn record_sample(&mut self, idx: usize, sample: MetricSample) {
         let id = self.conns[idx].id;
         if !self.should_collect(id) {
             return;
         }
-        if self.collected_samples >= self.config.retention.max_samples() {
-            self.overflowed = true;
-            return;
+        if self.admit(idx) {
+            self.conns[idx].series.push_back(sample);
         }
-        self.collected_samples += 1;
-        self.conns[idx].series.push(sample);
     }
 
-    /// Stores a per-segment state snapshot on the instance at `idx`, enforcing `max_samples`.
+    /// Stores a per-segment state snapshot on the instance at `idx`, enforcing the retention policy.
     /// Gated by `config.collect_state_timeline` at the call site (all instances, not per-id).
     fn record_state(&mut self, idx: usize, sample: StateSample) {
         if self.overflowed {
             return;
         }
-        if self.collected_samples >= self.config.retention.max_samples() {
-            self.overflowed = true;
-            return;
+        if self.admit(idx) {
+            self.conns[idx].states.push_back(sample);
         }
-        self.collected_samples += 1;
-        self.conns[idx].states.push(sample);
     }
 
-    /// Stores one `SeqSample` on the instance at `idx`, enforcing `max_samples`.
+    /// Stores one `SeqSample` on the instance at `idx`, enforcing the retention policy.
     fn record_seq(&mut self, idx: usize, sample: SeqSample) {
         if self.overflowed {
             return;
         }
-        if self.collected_samples >= self.config.retention.max_samples() {
-            self.overflowed = true;
-            return;
+        if self.admit(idx) {
+            self.conns[idx].seq.push_back(sample);
         }
-        self.collected_samples += 1;
-        self.conns[idx].seq.push(sample);
     }
 
     /// Builds and records this segment's seq points when seq collection is on and not overflowed.
@@ -352,17 +467,14 @@ impl Tracker {
         }
     }
 
-    /// Stores one `InFlightSample` on the instance at `idx`, enforcing `max_samples`.
+    /// Stores one `InFlightSample` on the instance at `idx`, enforcing the retention policy.
     fn record_inflight(&mut self, idx: usize, sample: InFlightSample) {
         if self.overflowed {
             return;
         }
-        if self.collected_samples >= self.config.retention.max_samples() {
-            self.overflowed = true;
-            return;
+        if self.admit(idx) {
+            self.conns[idx].inflight.push_back(sample);
         }
-        self.collected_samples += 1;
-        self.conns[idx].inflight.push(sample);
     }
 
     /// Snapshots each direction's current outstanding for this segment when in-flight collection
@@ -386,17 +498,14 @@ impl Tracker {
         }
     }
 
-    /// Stores one `RttSample` on the instance at `idx`, enforcing `max_samples`.
+    /// Stores one `RttSample` on the instance at `idx`, enforcing the retention policy.
     fn record_rtt(&mut self, idx: usize, sample: RttSample) {
         if self.overflowed {
             return;
         }
-        if self.collected_samples >= self.config.retention.max_samples() {
-            self.overflowed = true;
-            return;
+        if self.admit(idx) {
+            self.conns[idx].rtt.push_back(sample);
         }
-        self.collected_samples += 1;
-        self.conns[idx].rtt.push(sample);
     }
 
     /// Records the per-ack RTT + smoothed SRTT when RTT collection is on and this segment yielded
@@ -431,17 +540,14 @@ impl Tracker {
         );
     }
 
-    /// Stores one `ThroughputSample` on the instance at `idx`, enforcing `max_samples`.
+    /// Stores one `ThroughputSample` on the instance at `idx`, enforcing the retention policy.
     fn record_throughput(&mut self, idx: usize, sample: ThroughputSample) {
         if self.overflowed {
             return;
         }
-        if self.collected_samples >= self.config.retention.max_samples() {
-            self.overflowed = true;
-            return;
+        if self.admit(idx) {
+            self.conns[idx].throughput.push_back(sample);
         }
-        self.collected_samples += 1;
-        self.conns[idx].throughput.push(sample);
     }
 
     /// Snapshots each direction's trailing-window `(throughput, goodput)` for this segment when
@@ -471,11 +577,17 @@ impl Tracker {
         }
     }
 
-    /// Folds one `Item` into tracker state. `Tick`s are inert in replay (idle is evaluated
-    /// per-segment from each segment's own ts); they never create a connection.
+    /// Folds one `Item` into tracker state. A `Segment` advances `now` and, under `Evict`, ages
+    /// out samples past the horizon. `Tick` handling is added by the live path; under `FailFast`
+    /// (replay) it stays inert — replay never emits a `Tick`.
     pub fn observe(&mut self, item: &Item) {
-        if let Item::Segment(seg) = item {
-            self.observe_segment(seg);
+        match item {
+            Item::Segment(seg) => {
+                self.now = Nanos(self.now.0.max(seg.ts.0));
+                self.observe_segment(seg);
+                self.evict_samples();
+            }
+            Item::Tick(_) => {}
         }
     }
 
@@ -571,12 +683,12 @@ impl Tracker {
             base_o2r: None,
             base_r2o: None,
             metrics: MetricState::new(),
-            series: Vec::new(),
-            states: Vec::new(),
-            seq: Vec::new(),
-            inflight: Vec::new(),
-            rtt: Vec::new(),
-            throughput: Vec::new(),
+            series: VecDeque::new(),
+            states: VecDeque::new(),
+            seq: VecDeque::new(),
+            inflight: VecDeque::new(),
+            rtt: VecDeque::new(),
+            throughput: VecDeque::new(),
             srtt: [None, None],
             unwrap: [SeqUnwrap::default(); 2],
         };
@@ -640,7 +752,7 @@ impl Tracker {
             .iter()
             .map(|c| ConnectionMetrics {
                 conn: c.view(),
-                series: c.series.clone(),
+                series: c.series.iter().copied().collect(),
             })
             .collect();
         out.sort_by_key(|m| (m.conn.opened_at, m.conn.id.pair, m.conn.id.instance));
@@ -664,11 +776,11 @@ impl Tracker {
             .map(|c| {
                 (
                     c.view(),
-                    c.states.clone(),
-                    c.seq.clone(),
-                    c.inflight.clone(),
-                    c.rtt.clone(),
-                    c.throughput.clone(),
+                    c.states.iter().copied().collect(),
+                    c.seq.iter().copied().collect(),
+                    c.inflight.iter().copied().collect(),
+                    c.rtt.iter().copied().collect(),
+                    c.throughput.iter().copied().collect(),
                 )
             })
             .collect();
@@ -1759,5 +1871,103 @@ mod throughput_tests {
         t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 100, 0));
         let tl = t.into_timeline().expect("timeline");
         assert!(tl.throughput_series(only_id(&tl)).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod evict_tests {
+    use super::test_support::{ep, seg};
+    use super::*;
+    use crate::config::RetentionPolicy;
+    use crate::metrics::SeriesCollection;
+    use tcpvisr_core::{Nanos, TcpFlags};
+
+    fn evict_cfg(window_ns: u64) -> EngineConfig {
+        EngineConfig {
+            collect_state_timeline: true,
+            collect_throughput_timeline: true,
+            series_collection: SeriesCollection::All,
+            retention: RetentionPolicy::Evict {
+                window: Nanos(window_ns),
+                max_samples: 1_000_000,
+            },
+            ..EngineConfig::default()
+        }
+    }
+
+    #[test]
+    fn state_samples_older_than_window_are_evicted_keeping_latest() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(evict_cfg(1_000)); // 1000ns window
+        // four sends 500ns apart -> ts 500,1000,1500,2000; now=2000, horizon=1000
+        for k in 1..=4u64 {
+            let seq = 100 + u32::try_from(k).unwrap_or(0) * 10;
+            t.observe(&seg(c, s, TcpFlags::ACK, seq, 1, 10, k * 500));
+        }
+        let states: Vec<u64> = t.conns[0].states.iter().map(|x| x.t.0).collect();
+        // horizon = now(2000) - window(1000) = 1000; keep t >= 1000 -> {1000,1500,2000}
+        assert_eq!(states, vec![1000, 1500, 2000], "front (t<1000) evicted");
+    }
+
+    #[test]
+    fn states_never_evicts_the_last_sample() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(evict_cfg(1)); // 1ns window: everything but latest is stale
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 1_000));
+        t.observe(&seg(c, s, TcpFlags::ACK, 110, 1, 10, 5_000));
+        let states: Vec<u64> = t.conns[0].states.iter().map(|x| x.t.0).collect();
+        assert_eq!(
+            states,
+            vec![5_000],
+            "at least the most recent state survives"
+        );
+    }
+
+    #[test]
+    fn max_samples_backstop_evicts_oldest_under_evict() {
+        // A window so wide it never triggers, so only the max_samples backstop bounds the series.
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let cfg = EngineConfig {
+            collect_state_timeline: true,
+            retention: RetentionPolicy::Evict {
+                window: Nanos(u64::MAX),
+                max_samples: 3,
+            },
+            ..EngineConfig::default()
+        };
+        let mut t = Tracker::new(cfg);
+        for k in 1..=6u64 {
+            let seq = 100 + u32::try_from(k).unwrap_or(0) * 10;
+            t.observe(&seg(c, s, TcpFlags::ACK, seq, 1, 10, k * 1_000));
+        }
+        // state-only collection: 1 sample/segment, bounded at 3 by the backstop (not the window).
+        let states: Vec<u64> = t.conns[0].states.iter().map(|x| x.t.0).collect();
+        assert_eq!(
+            states,
+            vec![4_000, 5_000, 6_000],
+            "oldest evicted, latest kept"
+        );
+    }
+
+    #[test]
+    fn failfast_still_fails_fast() {
+        // Regression: FailFast must still trip SampleCeiling, unaffected by the evict path.
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let cfg = EngineConfig {
+            collect_state_timeline: true,
+            retention: RetentionPolicy::FailFast { max_samples: 1 },
+            ..EngineConfig::default()
+        };
+        let mut t = Tracker::new(cfg);
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 1_000));
+        t.observe(&seg(c, s, TcpFlags::ACK, 110, 1, 10, 2_000));
+        let err = t.into_timeline().expect_err("ceiling");
+        assert_eq!(
+            err,
+            MetricError::SampleCeiling {
+                samples: 2,
+                limit: 1
+            }
+        );
     }
 }
