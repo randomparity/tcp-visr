@@ -26,6 +26,7 @@ pub enum SkipReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeOutcome {
     Decoded(Segment),
+    Names(Vec<tcpvisr_core::NameObservation>),
     Skipped(SkipReason),
 }
 
@@ -71,8 +72,17 @@ pub fn decode_frame(link: LinkType, ts: Nanos, frame: &[u8], wire_len: u32) -> D
     if fragmenting {
         return DecodeOutcome::Skipped(SkipReason::Ipv6Fragment);
     }
-    let Some(TransportSlice::Tcp(tcp)) = sliced.transport.as_ref() else {
-        return DecodeOutcome::Skipped(classify_no_tcp(&sliced, truncated));
+    let tcp = match sliced.transport.as_ref() {
+        Some(TransportSlice::Tcp(tcp)) => tcp,
+        Some(TransportSlice::Udp(udp)) if udp.source_port() == 53 => {
+            let obs = crate::dns::parse_dns_answers(ts, udp.payload());
+            return if obs.is_empty() {
+                DecodeOutcome::Skipped(SkipReason::NonTcp)
+            } else {
+                DecodeOutcome::Names(obs)
+            };
+        }
+        _ => return DecodeOutcome::Skipped(classify_no_tcp(&sliced, truncated)),
     };
     DecodeOutcome::Decoded(Segment {
         ts,
@@ -297,7 +307,7 @@ mod tests {
                 assert_eq!(seg.window, 64240);
                 assert_eq!(seg.payload_len, 0);
             }
-            DecodeOutcome::Skipped(reason) => panic!("expected decode, got skip {reason:?}"),
+            other => panic!("expected decode, got {other:?}"),
         }
     }
 
@@ -320,6 +330,44 @@ mod tests {
             decode_full(LinkType::RawIp, &frame),
             DecodeOutcome::Skipped(SkipReason::NonTcp)
         );
+    }
+
+    fn ipv4_udp_dns_response() -> Vec<u8> {
+        use simple_dns::rdata::{A, RData};
+        use simple_dns::{CLASS, Name, Packet, ResourceRecord};
+        let mut p = Packet::new_reply(1);
+        p.answers.push(ResourceRecord::new(
+            Name::new("example.com").unwrap(),
+            CLASS::IN,
+            300,
+            RData::A(A {
+                address: u32::from(core::net::Ipv4Addr::new(93, 184, 216, 34)),
+            }),
+        ));
+        let dns = p.build_bytes_vec().unwrap();
+        let mut buf = Vec::new();
+        // Server (:53) -> client (:40000): source port 53 marks a response.
+        etherparse::PacketBuilder::ipv4([93, 184, 216, 34], [10, 0, 0, 2], 64)
+            .udp(53, 40000)
+            .write(&mut buf, &dns)
+            .unwrap();
+        buf
+    }
+
+    #[test]
+    fn decodes_dns_response_to_names() {
+        let frame = ipv4_udp_dns_response();
+        match decode_full(LinkType::RawIp, &frame) {
+            DecodeOutcome::Names(obs) => {
+                assert_eq!(obs.len(), 1);
+                assert_eq!(
+                    obs[0].ip,
+                    core::net::IpAddr::V4(core::net::Ipv4Addr::new(93, 184, 216, 34))
+                );
+                assert_eq!(obs[0].name.as_ref(), "example.com");
+            }
+            other => panic!("expected Names, got {other:?}"),
+        }
     }
 
     #[test]

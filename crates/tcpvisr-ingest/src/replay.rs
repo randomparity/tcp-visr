@@ -4,7 +4,7 @@ use std::fs::File;
 use std::path::Path;
 
 use pcap_parser::{Block, PcapBlockOwned, PcapError, create_reader};
-use tcpvisr_core::{Item, Nanos};
+use tcpvisr_core::{Item, NameObservation, Nanos};
 
 use crate::decode::{DecodeOutcome, decode_frame};
 use crate::link::LinkType;
@@ -34,6 +34,20 @@ pub fn parse_file_visit(
     path: &Path,
     sink: &mut dyn FnMut(&Item),
 ) -> Result<(LinkType, SkipCounts), IngestError> {
+    parse_file_visit_named(path, sink, &mut |_| {})
+}
+
+/// Like [`parse_file_visit`] but also streams DNS-derived [`NameObservation`]s into `name_sink`
+/// (design §6, §10.M10). Names ride beside the `Item` stream; the engine never sees them.
+///
+/// # Errors
+///
+/// Returns [`IngestError`] for the same whole-file failures as [`parse_file_visit`].
+pub fn parse_file_visit_named(
+    path: &Path,
+    sink: &mut dyn FnMut(&Item),
+    name_sink: &mut dyn FnMut(&NameObservation),
+) -> Result<(LinkType, SkipCounts), IngestError> {
     let file = File::open(path).map_err(|source| IngestError::Open {
         path: path.to_path_buf(),
         source,
@@ -50,7 +64,7 @@ pub fn parse_file_visit(
     loop {
         match reader.next() {
             Ok((offset, block)) => {
-                handle_block(&mut state, &block, path, sink)?;
+                handle_block(&mut state, &block, path, sink, name_sink)?;
                 reader.consume(offset);
             }
             Err(PcapError::Eof) => break,
@@ -88,11 +102,16 @@ pub fn parse_file_visit(
 /// Returns [`IngestError`] for the same whole-file failures as [`parse_file_visit`].
 pub fn parse_file(path: &Path) -> Result<ReplayParse, IngestError> {
     let mut items = Vec::new();
-    let (link_type, skipped) = parse_file_visit(path, &mut |item| items.push(item.clone()))?;
+    let mut names = Vec::new();
+    let (link_type, skipped) =
+        parse_file_visit_named(path, &mut |item| items.push(item.clone()), &mut |obs| {
+            names.push(obs.clone());
+        })?;
     Ok(ReplayParse {
         items,
         skipped,
         link_type,
+        names,
     })
 }
 
@@ -101,6 +120,7 @@ fn handle_block(
     block: &PcapBlockOwned<'_>,
     path: &Path,
     sink: &mut dyn FnMut(&Item),
+    name_sink: &mut dyn FnMut(&NameObservation),
 ) -> Result<(), IngestError> {
     match block {
         PcapBlockOwned::LegacyHeader(header) => {
@@ -118,7 +138,7 @@ fn handle_block(
             let abs_ns = u64::from(b.ts_sec)
                 .saturating_mul(1_000_000_000)
                 .saturating_add(u64::from(b.ts_usec).saturating_mul(state.nanos_per_tick));
-            process_packet(state, abs_ns, b.origlen, b.data, path, sink)
+            process_packet(state, abs_ns, b.origlen, b.data, path, sink, name_sink)
         }
         PcapBlockOwned::NG(Block::InterfaceDescription(idb)) => {
             let link = dlt_to_link(idb.linktype.0, path)?;
@@ -148,7 +168,7 @@ fn handle_block(
         PcapBlockOwned::NG(Block::EnhancedPacket(epb)) => {
             let ticks = (u64::from(epb.ts_high) << 32) | u64::from(epb.ts_low);
             let abs_ns = ticks.saturating_mul(state.nanos_per_tick);
-            process_packet(state, abs_ns, epb.origlen, epb.data, path, sink)
+            process_packet(state, abs_ns, epb.origlen, epb.data, path, sink, name_sink)
         }
         // Section headers and other pcapng blocks (statistics, name resolution, ...) carry no
         // packet for M1 and are ignored.
@@ -179,6 +199,7 @@ fn process_packet(
     data: &[u8],
     path: &Path,
     sink: &mut dyn FnMut(&Item),
+    name_sink: &mut dyn FnMut(&NameObservation),
 ) -> Result<(), IngestError> {
     let baseline = *state.baseline.get_or_insert(abs_ns);
     let ts = Nanos(abs_ns.saturating_sub(baseline));
@@ -188,6 +209,7 @@ fn process_packet(
     })?;
     match decode_frame(link, ts, data, origlen) {
         DecodeOutcome::Decoded(seg) => sink(&Item::Segment(seg)),
+        DecodeOutcome::Names(obs) => obs.iter().for_each(&mut *name_sink),
         DecodeOutcome::Skipped(reason) => state.skipped.record(reason),
     }
     Ok(())

@@ -29,6 +29,7 @@ pub fn parse_file_libpcap(path: &Path) -> Result<ReplayParse, IngestError> {
     let link = LinkType::from_dlt(dlt).ok_or(IngestError::UnknownLinkType { dlt })?;
 
     let mut items = Vec::new();
+    let mut names = Vec::new();
     let mut skipped = SkipCounts::default();
     let mut baseline: Option<u64> = None;
 
@@ -44,6 +45,7 @@ pub fn parse_file_libpcap(path: &Path) -> Result<ReplayParse, IngestError> {
                 let ts = Nanos(abs_ns.saturating_sub(base));
                 match decode_frame(link, ts, packet.data, header.len) {
                     DecodeOutcome::Decoded(seg) => items.push(Item::Segment(seg)),
+                    DecodeOutcome::Names(obs) => names.extend(obs),
                     DecodeOutcome::Skipped(reason) => skipped.record(reason),
                 }
             }
@@ -61,5 +63,6 @@ pub fn parse_file_libpcap(path: &Path) -> Result<ReplayParse, IngestError> {
         items,
         skipped,
         link_type: link,
+        names,
     })
 }
