@@ -260,21 +260,15 @@ mod tests {
 
     #[test]
     fn closed_drops_out_still_open_stays() {
-        let tl = Timeline::new(vec![
-            (conn(0, 0, 100, ConnState::Closed), vec![ss(0, ConnState::Established, 0, 0), ss(100, ConnState::Closed, 0, 0)]),
-            (conn(1, 0, 100, ConnState::Established), vec![ss(0, ConnState::Established, 0, 0)]),
-        ]);
-        // end = 100; at 100 both active; strictly after their last_at only the still-open one
-        // stays (its effective_end == end == 100), the closed one is bounded at 100 too, so
-        // pick a still-open case with a later end via a third connection.
+        // c0 closes at 100; c1 and c2 stay Established with a later capture end (300).
         let tl = Timeline::new(vec![
             (conn(0, 0, 100, ConnState::Closed), vec![ss(0, ConnState::Established, 0, 0), ss(100, ConnState::Closed, 0, 0)]),
             (conn(1, 0, 100, ConnState::Established), vec![ss(0, ConnState::Established, 0, 0)]),
             (conn(2, 0, 300, ConnState::Established), vec![ss(0, ConnState::Established, 0, 0), ss(300, ConnState::Established, 0, 0)]),
         ]);
         let ids = |t: u64| tl.active_at(Nanos(t)).len();
-        assert_eq!(ids(50), 3);
-        assert_eq!(ids(200), 1, "closed@100 gone; c1 (open, end=300) stays; c2 stays -> 2");
+        assert_eq!(ids(50), 3, "all three open at 50");
+        assert_eq!(ids(200), 2, "closed@100 gone; c1 and c2 (open, end=300) stay");
     }
 
     #[test]
@@ -509,8 +503,12 @@ git commit -m "feat(engine): collect per-segment state timeline in the tracker"
 
 use tcpvisr_core::Nanos;
 
-/// The selectable playback speeds (0.1–10×; every rung renders exactly at one decimal).
+/// The selectable playback speeds (0.1–10×; every rung renders exactly at one decimal). The
+/// `SPEEDS` array is for display only; `RATIOS` is the exact `(numerator, denominator)` used
+/// for cursor math so `tick` needs no float cast (which the repo's `allow_attributes = deny`
+/// + pedantic cast lints would otherwise force an `#[expect]` around).
 const SPEEDS: [f64; 6] = [0.1, 0.5, 1.0, 2.0, 5.0, 10.0];
+const RATIOS: [(u64, u64); 6] = [(1, 10), (1, 2), (1, 1), (2, 1), (5, 1), (10, 1)];
 const DEFAULT_SPEED_IDX: usize = 2; // 1.0x
 
 /// Cursor + speed + play state over a capture's `[start, end]` time domain.
@@ -588,14 +586,18 @@ impl Transport {
         self.cursor = Nanos(t.0.clamp(self.start.0, self.end.0));
     }
 
-    /// When playing, advances the cursor by `round(speed * dt)` ns, clamped to `end`; reaching
-    /// `end` auto-pauses. `dt` is injected wall-clock nanoseconds. A no-op when paused.
+    /// When playing, advances the cursor by `speed * dt` ns (exact integer ratio math), clamped
+    /// to `end`; reaching `end` auto-pauses. `dt` is injected wall-clock nanoseconds. A no-op
+    /// when paused.
     pub fn tick(&mut self, dt: Nanos) {
         if !self.playing {
             return;
         }
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
-        let adv = (dt.0 as f64 * self.speed()).round().max(0.0) as u64;
+        let (num, den) = RATIOS[self.speed_idx];
+        // u128 intermediate: dt.0 (u64) * num (<=10) cannot overflow; try_from clamps the
+        // (already-bounded) result back into u64 without a lint-tripping `as` cast.
+        let prod = u128::from(dt.0) * u128::from(num) / u128::from(den);
+        let adv = u64::try_from(prod).unwrap_or(u64::MAX);
         self.cursor = Nanos(self.cursor.0.saturating_add(adv).min(self.end.0));
         if self.cursor.0 >= self.end.0 {
             self.playing = false;
@@ -674,11 +676,9 @@ mod tests {
 }
 ```
 
-Note: the item-level `#[allow(...)]` on the cast in `tick` is required because clippy pedantic denies these casts and `allow_attributes` forbids bare item-level allows only in the *lint* sense — this is a cast-lint allow, which is permitted with the inline justification. If clippy still rejects `allow_attributes`, hoist the three casts behind a small helper with a `#![allow(...)]` at a `#[cfg]`-free module scope is NOT possible here; instead compute `adv` as: `let adv = (dt.0 as f64 * self.speed()).round(); let adv = if adv <= 0.0 { 0 } else if adv >= u64::MAX as f64 { u64::MAX } else { adv as u64 };` and keep the single `#[allow]`. Verify against clippy in Step 2.
-
 - [ ] **Step 2: Run tests + clippy**
 
-Run: `cargo test -p tcpvisr-tui transport` and `cargo clippy -p tcpvisr-tui --all-targets --all-features -- -D warnings`. If clippy rejects the cast allow, apply the fallback in the note above.
+Run: `cargo test -p tcpvisr-tui transport` and `cargo clippy -p tcpvisr-tui --all-targets --all-features -- -D warnings`. The integer-ratio `tick` uses no float cast, so no `#[allow]`/`#[expect]` is needed.
 
 - [ ] **Step 3: Export from the crate**
 
@@ -975,6 +975,7 @@ In `render_main`, build the block with both a left title and a right-aligned tra
         .title(app.title().to_string())
         .title(Line::from(transport_status(app)).right_aligned());
 ```
+**Verify this against ratatui 0.30.2 first** (its title API has shifted across versions): confirm a second `.title()` with a right-aligned `Line` renders in the top-right of the border. If it does not, fall back to a dedicated header row — split the area with `Layout::vertical([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])` and render a `Line` with the left title and a right-aligned `transport_status` into the top row, the table into the middle, and the footer into the bottom. The render test in Step 1 is what confirms whichever form you pick.
 Empty state: when `rows.is_empty()`, show `no connections in capture` if `app.is_capture_empty()`, else `format!("no connections active at t={}s", fmt_seconds(app.cursor()))`.
 Row state cell now reads `ConnRow.state` (already the resolved state) — keep the `~` suffix on `origin_inferred`.
 Footer (nav mode): replace the M4 string with:
