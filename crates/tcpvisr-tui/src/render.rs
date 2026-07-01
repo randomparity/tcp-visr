@@ -339,14 +339,15 @@ fn render_throughput_body(frame: &mut Frame, app: &App, inner: Rect, focus: &Foc
         frame.render_widget(Paragraph::new("widen terminal to view graph"), inner);
         return;
     };
-    draw_throughput_legend(frame, inner);
+    let (unit, div) = rate_unit(plot.max_rate);
+    draw_throughput_legend(frame, inner, unit);
     draw_throughput_plot(frame, inner, GUTTER, &plot);
-    draw_throughput_axes(frame, inner, GUTTER, &plot);
+    draw_throughput_axes(frame, inner, GUTTER, &plot, div);
 }
 
-fn draw_throughput_legend(frame: &mut Frame, inner: Rect) {
+fn draw_throughput_legend(frame: &mut Frame, inner: Rect, unit: &str) {
     let legend = format!(
-        "Throughput  {} total  {} goodput",
+        "Throughput [{unit}]  {} total  {} goodput",
         throughput::THROUGHPUT_GLYPH,
         throughput::GOODPUT_GLYPH
     );
@@ -381,21 +382,28 @@ fn draw_throughput_plot(frame: &mut Frame, inner: Rect, gutter: u16, plot: &Thro
     }
 }
 
-fn draw_throughput_axes(frame: &mut Frame, inner: Rect, gutter: u16, plot: &ThroughputPlot) {
+fn draw_throughput_axes(
+    frame: &mut Frame,
+    inner: Rect,
+    gutter: u16,
+    plot: &ThroughputPlot,
+    div: u64,
+) {
     let buf = frame.buffer_mut();
     let y_top = inner.y + 1;
-    // Y labels: max_rate at the top, 0bps at the bottom, in adaptive bps/kbps/Mbps/Gbps units.
+    // Y labels: max_rate at the top, 0 at the bottom, scaled to the legend's unit (via `div`) so
+    // even a Mbps/Gbps label stays inside the gutter and never overwrites plot columns.
     buf.set_string(
         inner.x,
         y_top,
-        format!("{:>7}", fmt_rate(plot.max_rate)),
+        format!("{:>7}", fmt_rate_scaled(plot.max_rate, div)),
         Style::default(),
     );
     let y_bottom = y_top + plot.height - 1;
     buf.set_string(
         inner.x,
         y_bottom,
-        format!("{:>7}", fmt_rate(0)),
+        format!("{:>7}", fmt_rate_scaled(0, div)),
         Style::default(),
     );
     // X labels: start / end seconds on the bottom label row.
@@ -549,20 +557,32 @@ fn fmt_rtt(t: Nanos) -> String {
     format!("{n}ns")
 }
 
-/// Formats a bits/second rate with an adaptive SI unit (bps/kbps/Mbps/Gbps) so a slow flow does not
-/// collapse to `0.000Mbps`. Integer-only (deterministic snapshots). `< 1 kbps` prints whole bps.
-fn fmt_rate(bps: u64) -> String {
+/// Picks the adaptive bits/second axis unit (bps/kbps/Mbps/Gbps) and its divisor for a given
+/// `max_rate`, so both tick labels scale to one unit shown once in the legend. Choosing the unit
+/// from `max_rate` keeps every scaled label's whole part < 1000 (so the label fits the gutter).
+fn rate_unit(max_rate: u64) -> (&'static str, u64) {
     const UNITS: [(u64, &str); 3] = [
         (1_000_000_000, "Gbps"),
         (1_000_000, "Mbps"),
         (1_000, "kbps"),
     ];
     for (div, unit) in UNITS {
-        if bps >= div {
-            return format!("{}.{:03}{unit}", bps / div, (bps % div) * 1000 / div);
+        if max_rate >= div {
+            return (unit, div);
         }
     }
-    format!("{bps}bps")
+    ("bps", 1)
+}
+
+/// Formats a bits/second rate scaled to `div` (from [`rate_unit`]) as a compact, unit-less label
+/// that fits the detail-pane gutter: `<whole>.<3-frac>` for a scaled unit, or a bare integer for
+/// bps. Integer-only (deterministic snapshots). Keeps a Mbps/Gbps `max_rate` from overflowing the
+/// gutter into the plot, like `fmt_seq` does for the bytes axis.
+fn fmt_rate_scaled(bps: u64, div: u64) -> String {
+    if div <= 1 {
+        return bps.to_string();
+    }
+    format!("{}.{:03}", bps / div, (bps % div) * 1000 / div)
 }
 
 fn sort_label(field: SortField) -> &'static str {
@@ -577,7 +597,7 @@ fn sort_label(field: SortField) -> &'static str {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
-    use super::{fmt_rate, fmt_rtt, render};
+    use super::{fmt_rate_scaled, fmt_rtt, rate_unit, render};
     use crate::app::App;
     use crate::handle_key;
     use core::net::{IpAddr, Ipv4Addr};
@@ -919,13 +939,41 @@ mod tests {
         assert_eq!(fmt_rtt(Nanos(2_000_000_000)), "2.000s");
     }
 
-    // Criterion 15a: a sub-Mbps rate stays informative rather than collapsing to 0.000Mbps.
+    // Criterion 15a: the axis unit adapts to the rate magnitude (so a slow flow is not forced onto a
+    // Mbps scale that reads 0.000), and the tick label scales to that unit.
     #[test]
-    fn fmt_rate_adapts_units() {
-        assert_eq!(fmt_rate(0), "0bps");
-        assert_eq!(fmt_rate(800), "800bps");
-        assert_eq!(fmt_rate(1_500_000), "1.500Mbps");
-        assert_eq!(fmt_rate(2_000_000_000), "2.000Gbps");
+    fn rate_unit_adapts_and_scales() {
+        assert_eq!(rate_unit(800), ("bps", 1));
+        assert_eq!(rate_unit(12_000), ("kbps", 1_000));
+        assert_eq!(rate_unit(3_000_000), ("Mbps", 1_000_000));
+        assert_eq!(rate_unit(2_000_000_000), ("Gbps", 1_000_000_000));
+        assert_eq!(fmt_rate_scaled(800, 1), "800");
+        assert_eq!(fmt_rate_scaled(1_500_000, 1_000_000), "1.500");
+        assert_eq!(fmt_rate_scaled(500_000_000, 1_000_000), "500.000");
+    }
+
+    // The scaled Y label fits the 8-column gutter (<= 7 chars) at every realistic rate, so it never
+    // overwrites plot columns — the rate-axis analogue of `large_seq_axis_label_is_abbreviated_not_raw`.
+    #[test]
+    fn rate_axis_label_fits_gutter() {
+        for &bps in &[
+            0u64,
+            800,
+            12_000,
+            3_000_000,
+            500_000_000,
+            999_000_000,
+            1_500_000_000,
+            999_000_000_000,
+        ] {
+            let (_unit, div) = rate_unit(bps);
+            let label = fmt_rate_scaled(bps, div);
+            assert!(
+                label.len() <= 7,
+                "{bps} -> {label:?} ({} chars) overflows the gutter",
+                label.len()
+            );
+        }
     }
 
     // Criterion 19: the Throughput view renders title, legend, an axis label, a bits/sec unit, and a
