@@ -29,6 +29,7 @@ pub struct AsOf {
 
 /// One connection's timeline entry: its `Connection` view, its `t`-sorted snapshot series,
 /// and the right bound of its active interval (`last_at` if closed, else the capture end).
+#[derive(Debug, Clone)]
 struct Entry {
     conn: Connection,
     samples: Vec<StateSample>,
@@ -36,6 +37,7 @@ struct Entry {
 }
 
 /// The replay timeline over all connections.
+#[derive(Debug, Clone)]
 pub struct Timeline {
     entries: Vec<Entry>,
     start: Nanos,
