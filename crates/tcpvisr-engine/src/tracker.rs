@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use tcpvisr_core::{Endpoint, Item, MetricSample, Nanos, SampleDir, Segment, TcpFlags, TcpSeq};
 
 use crate::config::EngineConfig;
+#[cfg(test)]
+use crate::config::RetentionPolicy;
 use crate::conn::{ConnId, Connection, Direction, EndpointPair};
 use crate::metrics::{ConnectionMetrics, MetricError, MetricState, SeriesCollection};
 use crate::state::ConnState;
@@ -297,7 +299,7 @@ impl Tracker {
         if !self.should_collect(id) {
             return;
         }
-        if self.collected_samples >= self.config.max_samples {
+        if self.collected_samples >= self.config.retention.max_samples() {
             self.overflowed = true;
             return;
         }
@@ -311,7 +313,7 @@ impl Tracker {
         if self.overflowed {
             return;
         }
-        if self.collected_samples >= self.config.max_samples {
+        if self.collected_samples >= self.config.retention.max_samples() {
             self.overflowed = true;
             return;
         }
@@ -324,7 +326,7 @@ impl Tracker {
         if self.overflowed {
             return;
         }
-        if self.collected_samples >= self.config.max_samples {
+        if self.collected_samples >= self.config.retention.max_samples() {
             self.overflowed = true;
             return;
         }
@@ -355,7 +357,7 @@ impl Tracker {
         if self.overflowed {
             return;
         }
-        if self.collected_samples >= self.config.max_samples {
+        if self.collected_samples >= self.config.retention.max_samples() {
             self.overflowed = true;
             return;
         }
@@ -389,7 +391,7 @@ impl Tracker {
         if self.overflowed {
             return;
         }
-        if self.collected_samples >= self.config.max_samples {
+        if self.collected_samples >= self.config.retention.max_samples() {
             self.overflowed = true;
             return;
         }
@@ -434,7 +436,7 @@ impl Tracker {
         if self.overflowed {
             return;
         }
-        if self.collected_samples >= self.config.max_samples {
+        if self.collected_samples >= self.config.retention.max_samples() {
             self.overflowed = true;
             return;
         }
@@ -630,7 +632,7 @@ impl Tracker {
         if self.overflowed {
             return Err(MetricError::SampleCeiling {
                 samples: self.collected_samples + 1,
-                limit: self.config.max_samples,
+                limit: self.config.retention.max_samples(),
             });
         }
         let mut out: Vec<ConnectionMetrics> = self
@@ -653,7 +655,7 @@ impl Tracker {
         if self.overflowed {
             return Err(MetricError::SampleCeiling {
                 samples: self.collected_samples + 1,
-                limit: self.config.max_samples,
+                limit: self.config.retention.max_samples(),
             });
         }
         let series: Vec<ConnSeries> = self
@@ -1081,7 +1083,7 @@ mod timeline_tests {
         let (c, s) = (ep(1, 1234), ep(2, 80));
         let mut t = Tracker::new(EngineConfig {
             collect_state_timeline: true,
-            max_samples: 1,
+            retention: RetentionPolicy::FailFast { max_samples: 1 },
             ..EngineConfig::default()
         });
         t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 1_000));
@@ -1197,7 +1199,7 @@ mod metric_wire_tests {
         let (c, s) = (ep(1, 1234), ep(2, 80));
         let cfg = EngineConfig {
             series_collection: SeriesCollection::All,
-            max_samples: 1,
+            retention: RetentionPolicy::FailFast { max_samples: 1 },
             ..EngineConfig::default()
         };
         let mut t = Tracker::new(cfg);
@@ -1373,7 +1375,7 @@ mod seq_tests {
     fn seq_collection_counts_against_the_ceiling() {
         let (c, s) = (ep(1, 1234), ep(2, 80));
         let mut cfg = seq_cfg();
-        cfg.max_samples = 1; // first segment already produces state + seq samples
+        cfg.retention = RetentionPolicy::FailFast { max_samples: 1 }; // first segment already produces state + seq samples
         let mut t = Tracker::new(cfg);
         t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 1_000));
         t.observe(&seg(c, s, TcpFlags::ACK, 110, 1, 20, 2_000));
@@ -1483,7 +1485,7 @@ mod inflight_tests {
     fn inflight_collection_counts_against_ceiling() {
         let (c, s) = (ep(1, 1234), ep(2, 80));
         let mut cfg = iff_cfg();
-        cfg.max_samples = 1; // first segment already produces state + seq + inflight samples
+        cfg.retention = RetentionPolicy::FailFast { max_samples: 1 }; // first segment already produces state + seq + inflight samples
         let mut t = Tracker::new(cfg);
         t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 1_000));
         t.observe(&seg(c, s, TcpFlags::ACK, 110, 1, 20, 2_000));
@@ -1608,7 +1610,7 @@ mod rtt_tests {
     fn rtt_collection_counts_against_ceiling() {
         let (c, s) = (ep(1, 1234), ep(2, 80));
         let mut cfg = rtt_cfg();
-        cfg.max_samples = 1;
+        cfg.retention = RetentionPolicy::FailFast { max_samples: 1 };
         let mut t = Tracker::new(cfg);
         t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 0));
         t.observe(&seg(s, c, TcpFlags::ACK, 1, 110, 0, 500)); // rtt #1
@@ -1736,7 +1738,7 @@ mod throughput_tests {
     fn throughput_collection_counts_against_ceiling() {
         let (c, s) = (ep(1, 1234), ep(2, 80));
         let mut cfg = tput_cfg();
-        cfg.max_samples = 1; // first data segment already produces a throughput sample
+        cfg.retention = RetentionPolicy::FailFast { max_samples: 1 }; // first data segment already produces a throughput sample
         let mut t = Tracker::new(cfg);
         t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 100, 1_000));
         t.observe(&seg(c, s, TcpFlags::ACK, 200, 1, 100, 2_000)); // 2nd sample -> ceiling

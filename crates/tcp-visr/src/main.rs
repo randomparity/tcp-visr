@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use tcpvisr_core::{Item, MetricSample, Nanos, SampleDir};
-use tcpvisr_engine::{ConnectionMetrics, EngineConfig, SeriesCollection, Tracker};
+use tcpvisr_engine::{ConnectionMetrics, EngineConfig, RetentionPolicy, SeriesCollection, Tracker};
 
 /// Visualize TCP flow over time from a live system or a pcap/pcapng replay.
 #[derive(Parser)]
@@ -244,7 +244,7 @@ fn replay_engine_config(max_samples: usize) -> EngineConfig {
         collect_inflight_timeline: true,
         collect_rtt_timeline: true,
         collect_throughput_timeline: true,
-        max_samples,
+        retention: RetentionPolicy::FailFast { max_samples },
         ..EngineConfig::default()
     }
 }
@@ -337,7 +337,7 @@ fn run_metrics(
     let base = EngineConfig {
         throughput_window: Nanos(throughput_window_ms.saturating_mul(1_000_000)),
         reorder_window: Nanos(reorder_window_ms.saturating_mul(1_000_000)),
-        max_samples,
+        retention: RetentionPolicy::FailFast { max_samples },
         ..EngineConfig::default()
     };
 
@@ -447,7 +447,7 @@ mod build_replay_tests {
     fn sample_ceiling_is_fatal() {
         let cfg = EngineConfig {
             collect_state_timeline: true,
-            max_samples: 1,
+            retention: RetentionPolicy::FailFast { max_samples: 1 },
             ..EngineConfig::default()
         };
         let err = build_replay_app(&fixture(), cfg).expect_err("ceiling");
