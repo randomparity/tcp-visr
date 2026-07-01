@@ -1,6 +1,6 @@
 //! The pure connection tracker (design §10.M2, ADR-0006).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use tcpvisr_core::{Endpoint, Item, MetricSample, Nanos, SampleDir, Segment, TcpFlags, TcpSeq};
 
@@ -481,6 +481,12 @@ impl Tracker {
     /// is on and not overflowed (ADR-0012 §1: both directions, so ACK-driven drains are sampled
     /// at ack time rather than deferred to the next same-direction send).
     fn collect_inflight_points(&mut self, idx: usize, seg: &Segment) {
+        self.collect_inflight_at(idx, seg.ts);
+    }
+
+    /// In-flight snapshot for both directions stamped at time `t` — a segment ts (per-segment) or
+    /// the live `now` (a decay tick).
+    fn collect_inflight_at(&mut self, idx: usize, t: Nanos) {
         if self.overflowed || !self.config.collect_inflight_timeline {
             return;
         }
@@ -489,7 +495,7 @@ impl Tracker {
                 self.record_inflight(
                     idx,
                     InFlightSample {
-                        t: seg.ts,
+                        t,
                         dir: dir_sample(d),
                         bytes,
                     },
@@ -555,19 +561,24 @@ impl Tracker {
     /// M7 in-flight) so the sending flow's rate is captured at reverse-ACK times and shows decay; a
     /// direction that has not sent data returns `None` and contributes no sample (ADR-0014 §1).
     fn collect_throughput_points(&mut self, idx: usize, seg: &Segment) {
+        self.collect_throughput_at(idx, seg.ts);
+    }
+
+    /// Trailing-window `(throughput, goodput)` for both directions stamped at time `t`. On a decay
+    /// tick, a direction that sent data returns a lower (eventually zero) rate as bytes age out;
+    /// one that never sent data returns `None` and contributes no sample (ADR-0014 §1).
+    fn collect_throughput_at(&mut self, idx: usize, t: Nanos) {
         if self.overflowed || !self.config.collect_throughput_timeline {
             return;
         }
         for d in [Direction::OriginToResponder, Direction::ResponderToOrigin] {
             if let Some((throughput_bps, goodput_bps)) =
-                self.conns[idx]
-                    .metrics
-                    .throughput_at(d, seg.ts, &self.config)
+                self.conns[idx].metrics.throughput_at(d, t, &self.config)
             {
                 self.record_throughput(
                     idx,
                     ThroughputSample {
-                        t: seg.ts,
+                        t,
                         dir: dir_sample(d),
                         throughput_bps,
                         goodput_bps,
@@ -587,8 +598,87 @@ impl Tracker {
                 self.observe_segment(seg);
                 self.evict_samples();
             }
-            Item::Tick(_) => {}
+            Item::Tick(t) => self.observe_tick(*t),
         }
+    }
+
+    /// Advances live time on a `Tick`: bumps `now`, emits decay samples for still-active flows,
+    /// ages out samples, and evicts dead connections. Inert under `FailFast` (replay never emits a
+    /// `Tick`, and idle is judged per-segment there).
+    fn observe_tick(&mut self, t: Nanos) {
+        if self.config.retention.window().is_none() {
+            return;
+        }
+        self.now = Nanos(self.now.0.max(t.0));
+        self.emit_decay_samples(self.now);
+        self.evict_samples();
+        self.evict_dead_connections();
+    }
+
+    /// At time `t`, records a decay throughput/in-flight sample for each connection not yet idle
+    /// past `dead_after`, so a silenced flow's rate visibly ages toward zero as bytes leave the
+    /// window. Idle-past-`dead_after` connections are left for `evict_dead_connections`.
+    fn emit_decay_samples(&mut self, t: Nanos) {
+        if self.overflowed {
+            return;
+        }
+        let dead_after = self.config.dead_after.0;
+        for idx in 0..self.conns.len() {
+            if t.0.saturating_sub(self.conns[idx].last_at.0) > dead_after {
+                continue;
+            }
+            self.collect_throughput_at(idx, t);
+            self.collect_inflight_at(idx, t);
+        }
+    }
+
+    /// Removes connections terminal (`Closed`/`Reset`) or idle past `dead_after` whose last
+    /// activity precedes the eviction horizon, rebuilding the `live` index and pruning
+    /// `next_instance`, so the tracked connection count stays bounded under churn (criterion 17).
+    fn evict_dead_connections(&mut self) {
+        let Some(window) = self.config.retention.window() else {
+            return;
+        };
+        let horizon = self.now.0.saturating_sub(window.0);
+        let dead_after = self.config.dead_after.0;
+        let now = self.now.0;
+        let before = self.conns.len();
+        self.conns.retain(|c| {
+            let terminal = matches!(c.state, ConnState::Closed | ConnState::Reset);
+            let idle = now.saturating_sub(c.last_at.0) > dead_after;
+            !((terminal || idle) && c.last_at.0 < horizon)
+        });
+        if self.conns.len() == before {
+            return;
+        }
+        // Rebuild the pair->index map and prune next_instance for pairs with no survivor, else that
+        // map grows unbounded under churn. A later reuse of a fully-evicted pair restarts at 0.
+        self.live.clear();
+        let mut survivors: HashSet<EndpointPair> = HashSet::new();
+        for (i, c) in self.conns.iter().enumerate() {
+            self.live.insert(c.id.pair, i);
+            survivors.insert(c.id.pair);
+        }
+        self.next_instance
+            .retain(|pair, _| survivors.contains(pair));
+        self.recount_collected();
+    }
+
+    /// Recomputes `collected_samples` from the surviving connections' retained series after a bulk
+    /// removal, keeping the ceiling accounting consistent.
+    fn recount_collected(&mut self) {
+        self.collected_samples = self
+            .conns
+            .iter()
+            .map(|c| {
+                c.states.len()
+                    + c.series.len()
+                    + c.seq.len()
+                    + c.inflight.len()
+                    + c.rtt.len()
+                    + c.throughput.len()
+            })
+            .sum();
     }
 
     fn observe_segment(&mut self, seg: &Segment) {
@@ -1968,6 +2058,47 @@ mod evict_tests {
                 samples: 2,
                 limit: 1
             }
+        );
+    }
+
+    #[test]
+    fn tick_decays_throughput_toward_zero_after_silence() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut cfg = evict_cfg(10_000_000_000); // 10s window (no sample eviction here)
+        cfg.throughput_window = Nanos(1_000_000_000); // 1s throughput window
+        let mut t = Tracker::new(cfg);
+        // 1000 bytes at t=0
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 1000, 0));
+        let last_active = t.conns[0].throughput.back().map(|x| x.throughput_bps);
+        // Tick at t=2s: >1s of silence -> window empty -> a decay sample at 0 bps.
+        t.observe(&tcpvisr_core::Item::Tick(Nanos(2_000_000_000)));
+        let decayed = *t.conns[0].throughput.back().expect("a decay sample");
+        assert_eq!(decayed.t, Nanos(2_000_000_000));
+        assert_eq!(
+            decayed.throughput_bps, 0,
+            "rate decays to zero after the window empties"
+        );
+        assert!(last_active.unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn whole_connection_evicted_when_terminal_and_past_horizon() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(evict_cfg(1_000)); // 1000ns window
+        // open + RST at t=100 -> Reset (terminal), last_at=100
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 100));
+        t.observe(&seg(s, c, TcpFlags::RST, 1, 0, 0, 100));
+        assert_eq!(t.conns.len(), 1);
+        // Tick far past horizon: now=5000, horizon=4000 > last_at=100 -> evict whole connection.
+        t.observe(&tcpvisr_core::Item::Tick(Nanos(5_000)));
+        assert!(
+            t.conns.is_empty(),
+            "terminal + last_at<horizon -> whole-connection eviction"
+        );
+        assert!(t.live.is_empty());
+        assert!(
+            t.next_instance.is_empty(),
+            "next_instance pruned too (no unbounded map growth)"
         );
     }
 }
