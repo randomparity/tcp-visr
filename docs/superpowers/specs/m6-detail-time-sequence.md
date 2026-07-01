@@ -20,10 +20,12 @@ column). `Esc` closes it. Playback, seek, and step redraw the graph live.
 ### In scope
 
 - A pure **`SeqSample`** series in `tcpvisr-engine`: one record per data-carrying segment
-  (and one per SACK block), carrying `{ t, dir, seq, len, kind }` where `kind` is
-  `Data { retransmit, out_of_order }` or `Sack`, with `(dir, seq)` in the *data sender's*
-  sequence space (ADR-0011 §1). Collected under a new `EngineConfig.collect_seq_timeline`
-  flag, counting against `max_samples`.
+  (and one per SACK block), carrying `{ t, dir, rel, len, kind }` where `kind` is
+  `Data { retransmit, out_of_order }` or `Sack`, and `rel` is the **engine-unwrapped `i64`
+  cumulative sequence offset** from `dir`'s first-seen data seq (ADR-0011 §1 — so a >4 GB,
+  multi-wrap transfer rises monotonically instead of folding, and the TUI does no serial
+  arithmetic). Collected under a new `EngineConfig.collect_seq_timeline` flag, counting
+  against `max_samples`.
 - `Timeline` retains each connection's `SeqSample` series and exposes
   **`seq_series(id) -> &[SeqSample]`**; `into_timeline` carries it through.
 - A pure **detail projection** in `tcpvisr-tui`: `(series, conn bounds, focus direction,
@@ -112,12 +114,14 @@ For the focus connection (§3.5) and its focus direction (§3.6):
   `Connection.last_at` (which, for a still-open connection, precedes the capture end); it is
   read from the new `Timeline::x_span(id)` accessor (§4) so the detail's time axis matches the
   master header's `t=… / total`. It is **fixed**; scrubbing does not rescale it.
-- **Y axis (sequence)** spans `[0, max_rel]`. A sample's **relative sequence** (its row
-  position) is `rel(s) = s.seq.serial_diff(baseline)`, where `baseline` is the RFC-1982
-  serial-**minimum** `seq` over the focus direction's samples (ADR-0006; never naive
-  subtraction). The axis top `max_rel` is `max(rel(s) + s.len)` over those samples — i.e. the
-  furthest byte the stream reached, so a point is never plotted above the axis (a `Sack`
-  sample has `len = 0`, so it contributes only its own row). Fixed; scrubbing does not rescale.
+- **Y axis (sequence)** spans `[0, max_rel]`. Each sample already carries an engine-unwrapped
+  `i64` `rel` (§2, ADR-0011 §1). The projection sets `base = min(s.rel)` over the focus
+  direction's samples and a point's row position is `y(s) = s.rel - base` (a non-negative
+  `i64`). The axis top `max_rel` is `max(y(s) + s.len)` over those samples — i.e. the furthest
+  byte the stream reached, so a point is never plotted above the axis (a `Sack` sample has
+  `len = 0`, so it contributes only its own row). These are ordinary `i64` min/max (a total
+  order — no `serial_diff` in the TUI, no folding for a >4 GB transfer). Fixed; scrubbing does
+  not rescale.
 - **Plot rectangle.** The projection operates on the inner **plot rectangle** only: `W`
   columns × `H` rows of *cells*, excluding the pane border, the Y-axis label gutter, the
   X-axis label row, and the legend row — `render.rs` (§4) carves those off the pane and hands
@@ -126,15 +130,15 @@ For the focus connection (§3.5) and its focus direction (§3.6):
 - **Coordinate mapping (exact, clamped).** With `span_t = effective_end.0 - opened_at.0`:
   - `col(t) = if span_t == 0 { 0 } else { ((t.0 - opened_at.0) * (W-1)) / span_t }`, then
     clamped to `0..=W-1` (integer division; `t` is already in `[opened_at, effective_end]`).
-  - `row(s) = if max_rel == 0 { 0 } else { (rel(s) * (H-1)) / max_rel }`, then clamped to
-    `0..=H-1`. Row 0 is the bottom; a renderer drawing top-down writes screen line
-    `(H-1) - row`. Because the multiplier is `H-1` (not `H`), `rel(s) == max_rel` maps to row
-    `H-1` — the top cell — never `H` (out of bounds). The degenerate `span_t == 0` and
-    `max_rel == 0` cases collapse to column 0 / bottom row via the guards above, with no
+  - `row(s) = if max_rel == 0 { 0 } else { (y(s) * (H-1)) / max_rel }` (with `y(s) = s.rel -
+    base`), then clamped to `0..=H-1`. Row 0 is the bottom; a renderer drawing top-down writes
+    screen line `(H-1) - row`. Because the multiplier is `H-1` (not `H`), `y(s) == max_rel`
+    maps to row `H-1` — the top cell — never `H` (out of bounds). The degenerate `span_t == 0`
+    and `max_rel == 0` cases collapse to column 0 / bottom row via the guards above, with no
     division.
 - **Marks.** Each `SeqSample` of the focus direction with `t ≤ T` maps to cell
-  `(col(t), row(s))` (the point plots at the segment **start** seq, so a retransmit dips back
-  to its earlier row). The glyph is by kind:
+  `(col(t), row(s))` (the point plots at the segment **start** offset, so a retransmit dips
+  back to its earlier row). The glyph is by kind:
   - `Data { retransmit: false, out_of_order: false }` → the plain data glyph,
   - `Data { out_of_order: true, retransmit: false }` → the out-of-order glyph,
   - `Data { retransmit: true, .. }` → the retransmit glyph,
@@ -162,8 +166,8 @@ its `seq_series` from `Timeline::seq_series(id)` — all keyed by `ConnId`.
 
 The plotted direction is the connection's **higher-byte** direction: origin→responder if
 `bytes_o2r ≥ bytes_r2o`, else responder→origin. This is a deterministic function of the
-`Connection` view (the end-of-capture totals). The Y-axis baseline and `max_rel` are computed
-over that direction's samples only.
+`Connection` view (the end-of-capture totals). The Y-axis `base` (min `rel`) and `max_rel` are
+computed over that direction's samples only.
 
 ### 3.7 Rendering determinism
 
@@ -193,17 +197,25 @@ tests are deterministic. Axis time labels reuse the M5 fixed-3-decimal-seconds f
 - `tracker.rs`: when the flag is set, for every connection and every processed segment, run
   the existing metric derivation and, from its result + the segment, push `SeqSample`s: one
   `Data` point per data-carrying segment (payload > 0) in its own direction, and one `Sack`
-  point per SACK block (direction = opposite of the carrying segment; `seq` = block left;
-  `len` = 0). Each retained `SeqSample` counts against `max_samples` via the shared counter;
-  `into_timeline` passes the seq series through.
+  point per SACK block (direction = opposite of the carrying segment; position = block left;
+  `len` = 0). **Unwrapping:** the tracker keeps, per direction, an anchor (first-seen data
+  seq → `rel = 0`) and a running frontier `(seq, rel)`; a later seq `S`'s `rel` is
+  `frontier.rel + signed_serial_distance(frontier.seq, S)`, where the signed distance is the
+  RFC-1982 forward diff if `S` is at/ahead of the frontier else the negated backward diff
+  (magnitude always `< 2^31`, so it is well-defined), and the frontier advances when `S` is
+  ahead. A `Sack` block is unwrapped in the **acked** direction's frame (establishing that
+  direction's anchor if it has no data yet). Each retained `SeqSample` counts against
+  `max_samples` via the shared counter; `into_timeline`/`with_seq` pass the seq series
+  through. (This is the only place `serial_diff` runs for the seq view — ADR-0002/0006.)
 - `lib.rs`: re-export `SeqSample`, `SeqKind`.
 
 ### TUI (`tcpvisr-tui`)
 
 - `detail.rs` (new, pure): the `SeqPlot` projection and its `Mark { col, row, glyph }` /
-  axis-range types; `SeqPlot::project(series, x_span, focus_dir, baseline/max_rel, cursor,
-  width, height) -> SeqPlot`. Glyph constants live here. Unit-tested from hand-built
-  `Vec<SeqSample>`.
+  axis-range types; `SeqPlot::project(series, focus_dir, x_span, cursor, width, height) ->
+  SeqPlot`, computing `base = min(rel)` and `max_rel` internally from the focus direction's
+  samples (plain `i64` min/max — no serial arithmetic here). Glyph constants live here.
+  Unit-tested from hand-built `Vec<SeqSample>`.
 - `app.rs`: `App` gains `detail_open: bool`, `open_detail()`, `close_detail()`,
   `is_detail_open()`, and a `focus() -> Option<FocusConn>` that resolves the selected
   connection's static view + `seq_series` from the `Timeline`. Selection/reconciliation is
@@ -228,26 +240,32 @@ Dependency direction is unchanged (TUI → engine → core).
 
 1. **Data point emitted per data segment.** A tracker with `collect_seq_timeline = true` fed a
    connection with two data segments in one direction (seq 100 len 10, seq 110 len 20)
-   produces two `Data` `SeqSample`s in that direction with those `seq`/`len` and
-   `retransmit == false`. (Engine unit test.)
+   produces two `Data` `SeqSample`s in that direction with `rel == 0` / `rel == 10`, the given
+   `len`s, and `retransmit == false`. (Engine unit test.)
 2. **Retransmit classified on the seq point.** A behind-frontier re-send after a gap ≥
    `reorder_window` yields a `Data { retransmit: true }` `SeqSample`; an in-window
    behind-frontier segment yields `Data { out_of_order: true, retransmit: false }`. (Engine
    unit test, reusing the M3 derivation.)
-3. **SACK block emitted in the acked direction.** A segment in direction R2O carrying a SACK
-   block `(L, R)` produces a `Sack` `SeqSample` with `dir == OriginToResponder` (the acked
-   direction), `seq == L`, `len == 0`. (Engine unit test.)
+3. **SACK block emitted in the acked direction.** For a connection whose O2R data anchor is
+   seq `D0`, an R2O segment carrying a SACK block `(L, R)` produces a `Sack` `SeqSample` with
+   `dir == OriginToResponder` (the acked direction), `len == 0`, and `rel == L − D0` (the
+   block's left edge unwrapped in the O2R frame). (Engine unit test.)
 4. **Seq series carried through the timeline.** `into_timeline` on such a tracker yields a
    `Timeline` whose `seq_series(id)` returns the connection's `SeqSample`s sorted by `t`;
    `seq_series(unknown_id)` is empty. (Engine unit test.)
 5. **Seq collection counts against the ceiling.** With `collect_seq_timeline = true` and a
    `max_samples` smaller than the number of state+seq samples a fixture produces,
    `into_timeline` returns `SampleCeiling`. (Engine unit test.)
-6. **Relative sequence is serial-correct across a `u32` wrap.** A focus direction with data
-   segments at start seq `u32::MAX-100` (len 50) then `200` (len 50) projects the two points
-   at relative rows `0` and `301` (`200.serial_diff(u32::MAX-100)`, a forward advance, not a
-   fold), and the Y-axis top `max_rel` is `351` (`301 + 50`, the second segment's extent).
-   (Projection unit test.)
+6. **Unwrap across a single `u32` wrap (engine).** A direction with data segments at start seq
+   `u32::MAX-100` (len 50) then `200` (len 50) yields `SeqSample.rel == 0` then `rel == 301`
+   (the second start is a forward advance across the wrap, not a fold); the projection places
+   them at `y == 0` / `y == 301` with `max_rel == 351` (`301 + 50`). (Engine + projection unit
+   tests.)
+6a. **Unwrap across multiple wraps (engine, bulk transfer).** A direction that advances the
+   sequence number past several 4 GB wraps — e.g. start seqs `0` (len ~1e9), `~1e9`, `~2.2e9`,
+   `~3.4e9`, `~4.6e9` (wrapped `u32`) — yields strictly increasing `SeqSample.rel`
+   (`0 < 1e9 < 2.2e9 < 3.4e9 < 4.6e9`, held in `i64`), so a >4 GB transfer rises monotonically
+   instead of folding back to a low row. (Engine unit test.)
 7. **Reveal to `T`.** For a series with marks at `t = {0, 10, 20}` and a cursor at `t = 10`,
    the projection emits the marks at `t = 0` and `t = 10` and omits the one at `t = 20`; at
    `t = 20` all three appear. (Projection unit test.)
@@ -298,8 +316,11 @@ Dependency direction is unchanged (TUI → engine → core).
 - **Single-sample / zero-width span** → a connection whose focus direction has one data
   segment (`opened_at == effective_end`, or `max_rel == 0`) plots into column 0 / the bottom
   row with no divide-by-zero. (§3.4, criterion 10a.)
-- **`u32` sequence wrap within a connection** → relative sequence via RFC-1982 serial
-  arithmetic; a wrap is a forward advance, never a fold. (§3.4, criterion 6.)
+- **`u32` sequence wrap(s) within a connection** → the engine unwraps each seq to an `i64`
+  cumulative `rel` via bounded signed serial distance from the running frontier, so a wrap is
+  a forward advance and a bulk transfer that wraps the 32-bit space many times rises
+  monotonically instead of folding onto itself; the TUI does no serial arithmetic.
+  (§3.4, §4 engine, criteria 6/6a.)
 - **Dense capture (many segments per column)** → column bucketing bounds render to
   `O(cells)` and keeps the most-salient glyph; no unbounded work per frame. (§3.4.)
 - **Terminal too narrow/short for a graph** → explicit "widen terminal" message, master pane
@@ -312,15 +333,16 @@ Dependency direction is unchanged (TUI → engine → core).
 
 ## 7. Testing
 
-- **Engine unit tests** (criteria 1–5) from hand-built segment vectors through `Tracker` with
-  `collect_seq_timeline = true`, asserting the emitted `SeqSample`s and the `Timeline`
-  accessor. Reuse the M3 derivation fixtures for retransmit/out-of-order/SACK classification —
-  assert the *seq point's* kind, not how it is computed.
+- **Engine unit tests** (criteria 1–5, 6, 6a) from hand-built segment vectors through
+  `Tracker` with `collect_seq_timeline = true`, asserting the emitted `SeqSample`s (including
+  the unwrapped `rel` across single and multiple `u32` wraps) and the `Timeline` accessor.
+  Reuse the M3 derivation fixtures for retransmit/out-of-order/SACK classification — assert the
+  *seq point's* kind, not how it is computed.
 - **Projection unit tests** (criteria 6–12, incl. 10a) from hand-built `Vec<SeqSample>` and
   explicit viewport sizes, asserting axis ranges and specific `(col, row, glyph)` marks —
-  including the `u32`-wrap relative-sequence case, reveal-to-`T`, bucketing priority,
-  placement, degenerate (zero-width / `max_rel == 0`) spans, the cursor column, and the
-  narrow-terminal outcome. No terminal needed.
+  including the wrap-derived `rel` placement, reveal-to-`T`, bucketing priority, placement,
+  degenerate (zero-width / `max_rel == 0`) spans, the cursor column, and the narrow-terminal
+  outcome. No terminal needed.
 - **App / keys unit tests** (criteria 13–14) for open/close modality and detail-follows-
   selection, from hand-built timelines.
 - **`ratatui::TestBackend` render tests** (criteria 15–16): closed reproduces the M5 master;

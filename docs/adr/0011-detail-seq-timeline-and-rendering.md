@@ -41,19 +41,29 @@ pub enum SeqKind {
 pub struct SeqSample {
     pub t: Nanos,
     pub dir: SampleDir, // the DATA direction this point lives in
-    pub seq: TcpSeq,    // a sequence number in `dir`'s sequence space
+    pub rel: i64,       // unwrapped cumulative offset from `dir`'s first-seen data seq
     pub len: u32,       // payload length (0 for a Sack mark)
     pub kind: SeqKind,
 }
 ```
 
-- **Every `SeqSample`'s `(dir, seq)` is expressed in `dir`'s data-sender sequence space.** A
-  `Data` point is emitted for a data-carrying segment (payload > 0) in its own direction. A
-  `Sack` point is emitted for **each SACK block** carried by a segment: its `dir` is the
-  *opposite* of the carrying segment (the direction whose data is being acknowledged), and
-  its `seq` is the block's left edge — which already lives in that data sender's space. So a
-  consumer focusing on one direction filters `SeqSample`s by that `dir` and both the data
-  points and the SACK marks share one Y (sequence) axis.
+- **Every `SeqSample`'s `(dir, rel)` is expressed in `dir`'s data-sender sequence space, as
+  an unwrapped `i64` offset.** A `Data` point is emitted for a data-carrying segment
+  (payload > 0) in its own direction. A `Sack` point is emitted for **each SACK block**
+  carried by a segment: its `dir` is the *opposite* of the carrying segment (the direction
+  whose data is being acknowledged), and its position is the block's left edge — which already
+  lives in that data sender's space. So a consumer focusing on one direction filters
+  `SeqSample`s by that `dir` and both the data points and the SACK marks share one Y axis.
+- **`rel` is the wrap-unwrapped cumulative sequence offset, computed in the engine.** The
+  32-bit TCP sequence number wraps every 4 GB; a Stevens axis must *unwrap* it or a
+  multi-GB transfer folds on top of itself. The engine anchors each direction at its
+  first-seen data seq (`rel = 0`) and, for every later seq `S`, adds the **bounded signed
+  serial distance** from the running frontier (always within ±2^31, so RFC-1982 comparison is
+  well-defined; ADR-0006) to the frontier's cumulative offset. A retransmit/reorder therefore
+  lands at its true *earlier* `rel` (a negative step from the frontier), and a stream that
+  wraps the 32-bit space many times accumulates monotonically in `i64` (headroom for any
+  capture the `max_samples` ceiling admits). This keeps the error-prone serial arithmetic in
+  the engine; the TUI plots plain integers and never does `serial_diff` itself.
 - **Classification is not duplicated.** `retransmit` / `out_of_order` are taken from the
   same `MetricState::observe` derivation that produces `MetricSample` (ADR-0007); the
   tracker runs that derivation and transforms its result into a `SeqSample` instead of (for
@@ -99,10 +109,11 @@ resolved axis ranges. Rendering writes those glyphs into the terminal buffer.
   `[opened_at, effective_end]`; the Y axis spans `[0, max relative sequence]` over the whole
   connection. Axes do **not** rescale as the cursor moves, so scrubbing does not make the
   plot jump.
-- **Relative sequence.** The Y value of a point is `seq.serial_diff(baseline)` where
-  `baseline` is the RFC-1982 serial-minimum sequence over the focus direction's samples
-  (ADR-0006 arithmetic, never naive subtraction) — so a `u32` wrap within a connection is a
-  forward advance, not a fold, and the axis starts near 0 for readability.
+- **Relative sequence.** Each point already carries an unwrapped `i64` `rel` (above). The
+  projection's Y baseline is the plain integer **minimum** of `rel` over the focus direction's
+  revealed-and-unrevealed samples, and the axis top is `max(rel − baseline + len)` — ordinary
+  `i64` min/max, a total order, so it is deterministic and cannot fold. No `serial_diff` runs
+  in the TUI; a multi-wrap (>4 GB) transfer plots as a continuously rising line, not a fold.
 - **Reveal to `T`.** Only marks with `t ≤ cursor` are drawn; a vertical **cursor column** is
   drawn at `T`'s X position. Playing or seeking animates the sequence graph filling in.
 - **Focus direction.** The plotted direction is the connection's higher-byte direction
