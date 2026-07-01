@@ -1625,6 +1625,7 @@ dependencies = [
  "tcpvisr-core",
  "tcpvisr-engine",
  "tcpvisr-ingest",
+ "tcpvisr-tui",
 ]
 
 [[package]]

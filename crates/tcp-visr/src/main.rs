@@ -19,8 +19,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Replay a pcap/pcapng capture.
-    Replay,
+    /// Replay a pcap/pcapng capture in the interactive TUI.
+    Replay {
+        /// The `.pcap`/`.pcapng` capture file to browse.
+        file: PathBuf,
+    },
     /// Capture live from a network interface.
     Live,
     /// Print decoded TCP segments from a capture.
@@ -55,7 +58,7 @@ enum Command {
 impl Command {
     fn name(&self) -> &'static str {
         match self {
-            Command::Replay => "replay",
+            Command::Replay { .. } => "replay",
             Command::Live => "live",
             Command::Parse { .. } => "parse",
             Command::Conns { .. } => "conns",
@@ -82,6 +85,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("no subcommand given; run `tcp-visr --help`".into());
     };
     match command {
+        Command::Replay { file } => run_replay(&file),
         Command::Parse { file } => run_parse(&file),
         Command::Conns { file } => run_conns(&file),
         Command::Metrics {
@@ -97,7 +101,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             reorder_window_ms,
             max_samples,
         ),
-        other => Err(format!(
+        other @ Command::Live => Err(format!(
             "`{}` is not implemented yet (see the milestone roadmap)",
             other.name()
         )
@@ -194,6 +198,29 @@ fn run_conns(file: &Path) -> Result<(), Box<dyn std::error::Error>> {
         conns.len(),
         skipped.total()
     )?;
+    Ok(())
+}
+
+/// Streams `file` into the engine (same path as `conns`), then browses the
+/// resulting connections in the interactive TUI. Requires an interactive
+/// terminal; refuses to run when stdout is redirected so it never blocks a pipe.
+fn run_replay(file: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() {
+        return Err("replay requires an interactive terminal (stdout is not a tty)".into());
+    }
+    let mut tracker = Tracker::new(EngineConfig::default());
+    let (_link, skipped) =
+        tcpvisr_ingest::parse_file_visit(file, &mut |item| tracker.observe(item))?;
+    let conns = tracker.into_connections();
+    let title = format!(
+        "tcp-visr — {}  ({} connections, skipped {})",
+        file.display(),
+        conns.len(),
+        skipped.total(),
+    );
+    let app = tcpvisr_tui::App::new(&conns, title);
+    tcpvisr_tui::run(app)?;
     Ok(())
 }
 
