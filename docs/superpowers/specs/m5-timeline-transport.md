@@ -86,16 +86,26 @@ end-of-capture.
 `Timeline` is pure (no I/O, no clock) and is built from a `Vec<(Connection, Vec<StateSample>)>`
 so it is testable from hand-built vectors (testing convention).
 
-- **Bounds.** `start` = the minimum `opened_at`; `end` = the maximum `last_at`. An empty
-  capture has `start == end == 0`.
+- **Ordering (non-monotonic capture time).** Capture timestamps are **not** guaranteed
+  monotonic (design §14; the tracker sets `opened_at` to the *first-seen* segment's `ts`,
+  advances `last_at` with `max`, and the tracker test
+  `last_at_is_max_under_reordered_timestamps` exercises reordered arrival). The tracker
+  therefore appends `StateSample`s in arrival order, which may not be `t`-order. `Timeline`
+  **sorts each connection's `StateSample` series by `t` (stable, so equal-`t` samples keep
+  arrival order and the last-arriving wins carry-forward) at construction**, so the
+  per-connection binary search below is always over a `t`-sorted slice.
+- **Bounds.** `start` = the minimum `StateSample.t` across all connections (equal to the
+  minimum `opened_at` when time is monotonic, but reorder-safe); `end` = the maximum
+  `last_at`. An empty capture (no connections) has `start == end == 0`.
 - **Interval index.** Each connection occupies `[opened_at, effective_end]` where
   `effective_end = last_at` if its final `state` is `Closed`/`Reset`, else `end` (still-open
   connections extend to the running "now"; ADR-0004). `active_at(T)` returns the connections
   whose interval contains `T` (`opened_at ≤ T ≤ effective_end`).
 - **Per-connection resolution.** For an active connection, its `(state, bytes_o2r,
-  bytes_r2o)` as of `T` is the last `StateSample` with `t ≤ T` (binary search,
-  last-value-carried-forward). Because `opened_at` equals the first sample's `t`, an active
-  connection always has such a sample.
+  bytes_r2o)` as of `T` is the last `StateSample` with `t ≤ T` in the `t`-sorted series
+  (binary search, last-value-carried-forward). Since `T ≥ opened_at` for an active
+  connection and the first-observed segment produced a sample at `t = opened_at`, at least
+  one sample satisfies `t ≤ T`.
 - **`resolve_at(T)`** returns, for each active connection, its `ConnId` and its
   `(state, bytes_o2r, bytes_r2o)` as of `T`.
 - **Event times.** `next_event(T)` / `prev_event(T)` return the nearest event time strictly
@@ -124,14 +134,16 @@ so it is testable from hand-built vectors (testing convention).
 ### 3.5 Master list as of `T` (App)
 
 `App` owns the `Timeline`, the `Transport`, a precomputed static projection of each
-connection (`ConnId`, peer `Endpoint`, service label, `origin_inferred`, and the lowercased
-search string), and the M4 sort/filter/selection state.
+connection (`ConnId`, peer `Endpoint`, service label, `origin_inferred`, and a lowercased
+**static search prefix** covering origin/responder/service), and the M4 sort/filter/selection
+state. Only the origin/responder/service portion is static; the state portion of the
+searchable text varies with `T` and is composed per frame (below).
 
 - **`visible()`** resolves the active rows at `transport.cursor`, joins each with its static
-  projection, applies the `/` filter (subsequence match over the search string, unchanged
-  from M4 §3.5), and sorts (M4 §3.4). The searchable string uses the connection's static
-  fields (origin/responder/service) plus its **as-of-`T`** state, so filtering by state
-  reflects the cursor.
+  projection, applies the `/` filter, and sorts (M4 §3.4). The filter is a subsequence match
+  (M4 §3.5) over the row's **full search text = static prefix + the as-of-`T` state**,
+  recomposed per frame so filtering by state reflects the cursor. (The static prefix is
+  precomputed once; only the short state suffix is rebuilt per visible row.)
 - **Selection** stays keyed by `ConnId` and reconciles to the first visible row (or none)
   when the selected connection is not active at `T` or is filtered out (M4 §3.6). Every
   transport action that changes the active set reconciles the selection.
@@ -188,9 +200,14 @@ reads a clock. It stays untested (ADR-0009) and small.
 
 ### CLI (`tcp-visr`)
 
-- `run_replay`: configure `collect_state_timeline = true` (+ a `max_samples` ceiling),
-  observe the capture, `into_timeline()?`, build the title, and `App::new(timeline, title)`.
-  Surface a `SampleCeiling` error as a fatal actionable message.
+- A testable seam `build_replay_app(file, cfg) -> Result<(App, ...), _>` that parses the
+  capture (`collect_state_timeline = true`), `into_timeline()?`, builds the title, and
+  returns the `App` — **without** the TTY guard or the event loop. This is what makes the
+  build wiring and the `SampleCeiling` path integration-testable in CI (the loop is not).
+- `run_replay`: keep the non-TTY guard, call `build_replay_app`, then `run(app)`. A
+  `SampleCeiling` from `build_replay_app` propagates as a fatal actionable message. The
+  guard's position relative to `build_replay_app` is unobservable to the user (both error
+  paths exit non-zero with their own message); tests drive `build_replay_app` directly.
 
 Dependency direction is unchanged (TUI → engine → core).
 
@@ -232,13 +249,17 @@ Dependency direction is unchanged (TUI → engine → core).
 12. **Render.** `render` into a `TestBackend` shows the play/pause glyph, the speed, the
     `t=cursor / total` readout, the transport key hints, and rows resolved as of `T`; at a
     `T` with no active connection it shows `no connections active`. (TestBackend tests.)
-13. **CLI wiring.** `tcp-visr replay <file>` on a fixture builds a `Timeline` and enters the
-    TUI; with stdout not a TTY it still exits non-zero with the interactive-terminal message.
-    (Bin integration test — the non-TTY path, since the loop needs no TTY to reach the
-    guard.)
-14. **Ceiling fail-fast.** With `max_samples` too small for the capture, `into_timeline`
-    returns `SampleCeiling` and `replay` surfaces it as a fatal actionable error. (Unit /
-    integration test.)
+13. **CLI wiring.** `build_replay_app(<fixture>, default cfg)` returns an `App` whose
+    `visible()` (at the initial cursor) matches the fixture's connections; and
+    `tcp-visr replay <file>` with stdout not a TTY exits non-zero with the
+    interactive-terminal message. (Bin integration tests.)
+14. **Ceiling fail-fast.** `build_replay_app(<fixture>, cfg with max_samples too small)`
+    returns `SampleCeiling` (naming the count, limit, and `--max-samples`). (Bin integration
+    test driving the seam directly.)
+15. **Out-of-order samples.** A `Timeline` built from a connection whose `StateSample`
+    vector is supplied in non-`t` order resolves `resolve_at(T)` identically to the same
+    samples supplied in `t` order (construction sorts them), and `start` is the minimum
+    sample time. (Unit test.)
 
 ## 6. Failure modes handled
 
@@ -247,22 +268,25 @@ Dependency direction is unchanged (TUI → engine → core).
 - **Empty capture** → `start == end == 0`, no rows, transport inert, `q` quits.
 - **Selection invalidated by a cursor move or filter** → deterministic fallback (§3.5).
 - **Sample-ceiling overflow** → fail fast with the existing actionable message (§3.1).
-- **Non-monotonic capture time** → bounds use min `opened_at` / max `last_at`; per-connection
-  `opened_at ≤ last_at` holds by construction (tracker uses saturating/max on `last_at`);
-  seek/tick clamp so the cursor never leaves `[start, end]`.
+- **Non-monotonic capture time** → each connection's `StateSample` series is sorted by `t`
+  at `Timeline` construction (§3.3); `start` = min sample time, `end` = max `last_at`;
+  per-connection `opened_at ≤ last_at` holds by construction (tracker uses `max` on
+  `last_at`); seek/tick clamp so the cursor never leaves `[start, end]`.
 - **Playhead at EOF** → `tick` auto-pauses; `toggle_play` rewinds (§3.4).
 
 ## 7. Testing
 
-- **Pure `Timeline` unit tests** for criteria 1–4, built from hand-constructed
-  `(Connection, Vec<StateSample>)` vectors (no capture, no I/O). Include a `u32`-wrap /
-  serial-arithmetic-adjacent edge only where the timeline itself compares times (times are
-  `Nanos`, monotonic — no serial wrap — so the risk is byte/state carry-forward, not seq).
+- **Pure `Timeline` unit tests** for criteria 1–4 and 15, built from hand-constructed
+  `(Connection, Vec<StateSample>)` vectors (no capture, no I/O). Times are `Nanos` and do
+  **not** wrap, but they can arrive non-monotonically, so criterion 15 supplies an
+  out-of-`t`-order sample vector and asserts construction sorts it; the risk is byte/state
+  carry-forward under reordering, not `seq` serial arithmetic.
 - **Pure `Transport` unit tests** for criteria 5–8.
 - **Pure `App` unit tests** for criteria 9–10 and the key mappings (11), from hand-built
   timelines.
 - **`ratatui::TestBackend` render tests** for criterion 12.
 - **Bin integration tests** (`crates/tcp-visr/tests/`) for criteria 13–14: the non-TTY
-  guard on `replay`, and the ceiling error surfaced as a fatal message.
+  guard on `replay`, the `build_replay_app` seam over a fixture, and the ceiling error from
+  the seam.
 - Test behavior, not implementation: assert what `visible()` / `resolve_at` / the rendered
   buffer report, not how the interval index or cursor math is computed.
