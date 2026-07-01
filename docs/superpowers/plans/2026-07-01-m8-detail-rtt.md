@@ -237,41 +237,130 @@ git commit -m "feat(engine): add RttSample and carry it through the Timeline"
 - Consumes: `RttSample`, `EngineConfig.collect_rtt_timeline`, `MetricSample { t, dir, rtt: Option<Nanos>, .. }`.
 - Produces: RTT series on each `ConnTrack`, flowing through `into_timeline` into `Timeline::rtt_series`.
 
-- [ ] **Step 1: Write the failing tests** — add an `rtt_tests` module at the bottom of `tracker.rs`
-  (reuse the crate's existing test-segment builder conventions; the exact `Segment` construction
-  mirrors the `inflight_tests` module already in this file — read it and match its `iff_cfg`/`seg`
-  helpers, adding `collect_rtt_timeline: true`). Cover criteria 1–5:
+- [ ] **Step 1: Write the failing tests** — add an `rtt_tests` module at the bottom of
+  `tracker.rs`, reusing the in-file `test_support::{ep, seg}` builder (`seg(src, dst, flags, seq,
+  ack, len, ts)`) exactly as `inflight_tests` does. Complete code (covers criteria 1–6):
 
 ```rust
 #[cfg(test)]
 mod rtt_tests {
-    #![allow(clippy::unwrap_used)]
+    use super::test_support::{ep, seg};
     use super::*;
-    // ... mirror the inflight_tests helpers: a cfg() enabling collect_rtt_timeline,
-    // a seg() builder, and a filter over rtt_series by dir.
+    use tcpvisr_core::{SampleDir, TcpFlags};
 
-    // Criterion 1: O2R data (seq 100 len 10, t=1000), then R2O ACK=110 (t=1500).
-    // Exactly one RttSample, dir == O2R (measured flow = the acked sender), rtt == 500.
-    #[test]
-    fn rtt_attributed_to_measured_flow_not_ack_direction() { /* ... */ }
+    fn rtt_cfg() -> EngineConfig {
+        EngineConfig {
+            collect_rtt_timeline: true,
+            ..EngineConfig::default()
+        }
+    }
 
-    // Criterion 2: raw RTTs 800,800,400 for one direction -> srtt 800,800,750.
-    #[test]
-    fn srtt_is_rfc6298_ewma() { /* ... */ }
+    fn only_id(tl: &crate::timeline::Timeline) -> ConnId {
+        tl.connections().next().expect("one connection").id
+    }
 
-    // Criterion 3: a retransmit (Karn) / dup-ACK yields no RttSample.
-    #[test]
-    fn karn_and_dup_ack_produce_no_rtt_sample() { /* ... */ }
+    /// (t, rtt, srtt) triples for the O2R-measured RTT samples, t-ordered by the Timeline.
+    fn o2r_rtt(tl: &crate::timeline::Timeline) -> Vec<(u64, u64, u64)> {
+        tl.rtt_series(only_id(tl))
+            .iter()
+            .filter(|s| s.dir == SampleDir::OriginToResponder)
+            .map(|s| (s.t.0, s.rtt.0, s.srtt.0))
+            .collect()
+    }
 
-    // Criterion 4: into_timeline exposes t-sorted rtt_series; unknown id empty.
+    // Criterion 1: the RTT of O2R data is measured on the R2O ACK, so the sample is tagged O2R
+    // (the acked sender), not R2O (the ACK's own direction).
     #[test]
-    fn rtt_series_flows_through_into_timeline() { /* ... */ }
+    fn rtt_attributed_to_measured_flow_not_ack_direction() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(rtt_cfg());
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 1_000)); // O2R data seq100 len10
+        t.observe(&seg(s, c, TcpFlags::ACK, 1, 110, 0, 1_500)); // R2O pure ACK=110
+        let tl = t.into_timeline().expect("timeline");
+        let all = tl.rtt_series(only_id(&tl));
+        assert_eq!(all.len(), 1, "exactly one RTT sample");
+        assert_eq!(all[0].dir, SampleDir::OriginToResponder, "measured flow is O2R");
+        assert_eq!((all[0].t.0, all[0].rtt.0), (1_500, 500));
+    }
 
-    // Criterion 5: a max_samples smaller than the produced samples -> SampleCeiling.
+    // Criterion 2: srtt is the RFC 6298 EWMA (α=1/8): 800, (7*800+800)/8=800, (7*800+400)/8=750.
     #[test]
-    fn rtt_collection_counts_against_ceiling() { /* ... */ }
+    fn srtt_is_rfc6298_ewma() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(rtt_cfg());
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 0)); // O2R -> pending(110,0)
+        t.observe(&seg(s, c, TcpFlags::ACK, 1, 110, 0, 800)); // R2O ACK110 -> rtt800
+        t.observe(&seg(c, s, TcpFlags::ACK, 110, 1, 10, 1_000)); // O2R -> pending(120,1000)
+        t.observe(&seg(s, c, TcpFlags::ACK, 1, 120, 0, 1_800)); // R2O ACK120 -> rtt800
+        t.observe(&seg(c, s, TcpFlags::ACK, 120, 1, 10, 2_000)); // O2R -> pending(130,2000)
+        t.observe(&seg(s, c, TcpFlags::ACK, 1, 130, 0, 2_400)); // R2O ACK130 -> rtt400
+        let tl = t.into_timeline().expect("timeline");
+        assert_eq!(
+            o2r_rtt(&tl),
+            vec![(800, 800, 800), (1_800, 800, 800), (2_400, 400, 750)]
+        );
+    }
+
+    // Criterion 3a: a duplicate ACK that does not advance the frontier yields no RTT sample.
+    #[test]
+    fn duplicate_ack_produces_no_rtt_sample() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(rtt_cfg());
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 0)); // O2R
+        t.observe(&seg(s, c, TcpFlags::ACK, 1, 110, 0, 500)); // R2O ACK110 -> rtt500
+        t.observe(&seg(s, c, TcpFlags::ACK, 1, 110, 0, 900)); // R2O dup ACK110 -> no advance
+        let tl = t.into_timeline().expect("timeline");
+        assert_eq!(o2r_rtt(&tl), vec![(500, 500, 500)], "only the advancing ACK yields RTT");
+    }
+
+    // Criterion 3b: a retransmitted range clears the pending queue (Karn), so the later ACK finds
+    // nothing to pair and yields no RTT sample.
+    #[test]
+    fn karn_retransmit_produces_no_rtt_sample() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(rtt_cfg());
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 0)); // O2R -> pending(110,0)
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 10_000_000)); // O2R retransmit (gap > 3ms)
+        t.observe(&seg(s, c, TcpFlags::ACK, 1, 110, 0, 11_000_000)); // R2O ACK110 -> pending empty
+        let tl = t.into_timeline().expect("timeline");
+        assert!(tl.rtt_series(only_id(&tl)).is_empty(), "Karn cleared the pending send");
+    }
+
+    // Criterion 6: off by default.
+    #[test]
+    fn rtt_off_by_default_is_empty() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(EngineConfig {
+            collect_state_timeline: true,
+            ..EngineConfig::default()
+        });
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 0));
+        t.observe(&seg(s, c, TcpFlags::ACK, 1, 110, 0, 500));
+        let tl = t.into_timeline().expect("timeline");
+        assert!(tl.rtt_series(only_id(&tl)).is_empty());
+    }
+
+    // Criterion 5: two RTT samples with max_samples=1 -> SampleCeiling.
+    #[test]
+    fn rtt_collection_counts_against_ceiling() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut cfg = rtt_cfg();
+        cfg.max_samples = 1;
+        let mut t = Tracker::new(cfg);
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 10, 0));
+        t.observe(&seg(s, c, TcpFlags::ACK, 1, 110, 0, 500)); // rtt #1
+        t.observe(&seg(c, s, TcpFlags::ACK, 110, 1, 10, 1_000));
+        t.observe(&seg(s, c, TcpFlags::ACK, 1, 120, 0, 1_500)); // rtt #2 -> ceiling
+        assert!(matches!(
+            t.into_timeline().expect_err("ceiling"),
+            MetricError::SampleCeiling { .. }
+        ));
+    }
 }
 ```
+
+(Criterion 4's t-ordering is asserted by `srtt_is_rfc6298_ewma`'s ascending-t vector; the
+unknown-id empty case is Task 2's `rtt_series_empty_for_unknown_id`.)
 
 Fill each test body with concrete `Segment` vectors following the `inflight_tests` pattern in this
 file. For criterion 2 build three separate Karn-paired ACK exchanges whose measured RTTs are
@@ -424,9 +513,64 @@ git commit -m "feat(engine): collect the RTT timeline with smoothed SRTT"
   (`Raw` at `row(rtt)`, `Smoothed` at `row(srtt)`); (b) `Series { Raw, Smoothed, Kernel }`;
   (c) `max_rtt` maximizes over wire `rtt`, wire `srtt`, and overlay `srtt`. Bucketing is per
   series (numeric-max), reveal-to-`T`, cursor column — all identical to `inflight.rs`.
-  Cover criteria 7–15 as tests in the module (mirror `inflight.rs`'s tests: corners, reveal,
-  fixed axes, per-series bucketing, degenerate spans, cursor column, focus-only, overlay
-  distinct+unclamped, plus a new `raw_and_smoothed_align_in_column` for criterion 14).
+  Cover criteria 7–15 as tests in the module. The tests below are the two worked templates — the
+  novel criterion-14 alignment test in full, and one placement test showing the helper shape.
+  The remaining tests (reveal-to-`T`, fixed axes, per-series numeric-max bucketing, degenerate
+  spans, cursor column, focus-only, overlay distinct+unclamped) are mechanical translations of
+  `inflight.rs`'s identically-named tests — copy each, swap `wire(t, bytes)` for `rtt(t, rtt,
+  srtt)`, `bytes`→`rtt`/`srtt`, `WIRE_GLYPH`→`RAW_GLYPH`/`SMOOTHED_GLYPH`, `Series::Cwnd`→
+  `Series::Kernel`, and `max_bytes`→`max_rtt`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use tcpvisr_core::SampleDir;
+
+    fn rtt(t: u64, rtt_ns: u64, srtt_ns: u64) -> RttSample {
+        RttSample {
+            t: Nanos(t),
+            dir: SampleDir::OriginToResponder,
+            rtt: Nanos(rtt_ns),
+            srtt: Nanos(srtt_ns),
+        }
+    }
+
+    fn marks_at(p: &RttPlot, col: u16, row: u16) -> Vec<Mark> {
+        p.marks.iter().filter(|m| m.col == col && m.row == row).copied().collect()
+    }
+
+    // Criterion 7: corners — a sample at (end, rtt=srtt=max) lands Raw+Smoothed at top-right; a
+    // sample at (start, rtt=0) lands its Raw mark at bottom-left. max_rtt = 40.
+    #[test]
+    fn corners_place_at_exact_indices() {
+        let s = [rtt(0, 0, 0), rtt(100, 40, 40)];
+        let p = project(&s, &[], SampleDir::OriginToResponder, (Nanos(0), Nanos(100)), Nanos(100), 10, 5).unwrap();
+        assert_eq!(p.max_rtt, 40);
+        assert!(marks_at(&p, 0, 0).iter().any(|m| m.series == Series::Raw), "bottom-left raw");
+        let top = marks_at(&p, 9, 4);
+        assert!(top.iter().any(|m| m.series == Series::Raw));
+        assert!(top.iter().any(|m| m.series == Series::Smoothed), "raw+smoothed both at top-right");
+    }
+
+    // Criterion 14: a single sample in its own column with rtt != srtt emits a Raw mark and a
+    // Smoothed mark in the same column at different rows, with distinct glyphs.
+    #[test]
+    fn raw_and_smoothed_align_in_column() {
+        // rtt=40 (max) -> row H-1; srtt=20 -> half. Single sample -> its own column, bucketing no-op.
+        let s = [rtt(100, 40, 20)];
+        let p = project(&s, &[], SampleDir::OriginToResponder, (Nanos(0), Nanos(100)), Nanos(100), 10, 11).unwrap();
+        let col = p.cursor_col; // t=100=end -> last column; the sample shares it
+        let raw = p.marks.iter().find(|m| m.series == Series::Raw && m.glyph == RAW_GLYPH).unwrap();
+        let smooth = p.marks.iter().find(|m| m.series == Series::Smoothed && m.glyph == SMOOTHED_GLYPH).unwrap();
+        assert_eq!(raw.col, smooth.col, "same column");
+        assert_ne!(raw.row, smooth.row, "different rows (rtt above srtt)");
+        assert!(raw.row > smooth.row, "raw (40) plots above smoothed (20)");
+        let _ = col;
+    }
+}
+```
 
 - [ ] **Step 2: Run to verify it fails**
 
@@ -760,6 +904,12 @@ fn rtt_view_open_shows_graph() {
     assert!(s.contains("RTT"), "rtt legend: {s}");
     assert!(s.contains("0.000s"), "an axis time label: {s}");
     assert!(s.contains("ms"), "ms axis unit: {s}");
+    // Criterion 19: a plotted data glyph must appear. The RTT legend already contains one '#'
+    // ("# smoothed"), so require at least TWO — the extra ones are plotted smoothed marks. This
+    // fails if the plot area draws nothing (unlike a bare `contains('#')`, which the legend alone
+    // would satisfy).
+    let hashes = s.matches('#').count();
+    assert!(hashes >= 2, "at least one plotted smoothed glyph beyond the legend: {hashes} in {s}");
 }
 
 #[test]
