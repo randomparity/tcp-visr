@@ -11,7 +11,7 @@ pub mod service;
 pub mod throughput;
 pub mod transport;
 
-pub use app::{App, ConnRow, DetailView, Mode, Outcome, SortDir, SortField};
+pub use app::{App, ConnRow, DetailView, LiveStatus, Mode, Outcome, SortDir, SortField};
 pub use inflight::{InFlightPlot, Series};
 pub use keys::handle_key;
 pub use render::render;
