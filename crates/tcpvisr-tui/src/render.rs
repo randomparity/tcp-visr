@@ -7,8 +7,9 @@ use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState};
 use tcpvisr_core::Nanos;
 
-use crate::app::{App, Mode, SortDir, SortField};
+use crate::app::{App, DetailView, FocusConn, Mode, SortDir, SortField};
 use crate::detail::{self, Mark, SeqPlot};
+use crate::inflight::{self, InFlightPlot, Mark as InFlightMark, Series};
 
 /// Columns reserved on the left of the detail pane for Y-axis (sequence) labels.
 const GUTTER: u16 = 8;
@@ -93,7 +94,7 @@ fn render_main(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
-/// Draws the Time/Sequence detail pane for the focused connection into `area`.
+/// Draws the detail pane (the view named by `app.detail_view()`) for the focused connection.
 fn render_detail(frame: &mut Frame, app: &App, area: Rect) {
     let Some(focus) = app.focus() else {
         let block = Block::bordered().title("DETAIL");
@@ -110,9 +111,16 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new("widen terminal to view graph"), inner);
         return;
     }
+    match app.detail_view() {
+        DetailView::TimeSequence => render_seq_body(frame, app, inner, &focus),
+        DetailView::InFlight => render_inflight_body(frame, app, inner, &focus),
+    }
+}
+
+/// Draws the Time/Sequence (Stevens) graph into the reserved pane interior (M6).
+fn render_seq_body(frame: &mut Frame, app: &App, inner: Rect, focus: &FocusConn<'_>) {
     let plot_w = inner.width - GUTTER;
     let plot_h = inner.height - 2; // legend + time labels
-
     let Some(plot) = detail::project(
         focus.series,
         focus.focus_dir,
@@ -124,10 +132,96 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new("widen terminal to view graph"), inner);
         return;
     };
-
     draw_legend(frame, inner);
     draw_plot(frame, inner, GUTTER, &plot);
     draw_axes(frame, inner, GUTTER, &plot);
+}
+
+/// Draws the In-flight (bytes-outstanding) sawtooth into the reserved pane interior (M7). The
+/// cwnd overlay series is empty on replay; M12 fills it (ADR-0012 §4).
+fn render_inflight_body(frame: &mut Frame, app: &App, inner: Rect, focus: &FocusConn<'_>) {
+    let plot_w = inner.width - GUTTER;
+    let plot_h = inner.height - 2; // legend + time labels
+    let Some(plot) = inflight::project(
+        focus.inflight,
+        &[],
+        focus.focus_dir,
+        focus.x_span,
+        app.cursor(),
+        plot_w,
+        plot_h,
+    ) else {
+        frame.render_widget(Paragraph::new("widen terminal to view graph"), inner);
+        return;
+    };
+    draw_inflight_legend(frame, inner);
+    draw_inflight_plot(frame, inner, GUTTER, &plot);
+    draw_inflight_axes(frame, inner, GUTTER, &plot);
+}
+
+fn draw_inflight_legend(frame: &mut Frame, inner: Rect) {
+    let legend = format!("In-flight   {} wire", inflight::WIRE_GLYPH);
+    let row = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: 1,
+    };
+    frame.render_widget(Paragraph::new(legend), row);
+}
+
+fn draw_inflight_plot(frame: &mut Frame, inner: Rect, gutter: u16, plot: &InFlightPlot) {
+    let buf = frame.buffer_mut();
+    let x0 = inner.x + gutter;
+    let y_top = inner.y + 1; // below the legend row
+    for &InFlightMark {
+        col,
+        row,
+        glyph,
+        series,
+    } in &plot.marks
+    {
+        let screen_row = plot.height - 1 - row; // bottom-origin row -> screen line
+        let x = x0 + col;
+        let y = y_top + screen_row;
+        let color = match series {
+            Series::Cwnd => Color::Cyan,
+            Series::Wire => Color::Reset,
+        };
+        buf.set_string(x, y, glyph.to_string(), Style::default().fg(color));
+    }
+}
+
+fn draw_inflight_axes(frame: &mut Frame, inner: Rect, gutter: u16, plot: &InFlightPlot) {
+    let buf = frame.buffer_mut();
+    let y_top = inner.y + 1;
+    // Y labels: max_bytes at the top, 0 at the bottom. `fmt_seq` keeps a large (multi-GB) value
+    // inside the gutter so it never overwrites plot columns.
+    let top = i64::try_from(plot.max_bytes).unwrap_or(i64::MAX);
+    buf.set_string(
+        inner.x,
+        y_top,
+        format!("{:>7}", fmt_seq(top)),
+        Style::default(),
+    );
+    let y_bottom = y_top + plot.height - 1;
+    buf.set_string(inner.x, y_bottom, format!("{:>7}", 0), Style::default());
+    // X labels: start / end seconds on the bottom label row.
+    let label_row = inner.y + inner.height - 1;
+    let start = fmt_seconds(plot.x_span.0);
+    let end = fmt_seconds(plot.x_span.1);
+    buf.set_string(
+        inner.x + gutter,
+        label_row,
+        format!("{start}s"),
+        Style::default(),
+    );
+    let end_label = format!("{end}s");
+    let end_x = inner
+        .x
+        .saturating_add(inner.width)
+        .saturating_sub(u16::try_from(end_label.len()).unwrap_or(0));
+    buf.set_string(end_x, label_row, end_label, Style::default());
 }
 
 fn draw_legend(frame: &mut Frame, inner: Rect) {
@@ -202,7 +296,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 SortDir::Desc => '▼',
             };
             format!(
-                "space play/pause  ←→ seek  +/- speed  ,/. step  ⏎ open  esc close  / filter  s sort:{}{arrow}  q quit",
+                "space play/pause  ←→ seek  +/- speed  ,/. step  ⏎ open  esc close  ⇥ view  / filter  s sort:{}{arrow}  q quit",
                 sort_label(app.sort_field()),
             )
         }
@@ -393,7 +487,9 @@ mod tests {
     #[test]
     fn footer_shows_transport_hints() {
         let app = app_span(1_000_000_000);
-        let s = draw(&app, 100, 8);
+        // Width 120: the M7 footer gained the `⇥ view` switcher hint (spec §3.3), so the tail
+        // (`q quit`) needs a wider viewport than M5's 80/100 — matching the other footer tests.
+        let s = draw(&app, 120, 8);
         assert!(s.contains("space"), "play/pause hint: {s}");
         assert!(s.contains("seek"), "seek hint: {s}");
         assert!(s.contains("speed"), "speed hint: {s}");
@@ -512,6 +608,62 @@ mod tests {
             "mark legend: {s}"
         );
         assert!(s.contains('#'), "at least one plotted data glyph: {s}");
+    }
+
+    #[test]
+    fn inflight_view_open_shows_graph() {
+        let c = conn_span(ep(1, 5), ep(2, 443), 0, 1_000, ConnState::Established);
+        let mut c2 = c;
+        c2.bytes_o2r = 100;
+        let inflight = vec![
+            tcpvisr_engine::InFlightSample {
+                t: Nanos(0),
+                dir: tcpvisr_core::SampleDir::OriginToResponder,
+                bytes: 50,
+            },
+            tcpvisr_engine::InFlightSample {
+                t: Nanos(1_000),
+                dir: tcpvisr_core::SampleDir::OriginToResponder,
+                bytes: 100,
+            },
+        ];
+        let tl = Timeline::with_seq(vec![(c2, vec![ss(0, 100, 0)], vec![], inflight)]);
+        let mut app = App::new(tl, "t".to_string());
+        app.open_detail();
+        app.cycle_detail_view(); // -> InFlight
+        let s = draw(&app, 120, 14);
+        assert!(s.contains("DETAIL"), "detail title: {s}");
+        assert!(s.contains("In-flight"), "in-flight legend: {s}");
+        assert!(s.contains('#'), "at least one wire glyph: {s}");
+        assert!(s.contains("0.000s"), "an axis time label: {s}");
+    }
+
+    #[test]
+    fn footer_advertises_view_switch() {
+        let app = app_span(1_000_000_000);
+        let s = draw(&app, 120, 8);
+        assert!(s.contains("view"), "footer view-switch hint: {s}");
+    }
+
+    #[test]
+    fn inflight_view_too_narrow_shows_widen_message() {
+        let c = conn_span(ep(1, 5), ep(2, 443), 0, 1_000, ConnState::Established);
+        let mut c2 = c;
+        c2.bytes_o2r = 100;
+        let inflight = vec![tcpvisr_engine::InFlightSample {
+            t: Nanos(0),
+            dir: tcpvisr_core::SampleDir::OriginToResponder,
+            bytes: 100,
+        }];
+        let tl = Timeline::with_seq(vec![(c2, vec![ss(0, 100, 0)], vec![], inflight)]);
+        let mut app = App::new(tl, "t".to_string());
+        app.open_detail();
+        app.cycle_detail_view();
+        let s = draw(&app, 34, 12); // right pane inner plot < MIN_W after the gutter
+        assert!(
+            s.contains("widen terminal"),
+            "narrow in-flight guidance: {s}"
+        );
     }
 
     #[test]
