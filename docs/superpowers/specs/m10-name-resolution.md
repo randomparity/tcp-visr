@@ -150,10 +150,12 @@ renders `host:port` when resolved (design §6: `→ github.com:443`). The origin
 
 ### Core (`tcpvisr-core`)
 
-- New `name.rs`: `HostName(String)` with `new(&str) -> Option<Self>` (sanitize + bound) and
-  `Display`/`AsRef<str>`; `NameObservation { ts, ip, name }`; `NameTable` wrapping
-  `HashMap<IpAddr, (Nanos, HostName)>` with `observe`, `resolve`, `len`, `is_empty`, `Default`.
-  Re-export all three from `lib.rs`. No I/O, no clock.
+- New `name.rs`: `HostName(String)` with `new(&str) -> Option<Self>` (printable-ASCII sanitize +
+  253 bound) and `Display`/`AsRef<str>`; `NameObservation { ts, ip, name }`; `NameTable` wrapping
+  `HashMap<IpAddr, (Nanos, HostName)>` plus a drop counter, with `observe` (latest-wins per IP,
+  capped at `NAME_TABLE_CAP` distinct IPs — a new IP past the cap is refused and counted), `resolve`,
+  `len`, `is_empty`, `dropped`, `Default`. `NAME_TABLE_CAP` is a module constant (`65_536`).
+  Re-export the three types from `lib.rs`. No I/O, no clock.
 
 ### Ingest (`tcpvisr-ingest`)
 
@@ -186,8 +188,9 @@ renders `host:port` when resolved (design §6: `→ github.com:443`). The origin
 ### CLI (`tcp-visr`)
 
 - `build_replay_app`: build a `NameTable`, parse via `parse_file_visit_named` folding
-  `NameObservation`s into it, pass it to `App::new`, and include `name_table.len()` in the title.
-  The `SampleCeiling` path is unchanged.
+  `NameObservation`s into it, pass it to `App::new`, and include `name_table.len()` in the title —
+  plus a `names capped` indicator when `name_table.dropped() > 0` (§2 observability). The
+  `SampleCeiling` path is unchanged.
 
 ### Dependencies
 
