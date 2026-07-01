@@ -371,6 +371,10 @@ and roadmap ordering already encode those, and duplicate state rots.
 | [0005](../adr/0005-libpcap-file-faucet-at-m1.md) | libpcap enters at M1 as a default-off file faucet for the parity test (amends ADR-0003 timing) | Accepted |
 | [0006](../adr/0006-connection-identity-and-direction.md) | Connection grouping, orientation, direction, and instance identity are engine-derived (RFC 1982 wrap-vs-reset) | Accepted |
 | [0007](../adr/0007-metric-derivation-model.md) | Per-event/per-direction metric sampling; `ConnectionMetrics` series; reorder-window retransmit/OOO; Karn RTT; sample ceiling; serde in the CLI | Accepted |
+| [0008](../adr/0008-usable-frame-headers-present.md) | Header-only / truncated captures: usable-header policy, skip-and-count truncated frames | Accepted |
+| [0009](../adr/0009-tui-master-list-architecture.md) | TUI master-list architecture: pure `App`/render/key seams, `TestBackend` snapshots | Accepted |
+| [0010](../adr/0010-timeline-transport-as-of-t.md) | Seekable `Timeline` + pure `Transport`; as-of-`T` master list; dedicated `StateSample` series | Accepted |
+| [0011](../adr/0011-detail-seq-timeline-and-rendering.md) | Detail Time/Sequence: dedicated `SeqSample` series + pure character-cell grid rendering | Accepted |
 
 ## 14. Risks
 
