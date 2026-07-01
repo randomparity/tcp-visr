@@ -30,6 +30,13 @@ fn handle_nav(app: &mut App, code: KeyCode) -> Outcome {
         KeyCode::Char('/') => app.enter_filter(),
         KeyCode::Char('j') | KeyCode::Down => app.move_down(),
         KeyCode::Char('k') | KeyCode::Up => app.move_up(),
+        KeyCode::Char(' ') => app.toggle_play(),
+        KeyCode::Left => app.seek(false),
+        KeyCode::Right => app.seek(true),
+        KeyCode::Char('+' | '=') => app.faster(),
+        KeyCode::Char('-' | '_') => app.slower(),
+        KeyCode::Char('.') => app.step_forward(),
+        KeyCode::Char(',') => app.step_back(),
         _ => {}
     }
     Outcome::Continue
@@ -97,8 +104,102 @@ mod tests {
         )
     }
 
+    /// One connection open on `[0, 1000]` with events at t=0 and t=500, so seek/step move the
+    /// cursor meaningfully.
+    fn wide_app() -> App {
+        let c = Connection {
+            id: ConnId {
+                pair: EndpointPair::new(ep(1, 1), ep(2, 22)),
+                instance: 0,
+            },
+            state: ConnState::Established,
+            origin: ep(1, 1),
+            responder: ep(2, 22),
+            origin_inferred: false,
+            opened_at: Nanos(0),
+            last_at: Nanos(1000),
+            bytes_o2r: 0,
+            bytes_r2o: 0,
+            segments: 2,
+        };
+        let samples = vec![
+            StateSample {
+                t: Nanos(0),
+                state: ConnState::Established,
+                bytes_o2r: 0,
+                bytes_r2o: 0,
+            },
+            StateSample {
+                t: Nanos(500),
+                state: ConnState::Established,
+                bytes_o2r: 10,
+                bytes_r2o: 0,
+            },
+        ];
+        App::new(Timeline::new(vec![(c, samples)]), "t".to_string())
+    }
+
     fn press(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn space_toggles_play_in_nav_mode() {
+        let mut a = app();
+        assert!(!a.is_playing());
+        assert_eq!(handle_key(&mut a, press(' ')), Outcome::Continue);
+        assert!(a.is_playing());
+        handle_key(&mut a, press(' '));
+        assert!(!a.is_playing());
+    }
+
+    #[test]
+    fn arrows_seek_the_cursor() {
+        let mut a = wide_app(); // bounds 0..1000, seek step = 1000/50 = 20
+        handle_key(&mut a, key(KeyCode::Right));
+        assert_eq!(a.cursor(), Nanos(20));
+        handle_key(&mut a, key(KeyCode::Left));
+        assert_eq!(a.cursor(), Nanos(0));
+    }
+
+    #[test]
+    fn plus_minus_change_speed() {
+        let mut a = app();
+        assert!((a.speed() - 1.0).abs() < 1e-9);
+        handle_key(&mut a, press('+'));
+        assert!((a.speed() - 2.0).abs() < 1e-9);
+        handle_key(&mut a, press('='));
+        assert!((a.speed() - 5.0).abs() < 1e-9);
+        handle_key(&mut a, press('-'));
+        assert!((a.speed() - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn period_and_comma_step_events() {
+        let mut a = wide_app(); // events at 0 and 500
+        handle_key(&mut a, press('.'));
+        assert_eq!(a.cursor(), Nanos(500));
+        handle_key(&mut a, press(','));
+        assert_eq!(a.cursor(), Nanos(0));
+    }
+
+    #[test]
+    fn transport_keys_are_inert_in_filter_mode() {
+        let mut a = wide_app();
+        handle_key(&mut a, press('/')); // enter filter
+        for c in [' ', '+', ',', '.'] {
+            handle_key(&mut a, press(c));
+        }
+        assert_eq!(a.query(), " +,.", "printable keys append to the query");
+        assert!(!a.is_playing(), "space did not toggle play in filter mode");
+        assert!((a.speed() - 1.0).abs() < 1e-9, "+ did not change speed");
+        assert_eq!(a.cursor(), Nanos(0), ". did not step the cursor");
+        let ev = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(handle_key(&mut a, ev), Outcome::Quit);
     }
 
     #[test]
