@@ -39,6 +39,7 @@ fn handle_nav(app: &mut App, code: KeyCode) -> Outcome {
         KeyCode::Char(',') => app.step_back(),
         KeyCode::Enter => app.open_detail(),
         KeyCode::Esc => app.close_detail(),
+        KeyCode::Tab => app.cycle_detail_view(),
         _ => {}
     }
     Outcome::Continue
@@ -254,6 +255,28 @@ mod tests {
         handle_key(&mut a, press('/'));
         handle_key(&mut a, key(KeyCode::Esc)); // clears filter, does not close/open detail
         assert!(!a.is_detail_open());
+    }
+
+    #[test]
+    fn tab_cycles_view_in_nav_mode() {
+        use crate::app::DetailView;
+        let mut a = app();
+        assert_eq!(a.detail_view(), DetailView::TimeSequence);
+        handle_key(&mut a, key(KeyCode::Tab));
+        assert_eq!(a.detail_view(), DetailView::InFlight);
+    }
+
+    #[test]
+    fn tab_does_not_cycle_view_in_filter_mode() {
+        use crate::app::DetailView;
+        let mut a = app();
+        handle_key(&mut a, press('/')); // enter filter
+        handle_key(&mut a, key(KeyCode::Tab));
+        assert_eq!(
+            a.detail_view(),
+            DetailView::TimeSequence,
+            "Tab inert for view-switching in filter mode"
+        );
     }
 
     #[test]
