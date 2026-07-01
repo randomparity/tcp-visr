@@ -10,13 +10,17 @@ building toward v0.1 (replay-only). The full design is the source of truth:
 [docs/design/tcp-visr-design.md](docs/design/tcp-visr-design.md); cross-cutting decisions are
 [ADRs](docs/adr/) and are authoritative when they disagree with the design doc.
 
-**Current state:** milestones M0–M5 are implemented. Working CLI subcommands are `parse`,
+**Current state:** milestones M0–M6 are implemented. Working CLI subcommands are `parse`,
 `conns`, `metrics`, and `replay` (all replay path only). `replay` opens the interactive TUI
 over a capture with a seekable timeline: play/pause, 0.1–10× speed, seek, and step, with the
 master list resolving each connection's state and bytes "as of" the cursor time via the
-cross-connection interval index (M5). `live`, kernel enrichment, and the per-connection detail
-graphs (M6–M9) are not built yet; `live` returns "not implemented yet". Do not assume a feature
-exists because the design describes it — check the roadmap (design §10) and the code.
+cross-connection interval index (M5). `Enter` opens a per-connection Time/Sequence (Stevens)
+detail pane (`Esc` closes it): a cursor-driven seq-vs-time graph with retransmit/SACK marks,
+plotted from an engine-unwrapped `i64` sequence offset so multi-GB transfers do not fold (M6).
+The remaining detail views — in-flight, RTT, throughput — and the `Tab` view-switcher (M7–M9),
+`live`, and kernel enrichment are not built yet; `live` returns "not implemented yet". Do not
+assume a feature exists because the design describes it — check the roadmap (design §10) and
+the code.
 
 ## Commands
 
