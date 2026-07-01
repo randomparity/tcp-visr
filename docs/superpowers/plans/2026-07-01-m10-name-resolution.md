@@ -614,7 +614,59 @@ git commit -m "feat(ingest): decode UDP/53 DNS responses to a Names outcome"
   - `pub fn parse_file_visit_named(path: &Path, item_sink: &mut dyn FnMut(&Item), name_sink: &mut dyn FnMut(&NameObservation)) -> Result<(LinkType, SkipCounts), IngestError>`.
   - `parse_file_visit` retained, delegating with a no-op name sink.
 
-- [ ] **Step 1: Write the failing test** — add to `crates/tcpvisr-ingest/tests/parse.rs` (or a new `dns_faucet.rs` integration test). Build a capture with one TCP SYN and one DNS response, then assert routing. Use the `support` module's pcap builders (mirror how `parse.rs`/`parity.rs` already build fixtures). Add a helper in `crates/tcpvisr-ingest/tests/support/mod.rs` if a UDP/DNS frame builder is missing — reuse the `ipv4_udp_dns_response`-style bytes from Task 4 (a UDP/53 response). Test body:
+> **Test-helper boundary (important).** The `ipv4_udp_dns_response()` helper written in Task 4 lives
+> in `decode.rs`'s `#[cfg(test)] mod tests` — a **`src/` unit-test module**. Integration tests under
+> `tests/` (`parse.rs`, `parity.rs`) are a **separate crate** and **cannot import** that helper, nor
+> can `decode.rs` import `tests/support/mod.rs`. So the DNS-frame builders must exist **in both
+> places** — this duplication is required by Rust's test layout, not an oversight. This task adds the
+> builders to `tests/support/mod.rs`; Task 4 keeps its own copy in `decode.rs`.
+
+- [ ] **Step 1: Add the DNS-frame builders to `crates/tcpvisr-ingest/tests/support/mod.rs`.** Add a
+  file-level `use simple_dns::...;` and these two functions (both return raw IP-frame bytes suitable
+  for `Pkt::new`). If the support module has a `#![allow(...)]` for test-only lints, keep it:
+
+```rust
+/// A UDP/53 DNS *response*: `example.com A 93.184.216.34` as raw IPv4/UDP frame bytes.
+pub fn ipv4_udp_dns_response() -> Vec<u8> {
+    use simple_dns::rdata::{RData, A};
+    use simple_dns::{Name, Packet, ResourceRecord, CLASS};
+    let mut p = Packet::new_reply(1);
+    p.answers.push(ResourceRecord::new(
+        Name::new("example.com").unwrap(),
+        CLASS::IN,
+        300,
+        RData::A(A { address: u32::from(core::net::Ipv4Addr::new(93, 184, 216, 34)) }),
+    ));
+    let dns = p.build_bytes_vec().unwrap();
+    let mut buf = Vec::new();
+    etherparse::PacketBuilder::ipv4([93, 184, 216, 34], [10, 0, 0, 2], 64)
+        .udp(53, 40000) // source port 53 marks a response
+        .write(&mut buf, &dns)
+        .unwrap();
+    buf
+}
+
+/// A UDP/53 DNS *query* (no answers) as raw IPv4/UDP frame bytes — yields no name observation.
+pub fn ipv4_udp_dns_query() -> Vec<u8> {
+    use simple_dns::Packet;
+    let dns = Packet::new_reply(2).build_bytes_vec().unwrap(); // empty answer section
+    let mut buf = Vec::new();
+    etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [93, 184, 216, 34], 64)
+        .udp(40000, 53) // dst port 53 = a request; source is not 53, so decode never treats it as a response
+        .write(&mut buf, &dns)
+        .unwrap();
+    buf
+}
+```
+
+  Note the query uses **destination** port 53 (source ≠ 53), so `decode_frame` classifies it
+  `Skipped(NonTcp)` for two independent reasons (not a response, and no answers) — either way the
+  faucet counts it `non_tcp`. `simple-dns` and `etherparse` are already dependencies of the crate, so
+  the support module (compiled with the integration tests) can use them with no manifest change.
+
+- [ ] **Step 2: Write the failing test** in `crates/tcpvisr-ingest/tests/parse.rs`, importing the two
+  new builders (and the existing `DLT_RAW, Pkt, ipv4_tcp_syn, legacy_pcap, write_temp`) from
+  `support`. Test body:
 
 ```rust
 #[test]
@@ -643,13 +695,12 @@ fn faucet_routes_names_and_excludes_them_from_non_tcp() {
 }
 ```
 
-Add `ipv4_udp_dns_response()` and `ipv4_udp_dns_query()` builders to `tests/support/mod.rs` (the query is a `Packet::new_query`-based UDP/53 packet, or simply a UDP/53 packet with an empty DNS answer section, built the same way as the response but with `Packet::new_reply` and no answers pushed).
+- [ ] **Step 3: Run to verify it fails**
 
-- [ ] **Step 2: Run to verify it fails**
+Run: `cargo test -p tcpvisr-ingest --test parse faucet_routes_names` → FAIL to compile (`ReplayParse`
+has no `names` field yet) — the expected pre-implementation failure.
 
-Run: `cargo test -p tcpvisr-ingest --test parse faucet_routes_names` → FAIL (`ReplayParse` has no `names`; builders missing).
-
-- [ ] **Step 3: Add `names` to `ReplayParse`** in `crates/tcpvisr-ingest/src/lib.rs`:
+- [ ] **Step 4: Add `names` to `ReplayParse`** in `crates/tcpvisr-ingest/src/lib.rs`:
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -663,7 +714,7 @@ pub struct ReplayParse {
 
 Add `pub use replay::{parse_file, parse_file_visit, parse_file_visit_named};`.
 
-- [ ] **Step 4: Add `parse_file_visit_named` and routing** in `crates/tcpvisr-ingest/src/replay.rs`:
+- [ ] **Step 5: Add `parse_file_visit_named` and routing** in `crates/tcpvisr-ingest/src/replay.rs`:
 
   a. Rename the existing `parse_file_visit` body to `parse_file_visit_named`, adding a `name_sink: &mut dyn FnMut(&NameObservation)` parameter, threaded into `process_packet`.
   b. Reintroduce `parse_file_visit` as a wrapper:
@@ -704,13 +755,13 @@ pub fn parse_file(path: &Path) -> Result<ReplayParse, IngestError> {
 
   Update the `DecodeOutcome`/`NameObservation` imports at the top of `replay.rs`.
 
-- [ ] **Step 5: Route names in the libpcap faucet** — in `crates/tcpvisr-ingest/src/libpcap.rs`, add `let mut names = Vec::new();`, extend the decode match with `DecodeOutcome::Names(obs) => names.extend(obs),`, and set `names` in the returned `ReplayParse`.
+- [ ] **Step 6: Route names in the libpcap faucet** — in `crates/tcpvisr-ingest/src/libpcap.rs`, add `let mut names = Vec::new();`, extend the decode match with `DecodeOutcome::Names(obs) => names.extend(obs),`, and set `names` in the returned `ReplayParse`.
 
-- [ ] **Step 6: Run to verify it passes**
+- [ ] **Step 7: Run to verify it passes**
 
 Run: `cargo test -p tcpvisr-ingest --test parse faucet_routes_names` → PASS. Then full `cargo test -p tcpvisr-ingest` → PASS (existing tests still green; any test that constructs `ReplayParse` literally now needs the `names` field — grep for `ReplayParse {` and add `names: vec![]` where constructed in tests).
 
-- [ ] **Step 7: Guardrails + commit**
+- [ ] **Step 8: Guardrails + commit**
 
 ```bash
 git add crates/tcpvisr-ingest/src/lib.rs crates/tcpvisr-ingest/src/replay.rs crates/tcpvisr-ingest/src/libpcap.rs crates/tcpvisr-ingest/tests/
@@ -882,9 +933,43 @@ Run: `cargo test -p tcpvisr-tui app::` and `cargo test -p tcpvisr-tui render::` 
 `App::new` call site needs editing (the 2-arg wrapper is preserved). If `ConnRow` is constructed
 literally anywhere in tests, add `host: None`.
 
-- [ ] **Step 6: Add the render tests** (spec criteria 12, 18) in `render.rs` `tests`:
-  - Title contains `→ github.com:443` for a resolved responder (build the `App` with a name table).
-  - A ~253-char resolved name renders truncated: assert the rendered buffer width equals the terminal width (no overflow) and the peer cell contains a prefix of the name.
+- [ ] **Step 6: Add the render tests** (spec criteria 12, 18) to `render.rs` `tests`. These reuse
+  the existing `draw(&app, w, h) -> String` helper, `conn_span`, `ss`, and `ep`:
+
+```rust
+    fn app_with_host(name: &str) -> App {
+        let c = conn_span(ep(1, 5), ep(2, 443), 0, 1_000, ConnState::Established);
+        let mut names = tcpvisr_core::NameTable::default();
+        names.observe(tcpvisr_core::NameObservation {
+            ts: Nanos(1),
+            ip: ep(2, 443).ip,
+            name: tcpvisr_core::HostName::new(name).unwrap(),
+        });
+        App::new_with_names(Timeline::new(vec![(c, vec![ss(0, 10, 20)])]), names, "t".to_string())
+    }
+
+    #[test]
+    fn detail_title_shows_resolved_responder_host() {
+        let mut app = app_with_host("github.com");
+        app.open_detail();
+        let s = draw(&app, 120, 12);
+        assert!(s.contains("github.com:443"), "detail title host: {s}");
+    }
+
+    #[test]
+    fn long_host_name_is_truncated_not_rendered_whole() {
+        // The peer column is far narrower than 253 chars; ratatui clips the Table cell, so the
+        // full name never renders contiguously (criterion 18). A prefix of 'a's does render.
+        let long = "a".repeat(253);
+        let app = app_with_host(&long);
+        let s = draw(&app, 80, 8);
+        assert!(!s.contains(&long), "the 253-char name must be clipped to the column, not shown whole");
+        assert!(s.contains("aaaa"), "a prefix of the resolved name renders in the peer column");
+    }
+```
+
+  (A `TestBackend` buffer is fixed size, so `draw` always yields `w`-wide lines by construction — the
+  real truncation signal is that the *whole* name does not appear, which `!s.contains(&long)` asserts.)
 
 - [ ] **Step 7: Guardrails + commit**
 
@@ -905,7 +990,12 @@ git commit -m "feat(tui): render DNS host labels on rows, filter, and detail tit
 - Create/Modify: a committed DNS fixture under `crates/tcp-visr/tests/fixtures/` + `crates/tcp-visr/tests/drift.rs` guard (follow the existing fixture-as-bytes convention)
 
 **Interfaces:**
-- Consumes: `parse_file_visit_named`, `NameTable`, `App::new` (3-arg).
+- Consumes: `parse_file_visit_named`, `NameTable`, `App::new_with_names`.
+- The support module (`crates/tcp-visr/tests/support/mod.rs`) already exposes
+  `legacy_pcap(frames: &[(u64, Vec<u8>)]) -> Vec<u8>`, a `tcp(...)` frame builder, and
+  `metrics_fixture_set() -> Vec<(&'static str, Vec<u8>)>`; `tests/drift.rs` byte-matches each set
+  via `committed_metrics_fixtures_match_builder` with an ignored `regenerate_metrics_fixtures`. This
+  task mirrors that shape with a `name_fixture_set()`.
 
 - [ ] **Step 1: Write the failing bin test** in `crates/tcp-visr/src/main.rs` `build_replay_tests`. Add a committed DNS fixture (a TCP connection + a DNS response resolving the responder IP to a host name), built by the support module like `metrics_basic.pcap`. Test:
 
@@ -934,7 +1024,76 @@ git commit -m "feat(tui): render DNS host labels on rows, filter, and detail tit
 
 Run: `cargo test -p tcp-visr build_replay_app_resolves_and_counts_names` → FAIL (fixture missing / title has no name count / `build_replay_app` does not build a table).
 
-- [ ] **Step 3: Build the fixture.** Add a `name_resolution.pcap` builder to `crates/tcp-visr/tests/support/mod.rs` (reuse the etherparse + `simple-dns` approach: a SYN/SYN-ACK/ACK to `93.184.216.34:443` plus a UDP/53 response `example.com A 93.184.216.34`). Add `simple-dns` as a `[dev-dependencies]` of `tcp-visr` if the support module builds DNS bytes. Write the fixture bytes to `crates/tcp-visr/tests/fixtures/name_resolution.pcap` and add a `drift.rs` case asserting the committed bytes equal the builder output (mirror the existing drift entries).
+- [ ] **Step 3: Build the fixture.** 
+  a. Add `simple-dns = "=0.11.3"` to `crates/tcp-visr/Cargo.toml` `[dev-dependencies]` (the support
+     module builds DNS bytes). Run `cargo deny check` → clean.
+  b. In `crates/tcp-visr/tests/support/mod.rs`, add a `udp_dns_response()` Ethernet-frame builder
+     (mirror the ingest one from Task 5 Step 1 but wrap with `PacketBuilder::ethernet2(...)` so it
+     matches the support module's Ethernet link type), and a fixture set:
+
+```rust
+/// Ethernet/IPv4/UDP-53 DNS response: `example.com A 93.184.216.34`.
+pub fn udp_dns_response() -> Vec<u8> {
+    use simple_dns::rdata::{RData, A};
+    use simple_dns::{Name, Packet, ResourceRecord, CLASS};
+    let mut p = Packet::new_reply(1);
+    p.answers.push(ResourceRecord::new(
+        Name::new("example.com").unwrap(),
+        CLASS::IN,
+        300,
+        RData::A(A { address: u32::from(core::net::Ipv4Addr::new(93, 184, 216, 34)) }),
+    ));
+    let dns = p.build_bytes_vec().unwrap();
+    let mut buf = Vec::new();
+    PacketBuilder::ethernet2([2, 0, 0, 0, 0, 1], [2, 0, 0, 0, 0, 2])
+        .ipv4([93, 184, 216, 34], [10, 0, 0, 2], 64)
+        .udp(53, 40000)
+        .write(&mut buf, &dns)
+        .unwrap();
+    buf
+}
+
+/// The M10 name-resolution fixture: a SYN to 93.184.216.34:443 (creates the connection) plus a
+/// DNS response resolving that IP to `example.com`. Uses the module `tcp(...)` builder for the SYN.
+pub fn name_fixture_set() -> Vec<(&'static str, Vec<u8>)> {
+    // `tcp(src_port, dst_port, seq, ack, flags, payload_len)` — match the existing `tcp` signature
+    // in this module; the SYN's dst is 93.184.216.34:443 via the builder's fixed peer addressing.
+    let syn = tcp(/* fill per the module's tcp() signature to target :443 */);
+    let cap = legacy_pcap(&[(1_000_000, syn), (2_000_000, udp_dns_response())]);
+    vec![("name_resolution.pcap", cap)]
+}
+```
+
+  (Adjust the `tcp(...)` call to this module's actual `tcp` signature — read it first; it emits an
+  Ethernet/IPv4 TCP frame. The connection's responder must be `93.184.216.34:443` so the DNS answer
+  resolves it.)
+  c. Add drift coverage in `crates/tcp-visr/tests/drift.rs` mirroring the metrics pair:
+
+```rust
+#[test]
+fn committed_name_fixtures_match_builder() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+    for (name, bytes) in support::name_fixture_set() {
+        let path = std::path::Path::new(dir).join(name);
+        let on_disk = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        assert_eq!(on_disk, bytes, "committed {name} is stale; regenerate fixtures");
+    }
+}
+
+#[test]
+#[ignore = "regenerates the committed name fixture; run explicitly after a reviewed change"]
+fn regenerate_name_fixtures() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+    std::fs::create_dir_all(dir).unwrap();
+    for (name, bytes) in support::name_fixture_set() {
+        std::fs::write(std::path::Path::new(dir).join(name), bytes).unwrap();
+    }
+}
+```
+
+  d. Generate the committed bytes: `cargo test -p tcp-visr --test drift regenerate_name_fixtures -- --ignored`.
+     This writes `crates/tcp-visr/tests/fixtures/name_resolution.pcap`. Then
+     `cargo test -p tcp-visr --test drift committed_name_fixtures_match_builder` → PASS.
 
 - [ ] **Step 4: Wire `build_replay_app`** in `main.rs`:
 
