@@ -714,6 +714,7 @@ mod tests {
             vec![sq],
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         )]);
         let mut app = App::new(tl, "t".to_string());
         app.open_detail();
@@ -749,6 +750,7 @@ mod tests {
             vec![],
             inflight,
             Vec::new(),
+            Vec::new(),
         )]);
         let mut app = App::new(tl, "t".to_string());
         app.open_detail();
@@ -780,7 +782,7 @@ mod tests {
             rtt: Nanos(3_000_000),
             srtt: Nanos(1_500_000),
         }];
-        let tl = Timeline::with_seq(vec![(c2, vec![ss(0, 100, 0)], vec![], vec![], rtt)]);
+        let tl = Timeline::with_seq(vec![(c2, vec![ss(0, 100, 0)], vec![], vec![], rtt, vec![])]);
         let mut app = App::new(tl, "t".to_string());
         app.open_detail();
         app.cycle_detail_view(); // -> InFlight
@@ -822,6 +824,7 @@ mod tests {
             vec![],
             inflight,
             Vec::new(),
+            Vec::new(),
         )]);
         let mut app = App::new(tl, "t".to_string());
         app.open_detail();
@@ -852,6 +855,7 @@ mod tests {
             c2,
             vec![ss(0, 100, 0)],
             vec![sq],
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         )]);
@@ -885,6 +889,7 @@ mod tests {
             c2,
             vec![ss(0, 5_000_000_000, 0)],
             vec![d(0, 0), d(1_000, 5_000_000_000)],
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         )]);

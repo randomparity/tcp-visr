@@ -12,6 +12,7 @@ pub use conn::{ConnId, Connection, EndpointPair};
 pub use metrics::{ConnectionMetrics, MetricError, SeriesCollection};
 pub use state::ConnState;
 pub use timeline::{
-    AsOf, ConnSeries, InFlightSample, RttSample, SeqKind, SeqSample, StateSample, Timeline,
+    AsOf, ConnSeries, InFlightSample, RttSample, SeqKind, SeqSample, StateSample, ThroughputSample,
+    Timeline,
 };
 pub use tracker::{Tracker, track};

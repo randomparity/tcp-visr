@@ -879,6 +879,7 @@ mod tests {
             vec![],
             vec![],
             rtt,
+            vec![],
         )]);
         let app = App::new(tl, "t".to_string());
         let f = app.focus().expect("selected");
@@ -903,6 +904,7 @@ mod tests {
             vec![ss(0, ConnState::Established, 100, 0)],
             vec![],
             inflight,
+            vec![],
             vec![],
         )]);
         let app = App::new(tl, "t".to_string());

@@ -55,6 +55,19 @@ pub struct RttSample {
     pub srtt: Nanos,
 }
 
+/// One point on a connection's Throughput/goodput graph (design §6, §10.M9, ADR-0014 §1). `dir` is
+/// the sending data-flow direction (the segment's own direction). `throughput_bps` is the
+/// trailing-window rate over all data bytes (the engine's `MetricSample.throughput_bps`);
+/// `goodput_bps` is the same window over only the non-retransmitted bytes (`goodput_bps ≤
+/// throughput_bps`), so the gap between them is the retransmitted rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThroughputSample {
+    pub t: Nanos,
+    pub dir: SampleDir,
+    pub throughput_bps: u64,
+    pub goodput_bps: u64,
+}
+
 /// A per-segment lifecycle snapshot: the connection's `(state, cumulative bytes)` at time `t`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StateSample {
@@ -64,14 +77,15 @@ pub struct StateSample {
     pub bytes_r2o: u64,
 }
 
-/// A connection paired with its four replay detail series (state, seq, in-flight, rtt), as fed to
-/// [`Timeline::with_seq`].
+/// A connection paired with its five replay detail series (state, seq, in-flight, rtt,
+/// throughput), as fed to [`Timeline::with_seq`].
 pub type ConnSeries = (
     Connection,
     Vec<StateSample>,
     Vec<SeqSample>,
     Vec<InFlightSample>,
     Vec<RttSample>,
+    Vec<ThroughputSample>,
 );
 
 /// A connection's resolved state as of a cursor time.
@@ -92,6 +106,7 @@ struct Entry {
     seq: Vec<SeqSample>,
     inflight: Vec<InFlightSample>,
     rtt: Vec<RttSample>,
+    throughput: Vec<ThroughputSample>,
     effective_end: Nanos,
 }
 
@@ -112,13 +127,13 @@ impl Timeline {
         Self::with_seq(
             conns
                 .into_iter()
-                .map(|(c, s)| (c, s, Vec::new(), Vec::new(), Vec::new()))
+                .map(|(c, s)| (c, s, Vec::new(), Vec::new(), Vec::new(), Vec::new()))
                 .collect(),
         )
     }
 
-    /// Builds the timeline from each connection, its `StateSample` series, its `SeqSample`
-    /// series, and its `InFlightSample` series. All three series are stable-sorted by `t`
+    /// Builds the timeline from each connection and its five detail series (state, seq, in-flight,
+    /// rtt, throughput). All series are stable-sorted by `t`
     /// because capture timestamps are not guaranteed monotonic (design §14); `start` is the
     /// minimum `StateSample.t` and `end` is the maximum `last_at`. A connection whose final
     /// state is `Closed`/`Reset` bounds its interval at `last_at`; any still-open connection
@@ -127,21 +142,22 @@ impl Timeline {
     pub fn with_seq(conns: Vec<ConnSeries>) -> Self {
         let end = conns
             .iter()
-            .map(|(c, _, _, _, _)| c.last_at)
+            .map(|(c, _, _, _, _, _)| c.last_at)
             .max()
             .unwrap_or(Nanos(0));
         let start = conns
             .iter()
-            .flat_map(|(_, s, _, _, _)| s.iter().map(|x| x.t))
+            .flat_map(|(_, s, _, _, _, _)| s.iter().map(|x| x.t))
             .min()
             .unwrap_or(Nanos(0));
         let mut entries: Vec<Entry> = Vec::with_capacity(conns.len());
         let mut event_times: Vec<Nanos> = Vec::new();
-        for (conn, mut samples, mut seq, mut inflight, mut rtt) in conns {
+        for (conn, mut samples, mut seq, mut inflight, mut rtt, mut throughput) in conns {
             samples.sort_by_key(|s| s.t);
             seq.sort_by_key(|s| s.t);
             inflight.sort_by_key(|s| s.t);
             rtt.sort_by_key(|s| s.t);
+            throughput.sort_by_key(|s| s.t);
             for s in &samples {
                 event_times.push(s.t);
             }
@@ -153,6 +169,7 @@ impl Timeline {
                 seq,
                 inflight,
                 rtt,
+                throughput,
                 effective_end,
             });
         }
@@ -209,6 +226,16 @@ impl Timeline {
     pub fn rtt_series(&self, id: ConnId) -> &[RttSample] {
         match self.entries.iter().find(|e| e.conn.id == id) {
             Some(e) => &e.rtt,
+            None => &[],
+        }
+    }
+
+    /// The focus connection's `ThroughputSample` series (`t`-sorted), or an empty slice if `id` is
+    /// unknown or its series was not collected.
+    #[must_use]
+    pub fn throughput_series(&self, id: ConnId) -> &[ThroughputSample] {
+        match self.entries.iter().find(|e| e.conn.id == id) {
+            Some(e) => &e.throughput,
             None => &[],
         }
     }
@@ -482,6 +509,7 @@ mod tests {
             vec![sq(300, 20, 10), sq(100, 0, 10)], // supplied out of t-order
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         )]);
         let series = tl.seq_series(id);
         assert_eq!(series.len(), 2);
@@ -507,6 +535,7 @@ mod tests {
             vec![ss(100, ConnState::Established, 0, 0)],
             vec![sq(100, 0, 10)],
             vec![iff(300, 5), iff(100, 10)], // supplied out of t-order
+            Vec::new(),
             Vec::new(),
         )]);
         let series = tl.inflight_series(id);
@@ -535,12 +564,53 @@ mod tests {
             vec![sq(100, 0, 10)],
             vec![iff(100, 10)],
             vec![ratt(300, 5, 5), ratt(100, 9, 9)], // supplied out of t-order
+            Vec::new(),
         )]);
         let series = tl.rtt_series(id);
         assert_eq!(series.len(), 2);
         assert_eq!(series[0].t, Nanos(100), "sorted by t at construction");
         assert_eq!(series[1].t, Nanos(300));
         assert_eq!(series[0].rtt, Nanos(9));
+    }
+
+    fn tput(t: u64, throughput: u64, goodput: u64) -> ThroughputSample {
+        ThroughputSample {
+            t: Nanos(t),
+            dir: SampleDir::OriginToResponder,
+            throughput_bps: throughput,
+            goodput_bps: goodput,
+        }
+    }
+
+    #[test]
+    fn with_seq_carries_throughput_sorted_and_exposes_series() {
+        let c = conn(0, 100, 300, ConnState::Established);
+        let id = c.id;
+        let tl = Timeline::with_seq(vec![(
+            c,
+            vec![ss(100, ConnState::Established, 0, 0)],
+            vec![sq(100, 0, 10)],
+            vec![iff(100, 10)],
+            vec![ratt(100, 9, 9)],
+            vec![tput(300, 5, 5), tput(100, 800, 400)], // supplied out of t-order
+        )]);
+        let series = tl.throughput_series(id);
+        assert_eq!(series.len(), 2);
+        assert_eq!(series[0].t, Nanos(100), "sorted by t at construction");
+        assert_eq!(series[1].t, Nanos(300));
+        assert_eq!(series[0].throughput_bps, 800);
+        assert_eq!(series[0].goodput_bps, 400);
+    }
+
+    #[test]
+    fn throughput_series_empty_for_unknown_id() {
+        let c = conn(0, 0, 10, ConnState::Established);
+        let other = ConnId {
+            pair: EndpointPair::new(ep(9, 1), ep(9, 2)),
+            instance: 7,
+        };
+        let tl = Timeline::new(vec![(c, vec![ss(0, ConnState::Established, 0, 0)])]);
+        assert!(tl.throughput_series(other).is_empty());
     }
 
     #[test]

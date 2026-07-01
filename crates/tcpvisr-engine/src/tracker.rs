@@ -9,7 +9,8 @@ use crate::conn::{ConnId, Connection, Direction, EndpointPair};
 use crate::metrics::{ConnectionMetrics, MetricError, MetricState, SeriesCollection};
 use crate::state::ConnState;
 use crate::timeline::{
-    ConnSeries, InFlightSample, RttSample, SeqKind, SeqSample, StateSample, Timeline,
+    ConnSeries, InFlightSample, RttSample, SeqKind, SeqSample, StateSample, ThroughputSample,
+    Timeline,
 };
 
 /// `true` when `seq` sits backward of `baseline` in RFC 1982 serial space by more than
@@ -121,6 +122,7 @@ struct ConnTrack {
     seq: Vec<SeqSample>,
     inflight: Vec<InFlightSample>,
     rtt: Vec<RttSample>,
+    throughput: Vec<ThroughputSample>,
     srtt: [Option<Nanos>; 2],
     unwrap: [SeqUnwrap; 2],
 }
@@ -427,6 +429,46 @@ impl Tracker {
         );
     }
 
+    /// Stores one `ThroughputSample` on the instance at `idx`, enforcing `max_samples`.
+    fn record_throughput(&mut self, idx: usize, sample: ThroughputSample) {
+        if self.overflowed {
+            return;
+        }
+        if self.collected_samples >= self.config.max_samples {
+            self.overflowed = true;
+            return;
+        }
+        self.collected_samples += 1;
+        self.conns[idx].throughput.push(sample);
+    }
+
+    /// Snapshots each direction's trailing-window `(throughput, goodput)` for this segment when
+    /// throughput collection is on and not overflowed. Both directions are sampled per segment (as
+    /// M7 in-flight) so the sending flow's rate is captured at reverse-ACK times and shows decay; a
+    /// direction that has not sent data returns `None` and contributes no sample (ADR-0014 §1).
+    fn collect_throughput_points(&mut self, idx: usize, seg: &Segment) {
+        if self.overflowed || !self.config.collect_throughput_timeline {
+            return;
+        }
+        for d in [Direction::OriginToResponder, Direction::ResponderToOrigin] {
+            if let Some((throughput_bps, goodput_bps)) =
+                self.conns[idx]
+                    .metrics
+                    .throughput_at(d, seg.ts, &self.config)
+            {
+                self.record_throughput(
+                    idx,
+                    ThroughputSample {
+                        t: seg.ts,
+                        dir: dir_sample(d),
+                        throughput_bps,
+                        goodput_bps,
+                    },
+                );
+            }
+        }
+    }
+
     /// Folds one `Item` into tracker state. `Tick`s are inert in replay (idle is evaluated
     /// per-segment from each segment's own ts); they never create a connection.
     pub fn observe(&mut self, item: &Item) {
@@ -457,7 +499,8 @@ impl Tracker {
                     && (want_metric
                         || self.config.collect_seq_timeline
                         || self.config.collect_inflight_timeline
-                        || self.config.collect_rtt_timeline)
+                        || self.config.collect_rtt_timeline
+                        || self.config.collect_throughput_timeline)
                 {
                     let sample = self.conns[idx].metrics.observe(seg, dir, &self.config);
                     if want_metric {
@@ -466,6 +509,7 @@ impl Tracker {
                     self.collect_seq_points(idx, seg, dir, &sample);
                     self.collect_inflight_points(idx, seg);
                     self.collect_rtt_points(idx, &sample);
+                    self.collect_throughput_points(idx, seg);
                 }
                 return;
             }
@@ -530,6 +574,7 @@ impl Tracker {
             seq: Vec::new(),
             inflight: Vec::new(),
             rtt: Vec::new(),
+            throughput: Vec::new(),
             srtt: [None, None],
             unwrap: [SeqUnwrap::default(); 2],
         };
@@ -548,7 +593,8 @@ impl Tracker {
             && (want_metric
                 || self.config.collect_seq_timeline
                 || self.config.collect_inflight_timeline
-                || self.config.collect_rtt_timeline))
+                || self.config.collect_rtt_timeline
+                || self.config.collect_throughput_timeline))
             .then(|| track.metrics.observe(seg, dir, &self.config));
         let idx = self.conns.len();
         self.conns.push(track);
@@ -560,6 +606,7 @@ impl Tracker {
             self.collect_seq_points(idx, seg, dir, &sample);
             self.collect_inflight_points(idx, seg);
             self.collect_rtt_points(idx, &sample);
+            self.collect_throughput_points(idx, seg);
         }
         if self.config.collect_state_timeline {
             let s = self.conns[idx].snapshot(seg.ts);
@@ -619,6 +666,7 @@ impl Tracker {
                     c.seq.clone(),
                     c.inflight.clone(),
                     c.rtt.clone(),
+                    c.throughput.clone(),
                 )
             })
             .collect();
@@ -1570,5 +1618,144 @@ mod rtt_tests {
             t.into_timeline().expect_err("ceiling"),
             MetricError::SampleCeiling { .. }
         ));
+    }
+}
+
+#[cfg(test)]
+mod throughput_tests {
+    use super::test_support::{ep, seg};
+    use super::*;
+    use tcpvisr_core::{SampleDir, TcpFlags};
+
+    fn tput_cfg() -> EngineConfig {
+        EngineConfig {
+            collect_throughput_timeline: true,
+            ..EngineConfig::default()
+        }
+    }
+
+    fn only_id(tl: &crate::timeline::Timeline) -> ConnId {
+        tl.connections().next().expect("one connection").id
+    }
+
+    /// `(t, throughput_bps, goodput_bps)` triples for the O2R-attributed throughput samples.
+    fn o2r_throughput(tl: &crate::timeline::Timeline) -> Vec<(u64, u64, u64)> {
+        tl.throughput_series(only_id(tl))
+            .iter()
+            .filter(|s| s.dir == SampleDir::OriginToResponder)
+            .map(|s| (s.t.0, s.throughput_bps, s.goodput_bps))
+            .collect()
+    }
+
+    // Criterion 1: throughput of O2R data is attributed to the sending flow (O2R), not flipped.
+    #[test]
+    fn throughput_attributed_to_the_sending_flow() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(tput_cfg());
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 100, 0)); // O2R 100 B data
+        let tl = t.into_timeline().expect("timeline");
+        let all = tl.throughput_series(only_id(&tl));
+        assert!(!all.is_empty());
+        assert!(
+            all.iter().all(|s| s.dir == SampleDir::OriginToResponder),
+            "the O2R sender's rate is tagged O2R, not the peer"
+        );
+    }
+
+    // Criterion 3: goodput excludes retransmitted bytes; the gap is the retransmit rate.
+    #[test]
+    fn goodput_excludes_retransmit_end_to_end() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(tput_cfg());
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 100, 0)); // 100 B new
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 100, 4_000_000)); // retransmit (gap 4ms >= 3ms)
+        let tl = t.into_timeline().expect("timeline");
+        let last = *o2r_throughput(&tl)
+            .last()
+            .expect("a sample at the retransmit");
+        assert_eq!(last.1, 1_600, "throughput counts both 100 B");
+        assert_eq!(
+            last.2, 800,
+            "goodput counts only the non-retransmitted 100 B"
+        );
+        assert_eq!(last.1, 2 * last.2, "the gap is the retransmit rate");
+    }
+
+    // Criterion 7: a direction that only ACKs (no payload) yields no throughput sample.
+    #[test]
+    fn ack_only_direction_yields_no_sample() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(tput_cfg());
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 100, 0)); // O2R data
+        t.observe(&seg(s, c, TcpFlags::ACK, 1, 200, 0, 1_000)); // R2O pure ACK, no payload
+        let tl = t.into_timeline().expect("timeline");
+        let r2o: Vec<_> = tl
+            .throughput_series(only_id(&tl))
+            .iter()
+            .filter(|s| s.dir == SampleDir::ResponderToOrigin)
+            .collect();
+        assert!(
+            r2o.is_empty(),
+            "the ACK-only direction has no throughput sample"
+        );
+        assert!(
+            !o2r_throughput(&tl).is_empty(),
+            "the data sender does have samples"
+        );
+    }
+
+    // Criterion 7a: the sending flow is sampled at a reverse-direction segment's time and shows
+    // decay once its bytes age out of the window. A sparse (own-data-segment-only) impl fails this.
+    #[test]
+    fn sender_flow_sampled_at_reverse_ack_times_and_decays() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(tput_cfg()); // 1s window
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 100, 0)); // O2R 100 B burst at t=0
+        t.observe(&seg(s, c, TcpFlags::ACK, 1, 200, 0, 500_000_000)); // R2O ACK inside the window
+        t.observe(&seg(s, c, TcpFlags::ACK, 1, 200, 0, 1_500_000_000)); // R2O ACK past the window
+        let tl = t.into_timeline().expect("timeline");
+        let o2r = o2r_throughput(&tl);
+        // A sample exists at each reverse-ACK time (both-directions snapshot), not only at t=0.
+        assert!(
+            o2r.iter().any(|&(t, _, _)| t == 500_000_000),
+            "sampled at the in-window reverse ACK: {o2r:?}"
+        );
+        let past = o2r
+            .iter()
+            .find(|&&(t, _, _)| t == 1_500_000_000)
+            .expect("sampled at the past-window reverse ACK");
+        assert_eq!(
+            (past.1, past.2),
+            (0, 0),
+            "the rate has decayed to zero once every byte aged out"
+        );
+    }
+
+    // Criterion 5: throughput collection counts against the ceiling.
+    #[test]
+    fn throughput_collection_counts_against_ceiling() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut cfg = tput_cfg();
+        cfg.max_samples = 1; // first data segment already produces a throughput sample
+        let mut t = Tracker::new(cfg);
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 100, 1_000));
+        t.observe(&seg(c, s, TcpFlags::ACK, 200, 1, 100, 2_000)); // 2nd sample -> ceiling
+        assert!(matches!(
+            t.into_timeline().expect_err("ceiling"),
+            MetricError::SampleCeiling { .. }
+        ));
+    }
+
+    // Criterion 6: off by default.
+    #[test]
+    fn throughput_off_by_default_is_empty() {
+        let (c, s) = (ep(1, 1234), ep(2, 80));
+        let mut t = Tracker::new(EngineConfig {
+            collect_state_timeline: true,
+            ..EngineConfig::default()
+        });
+        t.observe(&seg(c, s, TcpFlags::ACK, 100, 1, 100, 0));
+        let tl = t.into_timeline().expect("timeline");
+        assert!(tl.throughput_series(only_id(&tl)).is_empty());
     }
 }

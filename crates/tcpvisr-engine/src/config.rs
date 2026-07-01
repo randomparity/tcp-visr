@@ -8,9 +8,9 @@ use crate::metrics::SeriesCollection;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "four orthogonal collect-<series> timeline gates (state/seq/inflight/rtt); each is an \
-              independently unit-tested on/off knob per ADR-0010/0011/0012/0013, not a state flag \
-              cluster that would read better as an enum"
+    reason = "five orthogonal collect-<series> timeline gates (state/seq/inflight/rtt/throughput); \
+              each is an independently unit-tested on/off knob per ADR-0010/0011/0012/0013/0014, not \
+              a state flag cluster that would read better as an enum"
 )]
 pub struct EngineConfig {
     /// Idle gap after which a fresh SYN on the same pair starts a new instance.
@@ -35,6 +35,8 @@ pub struct EngineConfig {
     pub collect_inflight_timeline: bool,
     /// Whether the tracker records a per-ack `RttSample` timeline (M8 detail).
     pub collect_rtt_timeline: bool,
+    /// Whether the tracker records a per-segment `ThroughputSample` timeline (M9 detail).
+    pub collect_throughput_timeline: bool,
 }
 
 impl Default for EngineConfig {
@@ -50,6 +52,7 @@ impl Default for EngineConfig {
             collect_seq_timeline: false,
             collect_inflight_timeline: false,
             collect_rtt_timeline: false,
+            collect_throughput_timeline: false,
         }
     }
 }
@@ -83,6 +86,12 @@ mod tests {
     fn rtt_timeline_defaults_off() {
         let c = EngineConfig::default();
         assert!(!c.collect_rtt_timeline);
+    }
+
+    #[test]
+    fn throughput_timeline_defaults_off() {
+        let c = EngineConfig::default();
+        assert!(!c.collect_throughput_timeline);
     }
 
     #[test]
