@@ -57,6 +57,7 @@ pub struct AsOf {
 struct Entry {
     conn: Connection,
     samples: Vec<StateSample>,
+    seq: Vec<SeqSample>,
     effective_end: Nanos,
 }
 
@@ -70,28 +71,35 @@ pub struct Timeline {
 }
 
 impl Timeline {
-    /// Builds the timeline from each connection and its `StateSample` series.
-    ///
-    /// Each series is sorted by `t` (stable) because capture timestamps are not guaranteed
-    /// monotonic (design §14); `start` is the minimum sample time and `end` is the maximum
-    /// `last_at`. A connection whose final state is `Closed`/`Reset` bounds its interval at
-    /// `last_at`; any still-open connection extends to `end`.
+    /// Builds a state-only timeline (no seq series); every connection's `seq` is empty. This
+    /// preserves the M5 constructor so existing call sites and fixtures are unchanged.
     #[must_use]
     pub fn new(conns: Vec<(Connection, Vec<StateSample>)>) -> Self {
+        Self::with_seq(conns.into_iter().map(|(c, s)| (c, s, Vec::new())).collect())
+    }
+
+    /// Builds the timeline from each connection, its `StateSample` series, and its `SeqSample`
+    /// series. Both series are stable-sorted by `t` because capture timestamps are not
+    /// guaranteed monotonic (design §14); `start` is the minimum `StateSample.t` and `end` is
+    /// the maximum `last_at`. A connection whose final state is `Closed`/`Reset` bounds its
+    /// interval at `last_at`; any still-open connection extends to `end`.
+    #[must_use]
+    pub fn with_seq(conns: Vec<(Connection, Vec<StateSample>, Vec<SeqSample>)>) -> Self {
         let end = conns
             .iter()
-            .map(|(c, _)| c.last_at)
+            .map(|(c, _, _)| c.last_at)
             .max()
             .unwrap_or(Nanos(0));
         let start = conns
             .iter()
-            .flat_map(|(_, s)| s.iter().map(|x| x.t))
+            .flat_map(|(_, s, _)| s.iter().map(|x| x.t))
             .min()
             .unwrap_or(Nanos(0));
         let mut entries: Vec<Entry> = Vec::with_capacity(conns.len());
         let mut event_times: Vec<Nanos> = Vec::new();
-        for (conn, mut samples) in conns {
+        for (conn, mut samples, mut seq) in conns {
             samples.sort_by_key(|s| s.t);
+            seq.sort_by_key(|s| s.t);
             for s in &samples {
                 event_times.push(s.t);
             }
@@ -100,6 +108,7 @@ impl Timeline {
             entries.push(Entry {
                 conn,
                 samples,
+                seq,
                 effective_end,
             });
         }
@@ -128,6 +137,26 @@ impl Timeline {
     /// The tracked connections (static views), in construction order.
     pub fn connections(&self) -> impl Iterator<Item = &Connection> {
         self.entries.iter().map(|e| &e.conn)
+    }
+
+    /// The focus connection's `SeqSample` series (`t`-sorted), or an empty slice if `id` is
+    /// unknown or its series was not collected.
+    #[must_use]
+    pub fn seq_series(&self, id: ConnId) -> &[SeqSample] {
+        match self.entries.iter().find(|e| e.conn.id == id) {
+            Some(e) => &e.seq,
+            None => &[],
+        }
+    }
+
+    /// The connection's `[opened_at, effective_end]` time span for the detail X axis
+    /// (`effective_end` is `last_at` if closed, else the capture end), or `None` if unknown.
+    #[must_use]
+    pub fn x_span(&self, id: ConnId) -> Option<(Nanos, Nanos)> {
+        self.entries
+            .iter()
+            .find(|e| e.conn.id == id)
+            .map(|e| (e.conn.opened_at, e.effective_end))
     }
 
     /// The ids of connections active at `t` (`opened_at <= t <= effective_end`).
@@ -364,6 +393,47 @@ mod tests {
         assert_eq!(tl.connection_count(), 0);
         assert!(tl.resolve_at(Nanos(0)).is_empty());
         assert_eq!(tl.next_event(Nanos(0)), None);
+    }
+
+    fn sq(t: u64, rel: i64, len: u32) -> SeqSample {
+        SeqSample {
+            t: Nanos(t),
+            dir: SampleDir::OriginToResponder,
+            rel,
+            len,
+            kind: SeqKind::Data {
+                retransmit: false,
+                out_of_order: false,
+            },
+        }
+    }
+
+    #[test]
+    fn with_seq_sorts_and_exposes_series_and_x_span() {
+        let c = conn(0, 100, 300, ConnState::Established);
+        let id = c.id;
+        let tl = Timeline::with_seq(vec![(
+            c,
+            vec![ss(100, ConnState::Established, 0, 0)],
+            vec![sq(300, 20, 10), sq(100, 0, 10)], // supplied out of t-order
+        )]);
+        let series = tl.seq_series(id);
+        assert_eq!(series.len(), 2);
+        assert_eq!(series[0].t, Nanos(100), "sorted by t at construction");
+        assert_eq!(series[1].t, Nanos(300));
+        assert_eq!(tl.x_span(id), Some((Nanos(100), Nanos(300))));
+    }
+
+    #[test]
+    fn seq_series_and_x_span_are_empty_none_for_unknown_id() {
+        let c = conn(0, 0, 10, ConnState::Established);
+        let other = ConnId {
+            pair: EndpointPair::new(ep(9, 1), ep(9, 2)),
+            instance: 7,
+        };
+        let tl = Timeline::new(vec![(c, vec![ss(0, ConnState::Established, 0, 0)])]);
+        assert!(tl.seq_series(other).is_empty());
+        assert_eq!(tl.x_span(other), None);
     }
 
     #[test]
