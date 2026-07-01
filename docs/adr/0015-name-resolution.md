@@ -81,11 +81,12 @@ depend on; `tcpvisr-engine` does **not** gain them and is untouched):
 pub struct HostName(String);            // validated, sanitized, ≤253 bytes, trailing dot stripped
 pub struct NameObservation { pub ts: Nanos, pub ip: IpAddr, pub name: HostName }
 
-pub struct NameTable { /* HashMap<IpAddr, (Nanos, HostName)> */ }
+pub struct NameTable { /* HashMap<IpAddr, (Nanos, HostName)>, cap, dropped */ }
 impl NameTable {
     pub fn observe(&mut self, obs: NameObservation);   // keep the max-ts name per IP (last wins on tie)
     pub fn resolve(&self, ip: IpAddr) -> Option<&HostName>;
     pub fn len(&self) -> usize;                          // distinct IPs resolved (observability)
+    pub fn dropped(&self) -> u64;                        // new IPs refused after the cap (observability)
 }
 ```
 
@@ -94,15 +95,28 @@ impl NameTable {
   transport cursor: a peer keeps one stable label while scrubbing (deliberately unlike the as-of-`T`
   master-list state). Storing the `ts` and comparing makes this robust to non-monotonic capture
   time (§14) rather than relying on file order.
-- **Memory is bounded by distinct IPs, not by DNS-packet count.** Observations are folded into the
-  table as they arrive; no growing observation log is retained. A name-flood capture costs one
-  entry per distinct answer IP.
-- **`HostName` sanitizes at construction.** A DNS name is attacker-controlled and is rendered into
-  a terminal. `HostName::new` strips the trailing root dot, drops bytes outside a
-  conservative printable set (control characters, ESC, DEL — the terminal-escape-injection vector),
-  and bounds length to the DNS maximum (253). Construction returns `None` for an empty/all-invalid
-  name so it is dropped rather than rendered blank. This is the single choke point; nothing
-  downstream re-validates.
+- **Bounded to `NAME_TABLE_CAP` (65 536) distinct IPs, drop-and-count past it.** Observations are
+  folded into the table as they arrive; no growing observation log is retained. But "one entry per
+  distinct answer IP" is *not* small for a capture taken at a resolver/proxy, whose distinct answer
+  IPs are unbounded — design §7 makes bounded-with-no-silent-OOM the v1 contract. Once the table
+  holds `NAME_TABLE_CAP` IPs, an observation for a *new* IP is refused and counted (`dropped()`); an
+  already-present IP still updates. The drop is surfaced in the title (`names capped`), never silent
+  (§7). We drop-and-count rather than fail-fast (as the series ceiling does) because labels are
+  advisory: aborting a whole replay over DNS name flooding would deny analysis of the very TCP the
+  tool exists to show. Promoting the constant to a `--max-names` flag is a trivial future change.
+- **`HostName` sanitizes to printable ASCII at construction.** A DNS name is attacker-controlled and
+  is rendered into a terminal. `HostName::new` strips the trailing root dot, **keeps only bytes
+  `0x20`–`0x7e` and drops every other byte** — control characters, ESC, DEL (the
+  terminal-escape-injection vector), and all bytes `≥ 0x80`. On-wire host names are LDH
+  (letter/digit/hyphen/dot) or `xn--` punycode, i.e. already ASCII, so dropping `≥ 0x80` loses
+  nothing real while removing UTF-8 terminal display-width and combining-character ambiguity. It
+  rejects a name longer than 253 bytes and returns `None` for an empty/fully-dropped name so it is
+  dropped rather than rendered blank. This is the single choke point; nothing downstream
+  re-validates.
+- **Labels are advisory, not verified identity.** The mapping comes from capture DNS, which can be
+  spoofed or cache-poisoned; a crafted capture can assert any IP→name pair. The label is a display
+  convenience only. The raw numeric peer stays recoverable through the `conns`/`metrics`
+  subcommands, which never resolve names, so a wrong label cannot fully hide the real peer.
 
 The engine, `MetricSample`, and the `metrics` command's JSON are **entirely untouched**, so the
 hand-derived M3 oracle goldens and the parity `Item` stream are undisturbed (the property ADR-0010
@@ -156,7 +170,8 @@ already allowed).
   to `None` and keep their `ip:port`.
 - **Observability.** The header title gains a resolved-name count next to the skip count
   (`… (47 connections, 12 names, skipped 3)`), so a capture with unparsed/absent DNS is visibly
-  distinct from one with names (design §7: surface counts, no silent fallbacks).
+  distinct from one with names; when `NameTable::dropped() > 0` the title also shows `names capped`
+  (design §7: surface counts, no silent fallbacks/truncation).
 
 No detail **graph** changes — M10 adds no view (the four-view switcher was finalized in M9).
 
@@ -231,3 +246,13 @@ reverse-DNS is recorded as belonging to the live milestones.
   sanitizes at its single constructor.
 - **Parse TCP/53 DNS too.** Deferred: TCP-carried DNS is rare and its bytes are already consumed as
   TCP segments; M10 targets the common UDP case. Not required by the DoD.
+- **Leave the `NameTable` unbounded ("names are few").** Rejected: a capture taken at a resolver or
+  proxy has unbounded distinct answer IPs; an unbounded table is the same OOM path design §7 caps
+  for series. Bounded with drop-and-count instead.
+- **Fail-fast on the name cap (mirror the `--max-samples` ceiling).** Rejected: labels are advisory;
+  aborting the whole replay over DNS flooding would block analysis of the TCP itself. Drop-and-count
+  with a surfaced `names capped` is the proportionate response; the series ceiling stays fail-fast
+  because those series *are* the analysis.
+- **Pass UTF-8/IDN names through unsanitized.** Rejected: raw non-ASCII in a terminal raises
+  display-width and combining-character ambiguity on top of the escape-injection risk. On-wire names
+  are ASCII (LDH or punycode), so restricting to `0x20`–`0x7e` is both safe and lossless in practice.

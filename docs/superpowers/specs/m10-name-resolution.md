@@ -32,12 +32,20 @@ live faucet and cache exist; the `NameTable` built here is the seam it will feed
   extraction stays in lock-step (design §3.2) and the parity test asserts it.
 - **Core types** (`tcpvisr-core`): a sanitized, bounded **`HostName`** newtype; a
   **`NameObservation { ts: Nanos, ip: IpAddr, name: HostName }`**; and a pure latest-wins
-  **`NameTable`** with `observe(obs)`, `resolve(ip) -> Option<&HostName>`, `len()`, and `is_empty()`.
-  Latest-wins keeps the name with the greatest observation `ts` per IP (ties → last-seen); a stable
-  per-capture label, cursor-independent (ADR-0015 §2). `HostName::new(&str) -> Option<HostName>`
-  strips a trailing root dot, drops bytes outside a conservative printable set (rejecting control /
-  ESC / DEL — the terminal-escape vector), bounds length to 253, and returns `None` for an
-  empty/all-invalid name.
+  **`NameTable`** with `observe(obs)`, `resolve(ip) -> Option<&HostName>`, `len()`, `is_empty()`,
+  and `dropped() -> u64`. Latest-wins keeps the name with the greatest observation `ts` per IP
+  (ties → last-seen); a stable per-capture label, cursor-independent (ADR-0015 §2).
+  **Bounded to at most `NAME_TABLE_CAP` distinct IPs** (a constant, `65_536`): once full,
+  observations for a *new* IP are dropped and counted (`dropped()`), while an already-present IP
+  still updates. This caps memory on a DNS-heavy capture (e.g. a capture taken at a resolver, whose
+  distinct answer IPs are otherwise unbounded) — honoring design §7's no-OOM contract — without
+  failing the whole replay over advisory labels; the drop is surfaced, never silent (§7). Making
+  the cap a `--max-names` flag is a trivial future change, deferred to avoid new CLI surface now.
+  `HostName::new(&str) -> Option<HostName>` strips a trailing root dot, **keeps only printable ASCII
+  (bytes `0x20`–`0x7e`), dropping every other byte** (controls, ESC, DEL — the terminal-escape
+  vector — and all bytes `≥ 0x80`; on-wire names are LDH or `xn--` punycode, so this loses nothing
+  real and avoids terminal display-width/combining-char ambiguity), rejects a name longer than 253
+  bytes, and returns `None` for an empty or fully-dropped name.
 - **Faucet plumbing** (`tcpvisr-ingest`): the streaming `parse_file_visit` is retained as an
   item-only wrapper over a new `parse_file_visit_named(path, item_sink, name_sink)`; the collecting
   `parse_file` and `parse_file_libpcap` populate a new `ReplayParse.names: Vec<NameObservation>`.
@@ -48,9 +56,16 @@ live faucet and cache exist; the `NameTable` built here is the seam it will feed
   title `DETAIL <origin> → <responder>` renders the responder's host when known. `service`
   (port→name) is unchanged.
 - **Observability** (`tcp-visr` bin): the header title gains a resolved-name count
-  (`… (N connections, M names, skipped K)`), sourced from `NameTable::len()`.
+  (`… (N connections, M names, skipped K)`), sourced from `NameTable::len()`; when the cap dropped
+  any IPs it also shows `names capped` (from `NameTable::dropped() > 0`), so a truncated name set is
+  visibly distinct (§7, no silent truncation).
 - **CLI wiring**: `build_replay_app` folds observations into a `NameTable` via
-  `parse_file_visit_named` and passes it to `App::new`. No new CLI flags.
+  `parse_file_visit_named` and passes it to `App::new`. No new CLI flags (the name cap is the
+  `NAME_TABLE_CAP` constant).
+- **Trust model**: host labels are **advisory** — they reflect DNS answers *as observed in the
+  capture*, which can be spoofed or cache-poisoned (§6). The label is a display convenience, not a
+  verified peer identity; the raw numeric peer is always recoverable via the `conns`/`metrics`
+  subcommands (which never resolve names).
 - **Dependency**: add `simple-dns = "=0.11.3"` to `tcpvisr-ingest` (default, not gated on `live`);
   MIT, already on the `deny.toml` allow-list.
 - **Fixtures**: a committed capture containing a TCP connection plus a UDP/53 DNS response mapping
@@ -97,7 +112,11 @@ longer counts toward their `non_tcp` skip tally (it is decoded, not skipped; ADR
 - The `/` fuzzy filter matches the host name: typing `github` selects the connection whose peer
   resolved to `github.com`. Filtering on the raw IP still works for un-named peers.
 - Sort by peer orders by the rendered label’s underlying `Endpoint` (unchanged ordering key —
-  `(ip, port)`; the label is display only, so sort is stable regardless of names).
+  `(ip, port)`; the label is display only, so sort is stable regardless of names). A consequence:
+  when host labels are shown, the peer-sorted order follows IP, not the visible names — an accepted
+  trade-off (sorting by a spoofable label, and interleaving named/un-named rows, is worse).
+- A resolved name can be up to 253 chars; the peer cell **truncates to the column width** like any
+  over-long cell, so a long (or adversarially long) name never overflows the master pane.
 
 ### 3.3 Detail title
 
@@ -112,8 +131,18 @@ renders `host:port` when resolved (design §6: `→ github.com:443`). The origin
   the label does not change as the cursor scrubs. If two responses map the same IP to different
   names, the later-timestamped one wins (ties → last-seen).
 - **One IP → one label.** Multiple connections to the same IP share the label.
-- **Sanitized.** The rendered name never contains control/escape bytes and is ≤253 chars; an
+- **IP reuse can mislabel.** Because the label is static and keyed by IP, a genuinely *reused* IP
+  (CDN churn, DHCP, NAT rebinding) that is answered as `foo.com` early and `bar.com` late in the
+  capture labels *every* connection to that IP `bar.com` — including an earlier connection that was
+  really talking to `foo.com`. This is the accepted cost of choosing a stable per-capture label over
+  as-of-`T` (ADR-0015 §2, settled); labels are advisory, not per-connection ground truth.
+- **Advisory / untrusted.** The mapping itself comes from capture DNS, which can be spoofed or
+  poisoned; a crafted capture can assert any IP→name pair. The label is never treated as a verified
+  identity, and the raw numeric peer stays recoverable via `conns`/`metrics` (§3.2 trust model).
+- **Sanitized.** The rendered name is printable ASCII only (`0x20`–`0x7e`) and ≤253 chars; an
   answer whose name sanitizes to empty is dropped (peer stays `ip:port`).
+- **Bounded.** At most `NAME_TABLE_CAP` distinct IPs are retained; beyond that, new IPs are dropped
+  and counted, and the title shows `names capped` (§2 observability).
 - **Absent DNS.** A capture with no DNS responses (or only queries) resolves nothing: every peer is
   `ip:port` and the title shows `0 names`. This is not an error.
 
@@ -188,12 +217,13 @@ renders `host:port` when resolved (design §6: `→ github.com:443`). The origin
 7. **Cross-faucet parity includes names.** For a capture containing a DNS response, the pure-Rust
    and libpcap faucets produce equal `items`, `skipped`, **and** `names`. (Parity test, `live`
    feature.)
-8. **`HostName` sanitizes and bounds.** `HostName::new` strips a trailing dot (`"a.com." →
-   "a.com"`), drops control/ESC/DEL bytes (a name containing `\x1b[31m` renders without the escape),
-   rejects (`None`) a name longer than 253 bytes, and returns `None` for `""` and for a name
-   that sanitizes to empty. The rendered `Display` contains no byte `< 0x20` or `== 0x7f`.
-   (Core unit test, incl. a property test over arbitrary bytes: output is always printable and
-   ≤253.)
+8. **`HostName` keeps printable ASCII only, and bounds.** `HostName::new` strips a trailing dot
+   (`"a.com." → "a.com"`), keeps only bytes `0x20`–`0x7e` and drops everything else — a name
+   containing `\x1b[31m` renders without the escape, and a byte `≥ 0x80` (e.g. raw UTF-8) is dropped;
+   it rejects (`None`) a name longer than 253 bytes, and returns `None` for `""` and for a name that
+   sanitizes to empty. The rendered `Display` contains only bytes in `0x20`–`0x7e`. (Core unit test,
+   incl. a `proptest` over arbitrary bytes: output is always within `0x20`–`0x7e` and ≤253, or
+   `None`.)
 9. **`NameTable` is latest-wins per IP.** `observe`ing the same IP with name `a` at `ts=1` then `b`
    at `ts=2` resolves to `b`; observing `b` at `ts=2` then `a` at `ts=1` still resolves to `b`
    (max-ts wins regardless of insertion order); a tie at equal `ts` resolves to the last observed.
@@ -219,6 +249,13 @@ renders `host:port` when resolved (design §6: `→ github.com:443`). The origin
     render-closed snapshots pass unchanged. (Existing tests, unmodified.)
 16. **Drift guard.** The committed DNS fixture matches its source builder (the `drift` test passes
     with the new fixture). (Drift test.)
+17. **`NameTable` is bounded and surfaces drops.** Observing `NAME_TABLE_CAP + k` distinct IPs
+    retains exactly `NAME_TABLE_CAP` (`len()` == cap), reports `dropped() == k`, and still updates an
+    already-present IP after the cap is reached (a later `ts` for a retained IP wins). A capture that
+    exceeds the cap builds a title containing `names capped`. (Core unit test + bin/title test.)
+18. **Long resolved name truncates in the peer column.** An `App` whose peer resolves to a
+    ~253-char name renders that row's peer cell truncated to the column width, and the master pane
+    buffer width is unchanged (no overflow). (Render/TestBackend test.)
 
 ## 6. Failure modes handled
 
@@ -230,12 +267,19 @@ renders `host:port` when resolved (design §6: `→ github.com:443`). The origin
   counted `non_tcp`. (§4, criterion 4.)
 - **Compression-pointer loop / name flood** → bounded by `simple-dns` (parse returns `Result`) and
   by the per-IP `NameTable`; only A/AAAA answers are read. (ADR-0015 §4.)
-- **Hostile name bytes (terminal escapes)** → stripped at `HostName::new`; never rendered. (§2,
-  criterion 8.)
-- **Conflicting answers for one IP** → latest-`ts` wins deterministically. (§3.4, criterion 9.)
+- **Hostile name bytes (terminal escapes / non-ASCII)** → dropped at `HostName::new` (printable
+  ASCII only); never rendered. (§2, criterion 8.)
+- **Long / adversarial name** → truncated to the peer column width at render; no pane overflow. (§3.2,
+  criterion 18.)
+- **Spoofed / poisoned mapping** → labels are advisory (§3.2 trust model); the raw numeric peer is
+  always recoverable via `conns`/`metrics`. (§3.4.)
+- **Reused IP answered for two names** → latest-`ts` wins; a stable label that can be wrong for an
+  earlier connection to a reused IP — the documented as-of-`T` trade-off. (§3.4, criterion 9.)
 - **Non-monotonic capture time** → latest-wins compares stored `ts`, not file order. (ADR-0015 §2.)
-- **Very large capture** → only the per-IP table is retained (streaming preserved); names add no
-  per-segment memory and are not bounded by `--max-samples` (they are host-scoped, few). (§4.)
+- **DNS-heavy capture (unbounded distinct answer IPs)** → the `NameTable` caps at `NAME_TABLE_CAP`
+  distinct IPs; excess new IPs are dropped and counted, and the title shows `names capped` (design §7
+  no-OOM contract, no silent truncation). Memory is bounded regardless of DNS-packet count; the
+  streaming faucet retains only the capped table. (§2, criterion 17.)
 - **IPv6 peers** → resolved names render without the address brackets; unresolved keep `[addr]:port`.
   (§3.2, criterion 10.)
 
