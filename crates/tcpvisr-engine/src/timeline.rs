@@ -146,6 +146,11 @@ impl Timeline {
         self.event_times.get(k.checked_sub(1)?).copied()
     }
 
+    // A linear O(N) stab query over all tracked connections, not a sublinear interval tree.
+    // ADR-0004 frames playback cost as O(N_T) per frame (N_T = connections active at T); this
+    // scan is O(N) in the total connection count. That is acceptable for v1's target captures
+    // (interactive diagnostics, modest concurrency; ADR-0004 "bounded N_T"); a true interval
+    // tree (O(log N + N_T)) is a post-v1 optimization if large-N captures need it.
     fn active_indices(&self, t: Nanos) -> impl Iterator<Item = usize> + '_ {
         (0..self.entries.len()).filter(move |&i| {
             let e = &self.entries[i];
