@@ -38,8 +38,7 @@
 | `crates/tcpvisr-tui/src/keys.rs` | nav-mode `Enter`→open, `Esc`→close | modify |
 | `crates/tcpvisr-tui/src/render.rs` | split layout + `render_detail` + footer hints | modify |
 | `crates/tcpvisr-tui/src/lib.rs` | wire `detail` module + re-exports | modify |
-| `crates/tcp-visr/src/main.rs` | `collect_seq_timeline = true` in replay cfg | modify |
-| `crates/tcp-visr/tests/replay.rs` | integration: focus `seq_series` non-empty; ceiling still fatal | modify |
+| `crates/tcp-visr/src/main.rs` | `collect_seq_timeline = true` in replay cfg + in-crate seam test (focus `seq_series` non-empty) | modify |
 
 ---
 
@@ -779,7 +778,7 @@ git commit -m "feat(engine): collect unwrapped SeqSample series for replay"
   - glyph consts `DATA_GLYPH`, `OOO_GLYPH`, `RETRANS_GLYPH`, `SACK_GLYPH`, `CURSOR_GLYPH`.
   - `pub fn project(series: &[SeqSample], focus: SampleDir, x_span: (Nanos, Nanos), cursor: Nanos, width: u16, height: u16) -> Option<SeqPlot>` (None when below the minimum rectangle).
 
-- [ ] **Step 1: Write the failing tests** — create `detail.rs` with only a `#[cfg(test)]` module first (module body added in Step 3). Put this at the bottom of the file:
+- [ ] **Step 1: Register the module + write the failing tests** — first add `pub mod detail;` to `crates/tcpvisr-tui/src/lib.rs` (alongside the other `pub mod` lines) so the new file is compiled. Then create `detail.rs` containing **only** this `#[cfg(test)]` module (the projection code is added in Step 3); because it references `project`/`SeqPlot`/the glyph consts that do not exist yet, the crate will fail to compile — the intended red state. Put this at the bottom of the file:
 
 ```rust
 #[cfg(test)]
@@ -907,7 +906,7 @@ mod tests {
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p tcpvisr-tui --lib detail`
-Expected: FAIL — `project` / types not defined (won't compile). (Add `pub mod detail;` to `lib.rs` first so it is picked up — see Step 4; until then the file is not compiled.)
+Expected: FAIL — the crate does not compile: `cannot find function \`project\` in this scope` and `cannot find type \`SeqPlot\`/\`Mark\`` (the module is registered from Step 1, so the compiler actually reaches and rejects the test references).
 
 - [ ] **Step 3: Implement the projection** — put this at the top of `detail.rs` (above the test module):
 
@@ -1045,14 +1044,12 @@ pub fn project(
 }
 ```
 
-- [ ] **Step 4: Register the module** — in `crates/tcpvisr-tui/src/lib.rs`, add `pub mod detail;` alongside the other `pub mod` lines.
-
-- [ ] **Step 5: Run tests to verify they pass**
+- [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p tcpvisr-tui --lib detail`
-Expected: PASS (all projection tests).
+Expected: PASS (all projection tests). (`pub mod detail;` was already added in Step 1.)
 
-- [ ] **Step 6: Guardrails + commit**
+- [ ] **Step 5: Guardrails + commit**
 
 ```bash
 cargo fmt --all --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test -p tcpvisr-tui
@@ -1344,13 +1341,11 @@ Expected: FAIL — no detail rendering / footer hints.
 
 ```rust
 use ratatui::style::Color;
-use tcpvisr_core::SampleDir;
 
-use crate::app::FocusConn;
 use crate::detail::{self, Mark, SeqPlot};
 ```
 
-(Keep the existing imports; `Color` augments the existing `style` import — merge into one `use` line if the file already imports from `ratatui::style`.)
+(Keep the existing imports; `Color` augments the existing `use ratatui::style::{Modifier, Style};` — either add this line or extend that one to `{Color, Modifier, Style}`. Do **not** import `FocusConn` — `render_detail` binds `app.focus()` without naming the type, so importing it would be an unused import that fails `-D warnings`.)
 
 - [ ] **Step 4: Split the layout in `render`** — replace the body of `pub fn render`:
 
@@ -1409,7 +1404,7 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect) {
 
     draw_legend(frame, inner);
     draw_plot(frame, inner, GUTTER, &plot);
-    draw_axes(frame, inner, GUTTER, &plot, focus.focus_dir);
+    draw_axes(frame, inner, GUTTER, &plot);
 }
 
 fn draw_legend(frame: &mut Frame, inner: Rect) {
@@ -1440,7 +1435,7 @@ fn draw_plot(frame: &mut Frame, inner: Rect, gutter: u16, plot: &SeqPlot) {
     }
 }
 
-fn draw_axes(frame: &mut Frame, inner: Rect, gutter: u16, plot: &SeqPlot, _dir: SampleDir) {
+fn draw_axes(frame: &mut Frame, inner: Rect, gutter: u16, plot: &SeqPlot) {
     let buf = frame.buffer_mut();
     let y_top = inner.y + 1;
     // Y labels: max_rel at the top of the plot, 0 at the bottom.
@@ -1485,48 +1480,58 @@ git commit -m "feat(tui): render the Time/Sequence detail pane"
 
 ---
 
-### Task 9: CLI — collect the seq timeline in replay + integration test
+### Task 9: CLI — collect the seq timeline on the replay path
 
 **Files:**
-- Modify: `crates/tcp-visr/src/main.rs` (`run_replay`)
-- Modify: `crates/tcp-visr/tests/replay.rs`
+- Modify: `crates/tcp-visr/src/main.rs` (`run_replay` cfg + a test in the in-crate `#[cfg(test)] mod build_replay_tests`)
 
 **Interfaces:**
-- Consumes: `collect_seq_timeline` (Task 3), `App::open_detail`/`focus` (Task 6).
+- Consumes: `collect_seq_timeline` (Task 3), the existing private `build_replay_app(&Path, EngineConfig)` (main.rs), `App::focus` (Task 6).
 
-- [ ] **Step 1: Inspect the existing replay integration test** to reuse its fixture/helpers.
+> **Where the test lives.** `crates/tcp-visr/tests/replay.rs` is a **black-box** integration
+> crate: its tests only run the compiled binary via `Command::new(env!("CARGO_BIN_EXE_tcp-visr"))`
+> and inspect stdout/stderr/exit — they cannot call `build_replay_app` or `App::focus()`
+> in-process (a binary crate exports no library API). Criterion 17 drives the `build_replay_app`
+> seam directly, so its test belongs in `main.rs`'s existing `#[cfg(test)] mod build_replay_tests`
+> (which already has a `fixture()` helper and access to `build_replay_app`), next to the M5 seam
+> tests `builds_a_timeline_app_with_rows` / `sample_ceiling_is_fatal`. Do **not** edit
+> `tests/replay.rs`.
 
-Run: `sed -n '1,80p' crates/tcp-visr/tests/replay.rs`
-Expected: shows how it builds an `App` from `crates/tcp-visr/tests/fixtures/metrics_basic.pcap` (via the public `tcp-visr` test seam or a helper); mirror that construction below.
-
-- [ ] **Step 2: Write the failing integration test** — append to `crates/tcp-visr/tests/replay.rs`. (Adjust the app-construction line to match how the file already builds the replay `App`; the fixture path helper likely already exists in the file.)
+- [ ] **Step 1: Write the seam test** — append to `mod build_replay_tests` in `main.rs`:
 
 ```rust
-#[test]
-fn replay_collects_seq_series_for_the_focus_connection() {
-    // Build the replay App over the fixture with seq collection on (mirrors run_replay's cfg).
-    let cfg = tcpvisr_engine::EngineConfig {
-        collect_state_timeline: true,
-        collect_seq_timeline: true,
-        ..tcpvisr_engine::EngineConfig::default()
-    };
-    let app = build_test_replay_app(&fixture(), cfg).expect("build replay app");
-    let focus = app.focus().expect("a connection is selected at the initial cursor");
-    assert!(
-        !focus.series.is_empty(),
-        "fixture with data segments yields a non-empty focus seq series"
-    );
-}
+    #[test]
+    fn build_replay_app_collects_seq_series_for_the_focus_connection() {
+        let cfg = EngineConfig {
+            collect_state_timeline: true,
+            collect_seq_timeline: true,
+            ..EngineConfig::default()
+        };
+        let app = build_replay_app(&fixture(), cfg).expect("build");
+        let focus = app.focus().expect("a connection is selected at the initial cursor");
+        assert!(
+            !focus.series.is_empty(),
+            "fixture with data segments yields a non-empty focus seq series"
+        );
+    }
 ```
 
-If `replay.rs` does not already expose a `build_test_replay_app`/`fixture` helper, add small local helpers to the test file that call the same public path `run_replay` uses (the `tcp-visr` crate exposes `build_replay_app` for tests per M5; if it is `pub(crate)` only, drive it through the existing seam the file already uses and assert `app.focus()` there instead).
+(`build_replay_tests` uses `use super::*;`, so `EngineConfig`, `build_replay_app`, and `fixture()`
+are all in scope. If the fixture's peer-first-sorted connection happens to carry no data in its
+focus direction, `app.move_down()` to a data-bearing row before asserting, or assert over
+`app.visible()` — but `metrics_basic.pcap` is a data-carrying fixture, so the initial selection
+suffices.)
 
-- [ ] **Step 3: Run to verify it fails**
+- [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p tcp-visr --test replay replay_collects_seq_series`
-Expected: FAIL — `focus.series` is empty because `run_replay`/`build_replay_app` does not yet set `collect_seq_timeline`.
+Run: `cargo test -p tcp-visr --lib build_replay_app_collects_seq_series`
+Expected: FAIL — `focus.series` is empty because `run_replay` has not yet enabled
+`collect_seq_timeline`. **Wait:** the test passes its *own* cfg to `build_replay_app`, so it
+actually exercises Tasks 1–6 end-to-end and will already pass once those are merged. If it passes
+here, that is expected — it is the criterion-17 guard for the engine→build→focus path; treat
+Step 3 as the production-wiring change and keep this test as the regression guard.
 
-- [ ] **Step 4: Turn on seq collection in replay** — in `main.rs` `run_replay`, extend the `EngineConfig`:
+- [ ] **Step 3: Turn on seq collection in `run_replay`** — in `main.rs` `run_replay`, extend the cfg (this is the production wiring the interactive `replay` uses; the black-box `tests/replay.rs` tty/validation tests are unchanged by it):
 
 ```rust
     let cfg = EngineConfig {
@@ -1537,16 +1542,17 @@ Expected: FAIL — `focus.series` is empty because `run_replay`/`build_replay_ap
     };
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p tcp-visr --test replay`
-Expected: PASS (new test + existing replay tests — the ceiling test still fails fast because seq samples count against `max_samples`).
+Run: `cargo test -p tcp-visr`
+Expected: PASS — the new seam test, the M5 seam tests (`sample_ceiling_is_fatal` still trips
+because seq samples count against `max_samples`), and the unchanged black-box `tests/replay.rs`.
 
-- [ ] **Step 6: Guardrails + commit**
+- [ ] **Step 5: Guardrails + commit**
 
 ```bash
 cargo fmt --all --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test -p tcp-visr
-git add crates/tcp-visr/src/main.rs crates/tcp-visr/tests/replay.rs
+git add crates/tcp-visr/src/main.rs
 git commit -m "feat(cli): collect the seq timeline on the replay path"
 ```
 
