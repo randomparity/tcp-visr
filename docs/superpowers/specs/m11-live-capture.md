@@ -80,11 +80,13 @@ explicitly, never as an idle or lossless display.
     sample) expose the live cursor domain.
 - **TUI — live view seam + follow/freeze transport** (`tcpvisr-tui`):
   - `App::retarget(&mut self, timeline: Timeline, horizon: Nanos, now: Nanos)`: replaces the
-    underlying `Timeline`, refreshes per-connection `metas` for connections new since the last
-    frame (names resolved once via a `NameTable` passed at construction), updates the transport
-    domain to `[horizon, now]`, and — when following — pins the cursor to `now`; otherwise clamps
-    the frozen cursor into `[horizon, now]`. Selection, filter, sort, view tab, and detail-open
-    state are preserved.
+    underlying `Timeline` and **reconciles `metas` to exactly the snapshot's connection set** —
+    adds a `ConnMeta` for each new `ConnId` (name resolved once via a `NameTable` passed at
+    construction) **and drops metas whose `ConnId` is absent** from the new snapshot (so
+    whole-connection eviction bounds the App side too; O(added + removed), not a full rebuild).
+    Updates the transport domain to `[horizon, now]`, and — when following — pins the cursor to
+    `now`; otherwise clamps the frozen cursor into `[horizon, now]`. Selection, filter, sort, view
+    tab, and detail-open state are preserved.
   - Live-only `App` fields: `follow: bool` (default `true`), `LiveStatus { dropped, approximate }`.
     `space` toggles follow/freeze (in live mode) instead of the replay play/pause; `←/→` seek and
     freeze; the speed ladder is inert in live.
