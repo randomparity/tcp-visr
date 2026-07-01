@@ -32,6 +32,7 @@ pub enum DetailView {
     TimeSequence,
     InFlight,
     Rtt,
+    Throughput,
 }
 
 /// One master-list row: a connection projected as of the cursor time.
@@ -229,12 +230,14 @@ impl App {
         self.detail_view
     }
 
-    /// Advances the detail view (wrapping): Time/Sequence -> In-flight -> RTT -> Time/Sequence.
+    /// Advances the detail view (wrapping): Time/Sequence -> In-flight -> RTT -> Throughput ->
+    /// Time/Sequence. M9 finalizes the switcher with all four design §6 detail views.
     pub fn cycle_detail_view(&mut self) {
         self.detail_view = match self.detail_view {
             DetailView::TimeSequence => DetailView::InFlight,
             DetailView::InFlight => DetailView::Rtt,
-            DetailView::Rtt => DetailView::TimeSequence,
+            DetailView::Rtt => DetailView::Throughput,
+            DetailView::Throughput => DetailView::TimeSequence,
         };
     }
 
@@ -860,6 +863,8 @@ mod tests {
         assert_eq!(app.detail_view(), DetailView::InFlight);
         app.cycle_detail_view();
         assert_eq!(app.detail_view(), DetailView::Rtt);
+        app.cycle_detail_view();
+        assert_eq!(app.detail_view(), DetailView::Throughput);
         app.cycle_detail_view();
         assert_eq!(app.detail_view(), DetailView::TimeSequence);
     }
