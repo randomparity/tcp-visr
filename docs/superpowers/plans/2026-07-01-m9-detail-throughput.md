@@ -110,13 +110,25 @@ retransmit; `None` for a data-less direction. `cargo test -p tcpvisr-engine metr
 - `throughput_series_empty_for_unknown_id` (criterion 4).
 - `throughput_timeline_defaults_off` (criterion 6).
 
-**Acceptance:** engine compiles; `Timeline::new` unchanged in behavior (empty throughput series);
-`throughput_series` sorted + empty-for-unknown; flag defaults off. `cargo test -p tcpvisr-engine
-timeline:: config::` green. (The workspace won't fully build until Task 4 updates `tracker.rs`'s
-`with_seq` call and the TUI's `with_seq` test sites — do Tasks 2–4 as one green step if needed, or
-temporarily stub the tracker call.)
+**⚠ Atomic commit boundary — Tasks 2 + 3 land together.** Widening `ConnSeries` to a 6-tuple
+changes the `with_seq` **signature**, which is not a backward-compatible change: it breaks *every*
+call site at once — `timeline.rs`'s own tests (this task), `tracker.rs::into_timeline` (Task 3, the
+**same crate** as `timeline.rs`, so the engine will not compile until it is fixed), and the
+`app.rs`/`render.rs` tests in `tcpvisr-tui` (fixed in Task 5). Because "one logical change per
+commit, green at every commit" forbids a red compile, the signature change and **all** its
+call-site updates must be in **one commit**. Concretely: do Task 2 and Task 3 as a single green
+commit (the engine compiles only once `into_timeline` passes the 6th element). The TUI call sites
+are fixed in Task 5, so `cargo test --workspace` is only re-run for the full green *after* Task 5;
+between here and Task 5, verify the engine crate alone (`cargo test -p tcpvisr-engine`) — but do not
+*commit* until at least the engine compiles (end of Task 3).
 
-**Rollback:** revert the three files; `ThroughputSample` is unreferenced elsewhere until Task 3.
+**Acceptance (measured at the end of Task 3, the joint commit):** `Timeline::new` unchanged in
+behavior (empty throughput series); `throughput_series` sorted + empty-for-unknown; flag defaults
+off; `cargo test -p tcpvisr-engine` green.
+
+**Rollback:** Tasks 2 and 3 revert **together** (reverting only one leaves `into_timeline` calling a
+6-tuple `with_seq` with 5 args — a compile error). Reverting both restores the 5-tuple `with_seq`
+and all its call sites; `ThroughputSample` is then unreferenced.
 
 ---
 
@@ -159,10 +171,13 @@ both directions per segment (gated on having sent data), counting against the ce
 - Off by default (criterion 6): only `collect_state_timeline` set → empty throughput series.
 
 **Acceptance:** all `throughput_tests` pass; `into_timeline` carries the series; ceiling fails fast.
-`cargo test -p tcpvisr-engine` green (Task 2 + 3 together make the engine build). Update the TUI's
-`with_seq` test call sites (Task 5 pre-req) if the workspace build is checked here.
+`cargo test -p tcpvisr-engine` green — this is the joint Task 2 + 3 commit boundary, and the first
+point at which the engine compiles. (`cargo test --workspace` stays red until Task 5 fixes the TUI
+`with_seq` test sites; that is expected and is why the workspace guardrail is deferred to Task 5.)
 
-**Rollback:** revert `tracker.rs`; Task 2's `Timeline` still compiles (empty throughput vecs).
+**Rollback:** revert `tracker.rs` **and** Task 2's `timeline.rs` together (see Task 2's atomic-commit
+note) — reverting `tracker.rs` alone leaves `into_timeline` calling the 6-tuple `with_seq` with 5
+args, which will not compile.
 
 ---
 
