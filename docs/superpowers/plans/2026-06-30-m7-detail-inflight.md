@@ -765,7 +765,9 @@ pub fn project(
     let idx = |col: u16, row: u16| usize::from(row) * usize::from(width) + usize::from(col);
     let mut grid: Vec<Option<Mark>> = vec![None; cells];
 
-    let mut place = |series: Series, glyph: char, samples: &[InFlightSample], grid: &mut Vec<Option<Mark>>| {
+    // `place` mutates only its local `peak` and the `grid` argument, so it is `Fn` — bind it
+    // without `mut` or `unused_mut` fails under `-D warnings`.
+    let place = |series: Series, glyph: char, samples: &[InFlightSample], grid: &mut Vec<Option<Mark>>| {
         // Track the tallest revealed row per column for this series.
         let mut peak: Vec<Option<u16>> = vec![None; usize::from(width)];
         for s in samples.iter().filter(|s| s.dir == focus && s.t.0 <= cursor.0) {
@@ -807,7 +809,7 @@ pub fn project(
 }
 ```
 
-> Note on clippy: the closure captures `width`/`t0`/`span_t`/`max_bytes`/`cursor`/`focus`/`idx` by reference. If `clippy::too_many_arguments` or borrow issues arise, inline `place` as two explicit loops instead of a closure. Keep each function ≤100 lines / complexity ≤8; if `project` trips the complexity lint, extract the per-series placement into a free `fn place_series(...)`.
+> Note on clippy/rustc: the closure captures Copy values + `idx` by reference and is `Fn` (bind it `let place`, not `let mut place`, or `unused_mut` errors under `-D warnings`). If `clippy::too_many_arguments`, `unused_mut`, or borrow issues arise, extract the per-series placement into a free `fn place_series(series, glyph, samples, focus, x_span, cursor, max_bytes, width, height, grid)` instead of a closure. Keep each function ≤100 lines / complexity ≤8; if `project` trips the complexity lint, that same extraction resolves it.
 
 Then add to `lib.rs`:
 ```rust
