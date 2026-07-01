@@ -41,14 +41,26 @@ pub struct InFlightSample {
 }
 ```
 
-- **`bytes` is the wire-estimated bytes-outstanding for `dir`**, taken verbatim from the
-  `MetricSample.in_flight_bytes` the engine already derives (ADR-0007, serial-correct across
-  `u32` wrap). One `InFlightSample` is emitted per processed segment, in that segment's own
-  direction, so each direction carries its own sawtooth. A consumer focusing on one direction
-  filters by `dir` (the detail plots the higher-byte direction, as M6 does).
-- **Classification is not duplicated.** The value comes from the same `MetricState::observe`
-  call that M6 already runs on the replay path to classify seq points; the tracker transforms
-  its result into an `InFlightSample` instead of buffering the `MetricSample`.
+- **`bytes` is the wire-estimated bytes-outstanding for `dir`**, the same quantity the engine
+  already derives as `MetricSample.in_flight_bytes` (ADR-0007, serial-correct across `u32`
+  wrap).
+- **Both directions' outstanding are snapshotted at every segment — not just the segment's own
+  direction.** In-flight is a two-sided quantity: it *rises* when a direction sends and *falls*
+  when the opposite direction's ACK advances the sender's acknowledged frontier. If the series
+  recorded only the segment's own-direction outstanding (the naive mirror of `SeqSample`), an
+  ACK — which arrives in the opposite direction — would never sample the *sender's* now-lower
+  outstanding, and a burst-then-idle transfer would render a false high plateau on its tail
+  instead of the sawtooth's downstroke. So the tracker snapshots **each direction that has an
+  established send frontier** at every processed segment `t`, via a small
+  `MetricState::in_flight(dir) -> Option<u64>` query (`snd_nxt − acked`, serial, ≥ 0; `None`
+  before that direction has a frontier). The own direction's snapshot equals the
+  `MetricSample.in_flight_bytes` `observe` returns; the opposite direction's snapshot captures
+  the ack-driven drain at ack time. Redundant equal-valued snapshots (a segment that does not
+  change a direction's outstanding) are collapsed by the plot's per-column bucketing (§2), so
+  they cost only bounded memory, not visual noise.
+- **Classification is not duplicated.** The values come from the same `MetricState` the engine
+  already advances on the replay path to classify M6 seq points; the tracker reads outstanding
+  from it instead of buffering the `MetricSample`.
 - **Collection is gated by a new `EngineConfig.collect_inflight_timeline` flag** (default
   `false`), orthogonal to `collect_state_timeline` and `collect_seq_timeline`. On the replay
   path all three are on. Each retained `InFlightSample` counts against the existing
@@ -77,8 +89,8 @@ The in-flight curve is produced by a **pure projection** in `tcpvisr-tui` (a sib
   This differs from M6's `retransmit > sack > …` salience ordering because in-flight has no
   glyph taxonomy — the meaningful summary of a dense column is its peak outstanding value.
 - **Fixed axes.** X spans `[opened_at, effective_end]` (from `Timeline::x_span`, shared with
-  M6); Y spans `[0, max_bytes]` over the focus direction's whole series. Neither rescales as
-  the cursor moves.
+  M6); Y spans `[0, max_bytes]` over the focus direction's wire ∪ overlay series (§4). Neither
+  rescales as the cursor moves.
 
 A braille `Canvas` line was rejected for the same reasons ADR-0011 gave: it is impure, gives
 one marker per layer, and is hard to place/assert. A filled column-area rendering (bars from
@@ -116,6 +128,12 @@ non-phantom:
   bytes-over-time shape, and each `Mark` carries a `series` tag (`Wire` vs `Cwnd`) so the
   renderer draws the overlay with a distinct glyph/colour. Wire in-flight and cwnd are **never
   conflated** (design §4: in-flight ≤ cwnd; divergence is the diagnostic signal).
+- **The Y axis is scaled over wire ∪ overlay, not wire alone.** Because cwnd ≥ in-flight, an
+  overlay scaled against the wire maximum would clamp at the top row exactly when it diverges
+  upward — flattening the signal the overlay exists to show. `max_bytes` is therefore the
+  maximum over both the wire and overlay focus-direction samples. On replay the overlay is
+  empty, so this is identical to the wire maximum; the correction only matters once M12 fills
+  the overlay.
 - On the replay path the overlay is **empty**, so no cwnd is drawn. A projection **unit test**
   passes a synthetic overlay and asserts the distinctly-tagged marks, so the hook is exercised
   code, not dead code. M12 fills the overlay from the kernel series without touching the
@@ -125,8 +143,8 @@ non-phantom:
 
 - The replay path now retains a third per-connection series (`InFlightSample`) alongside
   `StateSample` and `SeqSample`, all bounded by `max_samples` with the existing fail-fast. The
-  extra memory is one `u64`+tag per segment; the ceiling protects against a hostile/large
-  capture (§7, §14).
+  extra memory is up to two small samples per segment (both directions' outstanding when each
+  has a send frontier); the ceiling protects against a hostile/large capture (§7, §14).
 - The engine gains no I/O and no clock read (ADR-0002 preserved); the in-flight series is
   derived purely from segments via the existing `MetricState`.
 - The in-flight projection is a second pure module, unit-testable without a terminal; only the
@@ -145,6 +163,13 @@ non-phantom:
   `metrics` JSON schema and the hand-derived oracle goldens, and retains heavier per-sample
   data than the view needs. A dedicated `InFlightSample` keeps `MetricSample` and the oracle
   frozen.
+- **Sample outstanding only at same-direction send times (the exact `SeqSample` mirror).**
+  Rejected: in-flight falls on ACKs, which travel in the opposite direction, so a send-only
+  series never captures the drain — a burst-then-idle transfer would show a false high plateau
+  on its tail and place every downstroke at the next send's timestamp instead of the ack's.
+  Snapshotting both directions' outstanding per segment is the small correction that makes the
+  sawtooth honest; the extra equal-valued snapshots are bucketed away in the plot and bounded
+  by `max_samples`.
 - **Fold in-flight collection into the existing `collect_seq_timeline` flag.** Rejected: the
   flags stay orthogonal and independently testable (as `collect_state_timeline` and
   `collect_seq_timeline` already are), even though replay sets all three. One flag per series

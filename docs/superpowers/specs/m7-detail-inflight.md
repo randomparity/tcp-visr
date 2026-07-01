@@ -21,18 +21,25 @@ live-only) can be drawn as a distinct overlay; on replay the overlay is empty.
 
 ### In scope
 
-- A pure **`InFlightSample`** series in `tcpvisr-engine`: one record per processed segment,
-  carrying `{ t, dir, bytes }` where `bytes` is the segment's **wire in-flight
-  (`MetricSample.in_flight_bytes`)** for its own direction (ADR-0012 §1 — the engine already
-  derives it, serial-correct across `u32` wrap; the tracker does not recompute it). Collected
-  under a new `EngineConfig.collect_inflight_timeline` flag, counting against `max_samples`.
+- A pure **`InFlightSample`** series in `tcpvisr-engine`, carrying `{ t, dir, bytes }` where
+  `bytes` is the wire **bytes in flight (outstanding)** for `dir` (the engine's
+  `in_flight_bytes`, serial-correct across `u32` wrap; the tracker reads it, not recomputes it).
+  In-flight is two-sided — it *rises* on a send and *falls* when the opposite direction's ACK
+  advances the sender's frontier — so at **every** processed segment the tracker snapshots
+  **each direction that has an established send frontier** (own and, when it has been acked,
+  the opposite), not just the segment's own direction (ADR-0012 §1). This is what lets an ACK
+  sample the sender's now-lower outstanding at ack time; a send-only series would leave a false
+  high plateau on a burst-then-idle tail. Collected under a new
+  `EngineConfig.collect_inflight_timeline` flag, counting against `max_samples`.
 - `Timeline` retains each connection's `InFlightSample` series and exposes
   **`inflight_series(id) -> &[InFlightSample]`**; `into_timeline` / `with_seq` carry it through.
 - A pure **in-flight projection** in `tcpvisr-tui` (a sibling module to M6's `detail.rs`):
   `(wire series, overlay series, focus direction, x_span, cursor T, viewport cells)` → resolved
   axis ranges + a grid of marks `{ col, row, glyph, series }`, revealing marks with `t ≤ T`, a
-  vertical cursor column at `T`, fixed full-extent axes (Y = `[0, max_bytes]`), **numeric-max**
-  column bucketing, and a distinct glyph for `series == Cwnd` overlay marks (ADR-0012 §2, §4).
+  vertical cursor column at `T`, fixed full-extent axes (Y = `[0, max_bytes]` over the focus
+  direction's **wire ∪ overlay** samples, so a diverging cwnd overlay is not clamped),
+  **numeric-max** column bucketing applied only to revealed samples, and a distinct glyph for
+  `series == Cwnd` overlay marks (ADR-0012 §2, §4).
 - **`App`** gains a `DetailView { TimeSequence, InFlight }` field, `detail_view()`, and
   `cycle_detail_view()`; the focus accessor also exposes the in-flight series. `Tab` cycles the
   view. `Enter`/`Esc` keep their M6 open/close meaning.
@@ -111,7 +118,10 @@ For the focus connection (§3.5) and its focus direction (§3.6):
 - **X axis (time)** spans `[opened_at, effective_end]` from `Timeline::x_span(id)` (shared with
   M6); fixed, does not rescale with the cursor.
 - **Y axis (bytes)** spans `[0, max_bytes]` where `max_bytes = max(s.bytes)` over the focus
-  direction's samples (plain `u64` max — no serial arithmetic). Fixed; does not rescale.
+  direction's **wire and overlay** samples (plain `u64` max — no serial arithmetic). Including
+  the overlay keeps a diverging cwnd (cwnd ≥ in-flight; design §4) from clamping at the top row;
+  on replay the overlay is empty so `max_bytes` equals the wire maximum. Fixed; does not
+  rescale.
 - **Plot rectangle.** `W` columns × `H` rows of cells, excluding border, Y-label gutter,
   X-label row, and legend row (`render.rs` carves them). Row 0 is the **bottom** (0 bytes),
   row `H-1` the top.
@@ -125,12 +135,13 @@ For the focus connection (§3.5) and its focus direction (§3.6):
 - **Marks.** Each focus-direction wire `InFlightSample` with `t ≤ T` maps to cell
   `(col(t), row(bytes))` with the **wire** glyph and `series == Wire`. Each overlay sample with
   `t ≤ T` maps the same way with the **cwnd** glyph and `series == Cwnd` (empty on replay).
-- **Column bucketing (downsampling).** When multiple **wire** marks fall in one column, the cell
-  keeps the **tallest** (max `row`) — the sawtooth peak for that time bucket. Overlay marks
-  bucket independently by the same max rule. This bounds render to `O(cells)` regardless of
-  sample count (ADR-0012 §2). A wire mark and an overlay mark that land in the same cell keep
-  their distinct glyphs (they are not merged; the overlay is drawn over empty cells or its own
-  bucket — see §3.7 for the render precedence).
+- **Column bucketing (downsampling).** Bucketing is applied **only to revealed samples**
+  (`t ≤ T`), so scrubbing never shows a future peak. When multiple **wire** marks fall in one
+  column the cell keeps the **tallest** (max `row`) — the sawtooth peak for that time bucket.
+  Overlay marks bucket independently by the same max rule. This bounds render to `O(cells)`
+  regardless of sample count (ADR-0012 §2). A wire mark and an overlay mark that land in the
+  same cell keep their distinct glyphs (they are not merged; see §3.7 for the render
+  precedence).
 - **Cursor column.** A vertical cursor glyph is drawn in the column corresponding to `T`, over
   cells no mark occupies (shared with M6).
 - **Reveal.** Marks with `t > T` are not drawn; at `T = opened_at` only the earliest show, at
@@ -177,14 +188,19 @@ the diagnostic cwnd line is visible; both keep their own colour.
   `with_seq` call sites (the M6 `timeline.rs` and `render.rs`/`app.rs` tests) get an added empty
   in-flight vector — a mechanical edit confined to M6/M7 code, not the M5 `new` fixtures.
 - `config.rs`: add `collect_inflight_timeline: bool` (default `false`).
+- `metrics.rs`: add `MetricState::in_flight(dir) -> Option<u64>` returning that direction's
+  current outstanding (`snd_nxt − acked`, serial, clamped ≥ 0) or `None` before the direction
+  has an acknowledged send frontier. Pure, no new state; used only by in-flight collection.
 - `tracker.rs`: `ConnTrack` gains `inflight: Vec<InFlightSample>`. When
-  `collect_inflight_timeline` is set and not overflowed, for every processed segment push one
-  `InFlightSample { t: seg.ts, dir, bytes: sample.in_flight_bytes }` from the **same**
-  `MetricSample` M6 already derives (so no second `observe` call). Record it via a
+  `collect_inflight_timeline` is set and not overflowed, for every processed segment — after the
+  **same** `MetricState::observe` M6 already runs (no second call) — snapshot each direction
+  `d` for which `metrics.in_flight(d)` is `Some(b)` as `InFlightSample { t: seg.ts, dir: d,
+  bytes: b }`. Recording both directions (own reflects the send, opposite reflects any ACK this
+  segment applied) is what captures ack-driven drains at ack time (§2). Record via a
   `record_inflight` helper mirroring `record_seq` (counts against `max_samples`, sets
   `overflowed`). Gate metric derivation on `collect_inflight_timeline` too, so replay derives
-  once and both seq + in-flight collection consume that one `MetricSample`. `into_timeline`
-  passes the in-flight series through `with_seq`.
+  once and both seq + in-flight collection consume that one derivation. `into_timeline` passes
+  the in-flight series through `with_seq`.
 - `lib.rs`: re-export `InFlightSample`.
 
 ### TUI (`tcpvisr-tui`)
@@ -217,11 +233,12 @@ Dependency direction is unchanged (TUI → engine → core).
 
 ## 5. Success criteria (falsifiable)
 
-1. **In-flight sample emitted per segment.** A tracker with `collect_inflight_timeline = true`
-   fed O2R data (seq 100 len 10), then an R2O ACK=110, then O2R data (seq 110 len 5) produces
-   O2R `InFlightSample`s with `bytes == 10` then `bytes == 5` (outstanding grows with sent
-   bytes, drains on ack) — the values matching `MetricSample.in_flight_bytes`. (Engine unit
-   test.)
+1. **In-flight rises on send and drains at ack time.** A tracker with
+   `collect_inflight_timeline = true` fed O2R data (seq 100 len 10, t=1000), then an R2O ACK=110
+   (t=2000), then O2R data (seq 110 len 5, t=3000) produces an O2R `InFlightSample` series
+   `bytes == 10` at t=1000, `bytes == 0` at t=2000 (the drain sampled at the **ack's**
+   timestamp, from the opposite-direction snapshot — not deferred to the next send), and
+   `bytes == 5` at t=3000. (Engine unit test.)
 2. **In-flight is serial-correct across a `u32` wrap.** A direction sending 50 bytes at start
    seq `u32::MAX-100` then 50 bytes at seq `200` (never acked) yields a second `InFlightSample`
    with `bytes == 351` (serial distance across the wrap, not naive subtraction). (Engine unit
@@ -246,9 +263,10 @@ Dependency direction is unchanged (TUI → engine → core).
 8. **Reveal to `T`.** For wire samples at `t = {0, 10, 20}` and cursor `t = 10`, the projection
    emits the marks at `t = 0` and `t = 10` and omits `t = 20`; at `t = 20` all three appear.
    (Projection unit test.)
-9. **Numeric-max column bucketing.** Two wire samples in the same column with `bytes` mapping to
-   rows `r1 < r2` render a single wire mark at row `r2` (the peak), not `r1`. (Projection unit
-   test.)
+9. **Numeric-max column bucketing over revealed samples.** Two revealed wire samples in the same
+   column with `bytes` mapping to rows `r1 < r2` render a single wire mark at row `r2` (the
+   peak), not `r1`; a taller sample in that column with `t > T` does not raise the column
+   (bucketing sees only `t ≤ T`). (Projection unit test.)
 10. **Degenerate spans.** A focus connection with a single sample (`opened_at ==
     effective_end`) projects that mark to `(col 0, …)` with no divide-by-zero; a focus direction
     whose samples are all `bytes == 0` (`max_bytes == 0`) projects to row 0. (Projection unit
@@ -258,10 +276,13 @@ Dependency direction is unchanged (TUI → engine → core).
 12. **Narrow-terminal guard.** Projecting into a viewport below the minimum inner width/height
     yields `None` (no marks), and `render` shows `widen terminal`. (Projection unit test +
     TestBackend test.)
-13. **Overlay hook draws a distinct series.** The projection given a non-empty overlay series
-    (synthetic cwnd) emits marks tagged `series == Cwnd` with the cwnd glyph, distinct from the
-    `Wire` marks, at their own `(col, row)`; with an **empty** overlay (the replay case) no
-    `Cwnd` marks are emitted. (Projection unit test.)
+13. **Overlay hook draws a distinct, unclamped series.** The projection given a non-empty overlay
+    series (synthetic cwnd) emits marks tagged `series == Cwnd` with the cwnd glyph, distinct
+    from the `Wire` marks, at their own `(col, row)`. An overlay value **above** the wire
+    maximum expands `max_bytes` so that overlay mark is not clamped to row `H-1` (its row is
+    below the top and above the wire marks' rows), proving the divergence signal survives. With
+    an **empty** overlay (the replay case) no `Cwnd` marks are emitted and `max_bytes` equals
+    the wire maximum. (Projection unit test.)
 14. **`Tab` cycles the view; `Enter`/`Esc` unchanged.** In navigation mode `Tab` advances
     `detail_view()` `TimeSequence → InFlight → TimeSequence`. `Enter` still opens and `Esc`
     still closes the pane; in filter mode `Tab` does not cycle the view and `Enter`/`Esc` keep
@@ -288,6 +309,11 @@ Dependency direction is unchanged (TUI → engine → core).
   error. (§3.4.)
 - **Single-sample / zero-width span / all-zero bytes** → plots into column 0 / the bottom row
   with no divide-by-zero. (§3.4, criterion 10.)
+- **Burst-then-idle transfer (sender stops, receiver ACKs)** → the ACK is a segment, and the
+  tracker snapshots the sender direction's now-lower outstanding from that opposite-direction
+  segment, so the sawtooth's drop is sampled at the ack, not left as a false high plateau on the
+  tail. Only a capture truncated before the ACK keeps the last-seen outstanding (honest: the
+  drain was not observed). (§2, criterion 1.)
 - **`u32` sequence wrap within a connection** → `bytes` is the engine's serial-correct
   `in_flight_bytes`; the TUI does no serial arithmetic. (§2, criterion 2.)
 - **Dense capture (many segments per column)** → numeric-max bucketing bounds render to
