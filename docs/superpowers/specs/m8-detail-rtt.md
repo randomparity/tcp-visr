@@ -172,7 +172,11 @@ direction's samples only.
 The projection is pure and integer-only (time→column, nanos→row are integer proportions, no
 float; the EWMA is integer), so `TestBackend` snapshots and the projection's unit tests are
 deterministic. Axis time labels reuse M6/M7's fixed-3-decimal-seconds formatter; the Y axis labels
-RTT in milliseconds via an integer formatter (nanoseconds → `<ms>.<3-frac>` with no float). When
+RTT via an integer, **unit-adapting** formatter `fmt_rtt(Nanos)` — it picks `ns`/`µs`/`ms`/`s` by
+the value's magnitude and prints `<whole>.<3-frac><unit>` (e.g. `450ns`, `1.500ms`, `2.000s`),
+mirroring how `fmt_seq` adapts SI suffixes, so a loopback capture whose whole `max_rtt` is
+sub-millisecond does not collapse to `0.000ms`. It is integer-only (no float). Note the plotted
+rows are unaffected — `row()` maps raw nanoseconds — so only the axis label adapts units. When
 marks of different series compete for a cell in the final glyph buffer, the renderer draws **raw
 first, then smoothed, then kernel** so the smoothed line and the diagnostic kernel overlay stay
 visible; each keeps its own colour.
@@ -273,9 +277,16 @@ Dependency direction is unchanged (TUI → engine → core).
     occupies that cell. (Projection unit test.)
 13. **Narrow-terminal guard.** Projecting into a viewport below the minimum inner width/height
     yields `None`; `render` shows `widen terminal`. (Projection unit test + TestBackend test.)
-14. **Raw and smoothed are distinct, aligned series.** A wire sample with `rtt != srtt` (e.g.
-    `rtt = max_rtt`, `srtt = max_rtt/2`) emits a `Raw` mark and a `Smoothed` mark at the **same
-    column** but **different rows**, with distinct glyphs. (Projection unit test.)
+13a. **Sub-millisecond axis label stays informative.** `fmt_rtt` renders a `max_rtt` of `450` ns
+    as a non-zero `ns`-unit label (e.g. `450ns`), not `0.000ms`; `1_500_000` ns renders as
+    `1.500ms`. (Formatter unit test.)
+14. **Raw and smoothed are distinct, aligned series (per sample, pre-bucketing).** A **single**
+    revealed wire sample occupying its own column, with `rtt != srtt` (e.g. `rtt = max_rtt`,
+    `srtt = max_rtt/2`), emits a `Raw` mark and a `Smoothed` mark at the **same column** but
+    **different rows**, with distinct glyphs. (The single-sample column makes bucketing a no-op;
+    with multiple samples per column the two series bucket to their own peaks independently, which
+    may be different samples — the per-sample alignment is a pre-bucketing property.) (Projection
+    unit test.)
 15. **Kernel overlay hook draws a distinct, unclamped series.** The projection given a non-empty
     overlay series (synthetic kernel srtt) emits marks tagged `Series::Kernel` with the kernel
     glyph, distinct from wire marks. An overlay `srtt` **above** the wire maximum expands
@@ -295,9 +306,12 @@ Dependency direction is unchanged (TUI → engine → core).
     RTT legend (naming the raw and smoothed glyphs), an axis time label, and at least one plotted
     glyph. (TestBackend test.)
 20. **CLI wiring.** `build_replay_app(<fixture>, cfg with collect_rtt_timeline)` returns an `App`
-    whose focus connection's `rtt_series` is non-empty for a fixture with acked data on the focus
-    direction; `replay_engine_config` turns the flag on; the ceiling path still returns
-    `SampleCeiling`. (Bin integration test driving the seam.)
+    whose focus connection's `rtt_series` is non-empty. For the committed `metrics_basic.pcap`
+    (single connection, index 0) the focus direction is O2R (SYN + 100 B data ≫ the 1-byte
+    SYN-ACK), and O2R has RTT samples at `t = 1 ms` and `t = 3 ms` (the SYN-ACK acking the SYN,
+    and the final ACK acking the O2R data) — verified from the M3 oracle. The test pins connection
+    0 so it cannot silently pass on the wrong flow. `replay_engine_config` turns the flag on; the
+    ceiling path still returns `SampleCeiling`. (Bin integration test driving the seam.)
 
 ## 6. Failure modes handled
 
