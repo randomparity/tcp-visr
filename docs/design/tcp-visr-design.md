@@ -287,7 +287,7 @@ tasks within a milestone map to **sub-issues**. See [§12](#12-development-workf
 | **M7** | Detail: In-flight / cwnd | wire-estimated in-flight sawtooth; overlay hooks for kernel cwnd | v0.1 |
 | **M8** | Detail: RTT | per-ack RTT samples + smoothed line | v0.1 |
 | **M9** | Detail: Throughput/goodput | sliding-window bytes/sec, goodput vs retransmitted; detail view switcher finalized | v0.1 |
-| **M10** | Name resolution | capture-DNS (IP→name from DNS packets) + live reverse-DNS with caching | v0.1 |
+| **M10** | Name resolution | capture-DNS (IP→name from DNS packets) host labels. The live reverse-DNS-with-caching half is deferred to the live milestones (M11/M12), where a wire faucet and cache exist; it feeds the same `NameTable` seam ([ADR-0015](../adr/0015-name-resolution.md)) | v0.1 |
 | **M11** | Live capture (libpcap) | `tcp-visr live -i eth0`; interface select, BPF filter, nanosecond-precision timestamps (fallback micro); `Tick` injection drives idle/decay; bounded ring buffer with eviction; pause/freeze with cursor clamped to the eviction horizon; running per-connection baseline retained for connection life independent of display retention (§5, ADR-0004); unprivileged open errors rather than yielding silent-empty | v0.2 |
 | **M12** | Live kernel enrichment | `sock_diag` real cwnd/srtt/retrans + `/proc` attribution joined by `ConnId` (instance-aware, §4); defined poll cadence, sample-to-wire-timeline alignment, socket-disappearance and recycled-tuple guards; `n/a` for unenriched connections; overlays on M7/M8; absent on replay | v0.2 |
 | **M13** | Ship 1.0 | config + themes, error UX, man page, asciinema README, install docs (incl. per-platform libpcap requirement for `live`), crates.io metadata, release CI (static `--no-default-features` replay-only binary + default libpcap-dynamic binary with `live`; checksums), CHANGELOG | v1.0 |
@@ -378,6 +378,7 @@ and roadmap ordering already encode those, and duplicate state rots.
 | [0012](../adr/0012-detail-inflight-and-view-switcher.md) | Detail In-flight: dedicated `InFlightSample` series (both directions), pure projection, `Tab` view-switcher, empty-on-replay kernel-cwnd overlay seam | Accepted |
 | [0013](../adr/0013-detail-rtt.md) | Detail RTT: dedicated `RttSample` series (measured-flow attribution), engine-smoothed SRTT (RFC 6298 EWMA), empty-on-replay kernel-srtt overlay seam | Accepted |
 | [0014](../adr/0014-detail-throughput-goodput.md) | Detail Throughput/goodput: dedicated `ThroughputSample` series (sender-flow attribution), engine-derived goodput over the throughput window, finalized four-view switcher, no kernel overlay | Accepted |
+| [0015](../adr/0015-name-resolution.md) | Name resolution: capture-DNS host labels via a side `NameTable` (engine untouched), sanitized `HostName`, `simple-dns` parser; live reverse-DNS deferred to M11/M12 behind the same table | Accepted |
 
 ## 14. Risks
 
