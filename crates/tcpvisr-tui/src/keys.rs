@@ -37,6 +37,8 @@ fn handle_nav(app: &mut App, code: KeyCode) -> Outcome {
         KeyCode::Char('-' | '_') => app.slower(),
         KeyCode::Char('.') => app.step_forward(),
         KeyCode::Char(',') => app.step_back(),
+        KeyCode::Enter => app.open_detail(),
+        KeyCode::Esc => app.close_detail(),
         _ => {}
     }
     Outcome::Continue
@@ -230,6 +232,28 @@ mod tests {
         handle_key(&mut a, press('/'));
         let ev = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(handle_key(&mut a, ev), Outcome::Quit);
+    }
+
+    #[test]
+    fn enter_opens_and_esc_closes_detail_in_nav_mode() {
+        let mut a = app();
+        handle_key(&mut a, key(KeyCode::Enter));
+        assert!(a.is_detail_open());
+        handle_key(&mut a, key(KeyCode::Esc));
+        assert!(!a.is_detail_open());
+    }
+
+    #[test]
+    fn filter_mode_enter_and_esc_do_not_touch_detail() {
+        let mut a = app();
+        handle_key(&mut a, press('/')); // enter filter mode
+        handle_key(&mut a, press('s'));
+        handle_key(&mut a, key(KeyCode::Enter)); // confirms filter, does not open detail
+        assert!(!a.is_detail_open());
+        assert_eq!(a.mode(), Mode::Nav);
+        handle_key(&mut a, press('/'));
+        handle_key(&mut a, key(KeyCode::Esc)); // clears filter, does not close/open detail
+        assert!(!a.is_detail_open());
     }
 
     #[test]
