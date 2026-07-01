@@ -4,6 +4,7 @@
 pub mod endpoint;
 pub mod flow;
 pub mod metric;
+pub mod name;
 pub mod segment;
 pub mod seq;
 pub mod time;
@@ -11,6 +12,7 @@ pub mod time;
 pub use endpoint::Endpoint;
 pub use flow::FlowKey;
 pub use metric::{MetricSample, SampleDir};
+pub use name::{HostName, NameObservation, NameTable};
 pub use segment::{Item, Segment, TcpFlags, TcpOptions};
 pub use seq::TcpSeq;
 pub use time::Nanos;
