@@ -363,3 +363,38 @@ fn run_metrics(
     writeln!(out)?; // trailing newline
     Ok(())
 }
+
+#[cfg(test)]
+mod build_replay_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    fn fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/metrics_basic.pcap")
+    }
+
+    #[test]
+    fn builds_a_timeline_app_with_rows() {
+        let cfg = EngineConfig {
+            collect_state_timeline: true,
+            ..EngineConfig::default()
+        };
+        let app = build_replay_app(&fixture(), cfg).expect("build");
+        assert!(
+            !app.visible().is_empty(),
+            "fixture has connections active at the initial cursor"
+        );
+    }
+
+    #[test]
+    fn sample_ceiling_is_fatal() {
+        let cfg = EngineConfig {
+            collect_state_timeline: true,
+            max_samples: 1,
+            ..EngineConfig::default()
+        };
+        let err = build_replay_app(&fixture(), cfg).expect_err("ceiling");
+        let msg = err.to_string();
+        assert!(msg.contains("--max-samples"), "actionable: {msg}");
+    }
+}

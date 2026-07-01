@@ -25,6 +25,7 @@ pub struct ConnRow {
 /// Time-invariant projection of a connection: everything a row needs that does not depend on
 /// the cursor, plus the lowercased search prefix (origin/responder/service). The state portion
 /// of the searchable text varies with `T` and is appended per frame.
+#[derive(Debug)]
 struct ConnMeta {
     peer: Endpoint,
     service: Option<&'static str>,
@@ -63,6 +64,7 @@ pub enum Outcome {
 }
 
 /// Pure interactive state for the timeline master list. No I/O, no clock.
+#[derive(Debug)]
 pub struct App {
     timeline: Timeline,
     transport: Transport,
