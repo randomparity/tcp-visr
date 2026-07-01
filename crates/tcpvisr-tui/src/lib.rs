@@ -2,8 +2,10 @@
 
 pub mod app;
 pub mod keys;
+pub mod render;
 pub mod service;
 
 pub use app::{App, ConnRow, Mode, Outcome, SortDir, SortField};
 pub use keys::handle_key;
+pub use render::render;
 pub use service::service_name;
